@@ -5,9 +5,91 @@
 # Container Scanning customization: https://docs.gitlab.com/user/application_security/container_scanning/#customizing-analyzer-behavior
 # Note that environment variables can be set in several places
 # See https://docs.gitlab.com/ci/variables/#cicd-variable-precedence
+image:
+  name: gcc:13-bookworm
+
+before_script:
+  # Retry apt operations to survive transient Docker-Desktop network hiccups
+  - apt-get update --fix-missing 
+  - apt-get install --fix-missing -y cmake make git curl wget
+  - apt-get install --fix-missing -y libgsl-dev qt6-base-dev
+  - apt-get install --fix-missing -y doxygen graphviz pkg-config libblas-dev liblapack-dev libopenblas-dev
+  - apt-get install --fix-missing -y build-essential clang pkg-config autoconf automake libtool ca-certificates libfftw3-dev
+  - apt-get install --fix-missing -y gdb libboost-filesystem-dev libboost-chrono-dev libboost-thread-dev libboost-regex-dev npm 
+  - apt-get install --fix-missing -y libpthread-stubs0-dev patchelf astrometry.net liblapacke-dev
+  - apt-get install --fix-missing -y gnuplot-nox libcairo2 libpango-1.0-0 libpangocairo-1.0-0
+
 stages:
+- .pre
+- build
 - test
 - secret-detection
+
+deps:
+  stage: .pre
+  script:
+    - mkdir -p deepskyproject
+    - export DeepSkyROOT=$(pwd)/deepskyproject
+
+    # Try using wget to download the repository archive instead of git clone
+    - git clone https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/deepskyfits.git
+    - cd deepskyfits && git submodule update --init --recursive
+    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    - make -j 2
+    # Repeat make because sometime it fail when waiting for unfinish compilation of others src. I also need to repeat cmake because it seems to ignore some of the header at first run
+    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    - make -j 2 install
+    
+    #- cd -
+    #- git clone https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/deepskysys
+    #- cd deepskysys && git submodule update --init --recursive
+    #- cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    #- make -j 2 install
+    
+    - cd -
+    - git clone https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/deepskymath
+    - cd deepskymath && git submodule update --init --recursive
+    - cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    - make -j 2 install
+    
+    #- cd -
+    #- git clone https://oauth2:${DEEPSKYFITS_TOKEN}@gitlab.in2p3.fr/deepskyproject/deepskydisplay.git
+    #- cd deepskydisplay && git submodule update --init --recursive
+    #- cmake -DCMAKE_INSTALL_PREFIX=../deepskyproject -Wno-dev -DCMAKE_CXX_STANDARD=23 -DCMAKE_CXX_STANDARD_REQUIRED=ON -DCMAKE_CXX_EXTENSIONS=OFF .
+    #- make -j 2 install
+
+    - cd -
+  artifacts:
+    expire_in: 24 hrs
+    paths:
+      - deepskyproject/
+
+build:
+  stage: build
+  needs:
+    - job: deps
+      artifacts: true
+  script:
+  - git fetch --tags --force || true
+  - export DeepSkyROOT=$(pwd)/deepskyproject   # absolu
+  - cmake -Wno-dev -DCMAKE_THREAD_LIBS_INIT="-lpthread" -DCMAKE_USE_PTHREADS_INIT=2 ..
+  - make -j 2
+  artifacts:
+    expire_in: 2 hrs
+    paths:
+    - build/
+
+test:
+  stage: test
+  needs:
+    - job: build
+      artifacts: true
+    - job: deps
+      artifacts: true
+  script:
+  - export DeepSkyROOT=$(pwd)/deepskyproject
+  - ctest --output-on-failure --test-dir .
+
 sast:
   stage: test
 include:
