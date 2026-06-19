@@ -1,0 +1,5 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/phot2pixTargets.cmake")
+
+check_required_components(phot2pix)
