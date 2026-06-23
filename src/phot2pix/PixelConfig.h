@@ -111,6 +111,32 @@ namespace phot2pix
                 m_params.emplace(k, v);   // emplace does nothing if key exists
         }
 
+        /// Return the stored value cast to double, regardless of the stored numeric type.
+        /// Works for all arithmetic types (double, float, int64_t, uint64_t, …).
+        /// std::string is not convertible to double and causes std::invalid_argument.
+        /// Throws std::out_of_range   if key is absent.
+        /// Throws std::invalid_argument if the stored type is not numeric.
+        double getAsDouble(const std::string& key) const
+        {
+            auto it = m_params.find(key);
+            if (it == m_params.end())
+                throw std::out_of_range("PixelConfig: missing key '" + key + "'");
+            return std::visit([&key](const auto& v) -> double {
+                using T = std::decay_t<decltype(v)>;
+                if constexpr (std::is_convertible_v<T, double>)
+                    return static_cast<double>(v);
+                else
+                    throw std::invalid_argument(
+                        "PixelConfig: key '" + key + "' is not a numeric type.");
+            }, it->second);
+        }
+
+        /// Non-throwing overload: returns defaultVal if the key is absent or non-numeric.
+        double getAsDouble(const std::string& key, double defaultVal) const noexcept
+        {
+            try { return getAsDouble(key); } catch (...) { return defaultVal; }
+        }
+
         /// Serialize back to a nlohmann::json object.
         json toJson() const
         {

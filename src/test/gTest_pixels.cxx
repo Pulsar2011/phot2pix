@@ -561,3 +561,54 @@ TEST(Inheritance, UserValidationOverride)
     EXPECT_NO_THROW(pixel.setDarkCurrent(0.01));
     EXPECT_THROW(pixel.setDarkCurrent(1.0), std::invalid_argument);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PixelConfig — getAsDouble()
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(PixelConfig, GetAsDoubleFromDouble)
+{
+    PixelConfig cfg{ {"gain", 2.5} };
+    EXPECT_DOUBLE_EQ(cfg.getAsDouble("gain"), 2.5);
+}
+
+TEST(PixelConfig, GetAsDoubleFromInt)
+{
+    PixelConfig cfg;
+    cfg.set<int64_t>("dark", 3);
+    EXPECT_DOUBLE_EQ(cfg.getAsDouble("dark"), 3.0);
+}
+
+TEST(PixelConfig, GetAsDoubleFromUInt)
+{
+    PixelConfig cfg;
+    cfg.set<uint64_t>("readNoise", 5u);
+    EXPECT_DOUBLE_EQ(cfg.getAsDouble("readNoise"), 5.0);
+}
+
+TEST(PixelConfig, GetAsDoubleFromFloat)
+{
+    PixelConfig cfg;
+    cfg.set<float>("QE", 0.8f);
+    EXPECT_NEAR(cfg.getAsDouble("QE"), 0.8, 1e-6);
+}
+
+TEST(PixelConfig, GetAsDoubleStringThrows)
+{
+    PixelConfig cfg{ {"path", std::string("/some/file.fits")} };
+    EXPECT_THROW(cfg.getAsDouble("path"), std::invalid_argument);
+}
+
+TEST(PixelConfig, GetAsDoubleMissingKey)
+{
+    PixelConfig cfg;
+    EXPECT_THROW(cfg.getAsDouble("nonexistent"), std::out_of_range);
+}
+
+TEST(PixelConfig, GetAsDoubleDefault)
+{
+    PixelConfig cfg;
+    EXPECT_DOUBLE_EQ(cfg.getAsDouble("missing", 42.0), 42.0); // absent → default
+    cfg.set<std::string>("path", std::string("/file.fits"));
+    EXPECT_DOUBLE_EQ(cfg.getAsDouble("path", 99.0), 99.0);    // non-numeric → default
+}

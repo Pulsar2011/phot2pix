@@ -14,8 +14,25 @@
 # ──────────────────────────────────────────────────────────────────────────────
 cmake_minimum_required(VERSION 3.20)
 
+# ─── Version: from exact git tag vX.Y.Z, or fall back to 0.1.0 ──────────────
+find_package(Git QUIET)
+set(_p2p_version "0.1.0")
+if(Git_FOUND)
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --match "v*" --exact-match
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE _git_tag
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _git_rc
+    )
+    if(_git_rc EQUAL 0 AND _git_tag MATCHES "^v([0-9]+)\\.([0-9]+)\\.([0-9]+)")
+        set(_p2p_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
+    endif()
+endif()
+
 project(phot2pix
-    VERSION     0.1.0
+    VERSION     ${_p2p_version}
     DESCRIPTION "Photon-to-Pixel CCD/CMOS sensor simulator library"
     LANGUAGES   CXX
 )
@@ -74,6 +91,7 @@ if(NOT DeepSkyROOT)
 endif()
 
 message(STATUS "${_G}──── phot2pix configuration ────────────────────────${_Z}")
+message(STATUS "${_G}  Version       :${_Z} ${PROJECT_VERSION}")
 message(STATUS "${_G}  Build type    :${_Z} ${CMAKE_BUILD_TYPE}")
 message(STATUS "${_G}  Install prefix:${_Z} ${CMAKE_INSTALL_PREFIX}")
 message(STATUS "${_G}  DeepSkyROOT  :${_Z} ${DeepSkyROOT}")
@@ -183,7 +201,58 @@ set_target_properties(DST::math PROPERTIES
 message(STATUS "${_G}  DSTmath lib   :${_Z} ${DSTmath_LIB}")
 message(STATUS "${_G}  DSTmath inc   :${_Z} ${DSTmath_INCLUDE_DIR}")
 
+# ─── Dependency: Minuit2 (shared, required by DSTfits) ───────────────────────
+# Headers live at ${DeepSkyROOT}/include/Minuit2/Minuit2/*.h — so the include
+# path must be ${DeepSkyROOT}/include/Minuit2 for <Minuit2/FCNBase.h> to resolve.
+find_library(Minuit2_LIB
+    NAMES Minuit2 libMinuit2
+    HINTS "${DeepSkyROOT}/${CMAKE_INSTALL_LIBDIR}"
+          "${DeepSkyROOT}/lib"
+    REQUIRED
+)
+cmake_path(GET Minuit2_LIB PARENT_PATH _minuit2_libdir)
+cmake_path(GET _minuit2_libdir PARENT_PATH _minuit2_root)
+set(Minuit2_INCLUDE_DIR "${_minuit2_root}/include/Minuit2")
+
+add_library(ROOT::Minuit2 SHARED IMPORTED GLOBAL)
+set_target_properties(ROOT::Minuit2 PROPERTIES
+    IMPORTED_LOCATION             "${Minuit2_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${Minuit2_INCLUDE_DIR}"
+)
+message(STATUS "${_G}  Minuit2 lib   :${_Z} ${Minuit2_LIB}")
+message(STATUS "${_G}  Minuit2 inc   :${_Z} ${Minuit2_INCLUDE_DIR}")
+
+# ─── Dependency: cfitsio (static, required by DSTfits) ───────────────────────
+find_library(cfitsio_LIB
+    NAMES cfitsio libcfitsio
+    HINTS "${DeepSkyROOT}/${CMAKE_INSTALL_LIBDIR}"
+          "${DeepSkyROOT}/lib"
+    REQUIRED
+)
+add_library(DST::cfitsio STATIC IMPORTED GLOBAL)
+set_target_properties(DST::cfitsio PROPERTIES
+    IMPORTED_LOCATION             "${cfitsio_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${DeepSkyROOT}/include/cfitsio"
+)
+message(STATUS "${_G}  cfitsio lib   :${_Z} ${cfitsio_LIB}")
+
+# ─── Dependency: wcslib (static, required by DSTfits) ────────────────────────
+find_library(wcslib_LIB
+    NAMES wcs libwcs
+    HINTS "${DeepSkyROOT}/${CMAKE_INSTALL_LIBDIR}"
+          "${DeepSkyROOT}/lib"
+    REQUIRED
+)
+add_library(DST::wcs STATIC IMPORTED GLOBAL)
+set_target_properties(DST::wcs PROPERTIES
+    IMPORTED_LOCATION             "${wcslib_LIB}"
+    INTERFACE_INCLUDE_DIRECTORIES "${DeepSkyROOT}/include/wcslib"
+)
+message(STATUS "${_G}  wcslib lib    :${_Z} ${wcslib_LIB}")
+
 # ─── Dependency: DSTfits (dynamic, required — used for full-matrix generation) ─
+# Declares cfitsio, wcslib and Minuit2 as interface dependencies so their
+# include paths and libraries propagate to all consumers of DST::fits.
 find_library(DSTfits_LIB
     NAMES DSTfits libDSTfits
     HINTS "${DeepSkyROOT}/${CMAKE_INSTALL_LIBDIR}"
@@ -198,6 +267,7 @@ add_library(DST::fits SHARED IMPORTED GLOBAL)
 set_target_properties(DST::fits PROPERTIES
     IMPORTED_LOCATION             "${DSTfits_LIB}"
     INTERFACE_INCLUDE_DIRECTORIES "${DSTfits_INCLUDE_DIR}"
+    INTERFACE_LINK_LIBRARIES      "ROOT::Minuit2;DST::cfitsio;DST::wcs"
 )
 message(STATUS "${_G}  DSTfits lib   :${_Z} ${DSTfits_LIB}")
 message(STATUS "${_G}  DSTfits inc   :${_Z} ${DSTfits_INCLUDE_DIR}")
@@ -269,6 +339,15 @@ if(BUILD_TESTING)
 endif()
 
 # ─── Install: library + headers ───────────────────────────────────────────────
+# Remove stale libphot2pix* files left by any previously installed version.
+install(CODE "
+    file(GLOB _old_libs \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}/libphot2pix*\")
+    foreach(_lib \${_old_libs})
+        message(STATUS \"Removing stale: \${_lib}\")
+        file(REMOVE \"\${_lib}\")
+    endforeach()
+")
+
 install(TARGETS phot2pix
     EXPORT      phot2pixTargets
     LIBRARY     DESTINATION "${CMAKE_INSTALL_LIBDIR}"
