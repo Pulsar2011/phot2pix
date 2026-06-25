@@ -78,8 +78,16 @@ namespace phot2pix
 #pragma endregion
 
 #pragma region - pixel response
-            // @bdetails Simulate the pixel response to incoming photons. In default behaviour this function emulate purely linear response with shot noise and read noise. This function need to be overridden by derived classes to implement specific pixel response behaviour. 
+            // @bdetails Simulate the pixel response to incoming photons. In default behaviour this function emulate purely linear response with shot noise and read noise. This function need to be overridden by derived classes to implement specific pixel response behaviour.
             virtual double pixelresponse(const double& flux, const double& exposureTime) const;
+
+            // Optional runtime-parameter overload. Derived classes can override this to
+            // extract extra parameters (e.g. "dT" for persistence) from cfg.
+            // The base class ignores cfg and delegates to the two-argument form.
+            virtual double pixelresponse(const double& flux, const double& exposureTime, const PixelConfig& cfg) const
+            {
+                return pixelresponse(flux, exposureTime);
+            }
 #pragma endregion
 #pragma endregion
     };

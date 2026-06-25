@@ -1,3 +1,12 @@
+//
+// Created by gillard on 2026-06-25.
+// Centre de Physique des Particule de Marseille (CPPM)
+// Licence under PolyForm Noncommercial License 1.0.0 https://polyformproject.org/licenses/noncommercial/1.0.0
+//  You may share and adapt this code with attribution, Non Comercial use only.
+//
+// gTest_pixelconfig.cxx
+//
+
 #include <gtest/gtest.h>
 #include <phot2pix/PixelConfig.h>
 #include <filesystem>
@@ -32,7 +41,7 @@ TEST(PixelConfig, InitializerList)
 TEST(PixelConfig, FromJson)
 {
     // bool → bool, unsigned → uint64_t, signed → int64_t, float → double, string → string.
-    // Nested objects are silently skipped.
+    // Nested objects and arrays are stored as json and accessible via getJson().
     json j;
     j["flag"]   = true;
     j["uint_v"] = uint64_t{7};
@@ -47,7 +56,7 @@ TEST(PixelConfig, FromJson)
     EXPECT_EQ   (cfg.get<int64_t>    ("int_v"),  int64_t{-3});
     EXPECT_DOUBLE_EQ(cfg.get<double> ("dbl_v"),  1.5);
     EXPECT_EQ   (cfg.get<std::string>("str_v"),  "hello");
-    EXPECT_FALSE(cfg.has("nested"));
+    EXPECT_TRUE (cfg.has("nested"));
 }
 
 TEST(PixelConfig, FromJsonFile)
@@ -220,6 +229,83 @@ TEST(PixelConfig, MergeDefaultsIntoEmpty)
 
     EXPECT_DOUBLE_EQ(cfg.get<double>     ("x"), 5.0);
     EXPECT_EQ       (cfg.get<std::string>("y"), "hello");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PixelConfig — getJson()
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST(PixelConfig, GetJsonArray)
+{
+    json j;
+    j["persistence"] = json::array({
+        {{"f", 0.01},  {"t", 200.0}},
+        {{"f", 0.005}, {"t", 1000.0}},
+    });
+
+    PixelConfig cfg(j);
+    EXPECT_TRUE(cfg.has("persistence"));
+
+    const json& traps = cfg.getJson("persistence");
+    ASSERT_EQ(traps.size(), 2u);
+    EXPECT_DOUBLE_EQ(traps[0].at("f").get<double>(), 0.01);
+    EXPECT_DOUBLE_EQ(traps[0].at("t").get<double>(), 200.0);
+    EXPECT_DOUBLE_EQ(traps[1].at("f").get<double>(), 0.005);
+    EXPECT_DOUBLE_EQ(traps[1].at("t").get<double>(), 1000.0);
+}
+
+TEST(PixelConfig, GetJsonNestedObject)
+{
+    json j;
+    j["nested"] = {{"a", 1}, {"b", 2}};
+
+    PixelConfig cfg(j);
+    EXPECT_TRUE(cfg.has("nested"));
+
+    const json& obj = cfg.getJson("nested");
+    EXPECT_EQ(obj.at("a").get<int>(), 1);
+    EXPECT_EQ(obj.at("b").get<int>(), 2);
+}
+
+TEST(PixelConfig, GetJsonMissingKeyThrows)
+{
+    PixelConfig cfg;
+    EXPECT_THROW(cfg.getJson("absent"), std::out_of_range);
+}
+
+TEST(PixelConfig, GetJsonOnScalarThrows)
+{
+    PixelConfig cfg{{"gain", 2.5}};
+    EXPECT_THROW(cfg.getJson("gain"), std::invalid_argument);
+}
+
+TEST(PixelConfig, GetJsonFromFile)
+{
+    fs::path tmp = fs::temp_directory_path() / "p2p_test_pixelconfig_json.json";
+    {
+        std::ofstream f(tmp);
+        f << R"({"gain":2.0,"persistence":[{"f":0.01,"t":200.0},{"f":0.005,"t":1000.0}]})";
+    }
+
+    PixelConfig cfg(tmp.string());
+    EXPECT_DOUBLE_EQ(cfg.get<double>("gain"), 2.0);
+
+    const json& traps = cfg.getJson("persistence");
+    ASSERT_EQ(traps.size(), 2u);
+    EXPECT_DOUBLE_EQ(traps[0].at("f").get<double>(), 0.01);
+    EXPECT_DOUBLE_EQ(traps[1].at("t").get<double>(), 1000.0);
+
+    fs::remove(tmp);
+}
+
+TEST(PixelConfig, GetJsonEmptyArray)
+{
+    json j;
+    j["persistence"] = json::array();
+
+    PixelConfig cfg(j);
+    EXPECT_TRUE(cfg.has("persistence"));
+    EXPECT_TRUE(cfg.getJson("persistence").empty());
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

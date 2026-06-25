@@ -43,12 +43,24 @@ namespace phot2pix
 
         static_assert(std::is_base_of_v<pixsim, PixelT>, "PixelT must derive from pixsim");
 
-#pragma region – private
+#pragma region - private
 // ── Private: thread dispatch ───────────────────────────────────────────────
     private:
 
         auto view()       { return std::span<PixelT>      (m_pixels.data(), m_pixels.size()); }
         auto view() const { return std::span<const PixelT>(m_pixels.data(), m_pixels.size()); }
+
+        // Dispatch pixelresponse with cfg, falling back to the 2-arg form if PixelT
+        // does not expose the 3-arg overload (e.g. because a derived class overrides
+        // only the 2-arg form, hiding the base-class 3-arg via C++ name hiding).
+        template<typename P>
+        static double _dispatchPixelResponse(const P& px, double flux, double dt, const PixelConfig& cfg)
+        {
+            if constexpr (requires { px.pixelresponse(flux, dt, cfg); })
+                return px.pixelresponse(flux, dt, cfg);
+            else
+                return px.pixelresponse(flux, dt);
+        }
 
         void _checkMapSize(size_t sz, const char* name) const
         {
@@ -113,6 +125,102 @@ namespace phot2pix
                 });
             }
             for (auto& th : workers) th.join();
+        }
+
+        // cfg-aware dispatch variants — capture cfg by const-ref in the thread lambda.
+        void _dispatch_cpu_cfg(const std::valarray<double>& flux,
+                               double                        dt,
+                               std::valarray<double>&         frame,
+                               size_t                         nThreads,
+                               const PixelConfig&             cfg) const
+        {
+            const size_t n    = m_pixels.size();
+            const size_t base = n / nThreads;
+            const size_t rem  = n % nThreads;
+
+            std::vector<std::thread> workers;
+            workers.reserve(nThreads);
+
+            for (size_t t = 0; t < nThreads; ++t)
+            {
+                const size_t start = t * base + std::min(t, rem);
+                const size_t end   = start + base + (t < rem ? 1 : 0);
+                workers.emplace_back([this, &flux, dt, start, end, &frame, &cfg]()
+                {
+                    _engine(flux, dt, start, end, frame, cfg);
+                });
+            }
+            for (auto& th : workers) th.join();
+        }
+
+        void _dispatch_cpu_window_cfg(const std::valarray<double>& flux,
+                                       double                        dt,
+                                       size_t c0, size_t r0,
+                                       size_t ncols, size_t nrows,
+                                       std::valarray<double>&         frame,
+                                       size_t                         nThreads,
+                                       const PixelConfig&             cfg) const
+        {
+            const size_t base = nrows / nThreads;
+            const size_t rem  = nrows % nThreads;
+
+            std::vector<std::thread> workers;
+            workers.reserve(nThreads);
+
+            for (size_t t = 0; t < nThreads; ++t)
+            {
+                const size_t row_start = t * base + std::min(t, rem);
+                const size_t row_end   = row_start + base + (t < rem ? 1 : 0);
+                workers.emplace_back([this, &flux, dt, c0, r0, row_start, row_end, ncols, &frame, &cfg]()
+                {
+                    _engine(flux, dt, c0, r0, row_start, row_end, ncols, frame, cfg);
+                });
+            }
+            for (auto& th : workers) th.join();
+        }
+
+        // Shared frame-to-FITScube conversion, factored out to avoid duplication
+        // between the standard and cfg-aware simulate() overloads.
+        std::shared_ptr<DSL::FITScube> _convertFrame(const std::valarray<double>& frame,
+                                                      size_t width, size_t height) const
+        {
+            std::shared_ptr<DSL::FITScube> img;
+            switch (m_pixelType)
+            {
+                case SBYTE_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<int8_t>({width, height}));
+                    *(img) += convert2int8(frame);   break;
+                case BYTE_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint8_t>({width, height}));
+                    *(img) += convert2uint8(frame);  break;
+                case SHORT_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<int16_t>({width, height}));
+                    *(img) += convert2int16(frame);  break;
+                case USHORT_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint16_t>({width, height}));
+                    *(img) += convert2uint16(frame); break;
+                case LONG_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<int32_t>({width, height}));
+                    *(img) += convert2int32(frame);  break;
+                case ULONG_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint32_t>({width, height}));
+                    *(img) += convert2uint32(frame); break;
+                case LONGLONG_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<int64_t>({width, height}));
+                    *(img) += convert2int64(frame);  break;
+                case ULONGLONG_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint64_t>({width, height}));
+                    *(img) += convert2uint64(frame); break;
+                case FLOAT_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<float>({width, height}));
+                    *(img) += convert2float(frame);  break;
+                case DOUBLE_IMG:
+                    img = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<double>({width, height}));
+                    *(img) += frame;                 break;
+                default:
+                    throw std::invalid_argument("Unrecognised FITS data type for output.");
+            }
+            return img;
         }
 #pragma endregion
 
@@ -199,6 +307,39 @@ namespace phot2pix
                 const size_t frame_base = r * ncols;
                 for (size_t c = 0; c < ncols; ++c)
                     frame[frame_base + c] = m_pixels[det_base + c].pixelresponse(flux[frame_base + c], dt);
+            }
+        }
+
+        // cfg-aware engine hooks — pass PixelConfig to pixelresponse() for runtime
+        // parameters (e.g. persistence dT).  Derived classes that need per-engine
+        // cfg logic can override these; the defaults delegate per-pixel dispatch.
+        virtual void _engine(const std::valarray<double>& flux,
+                              double                        dt,
+                              size_t                        begin,
+                              size_t                        end,
+                              std::valarray<double>&        frame,
+                              const PixelConfig&            cfg) const
+        {
+            for (size_t i = begin; i < end; ++i)
+                frame[i] = _dispatchPixelResponse(m_pixels[i], flux[i], dt, cfg);
+        }
+
+        virtual void _engine(const std::valarray<double>& flux,
+                              double                        dt,
+                              size_t                        c0,
+                              size_t                        r0,
+                              size_t                        row_begin,
+                              size_t                        row_end,
+                              size_t                        ncols,
+                              std::valarray<double>&         frame,
+                              const PixelConfig&             cfg) const
+        {
+            for (size_t r = row_begin; r < row_end; ++r)
+            {
+                const size_t det_base   = (r0 + r) * m_width + c0;
+                const size_t frame_base = r * ncols;
+                for (size_t c = 0; c < ncols; ++c)
+                    frame[frame_base + c] = _dispatchPixelResponse(m_pixels[det_base + c], flux[frame_base + c], dt, cfg);
             }
         }
 
@@ -442,20 +583,29 @@ namespace phot2pix
         //                    as an integer index or an EXTNAME string (default: 0).
         //
         // Known keys: "gain", "dark", "readNoise", "QE", "KTCnoise", "baseline"
-        // Unknown keys are forwarded to _applyCustomConfig() for derived classes.
-        void initialize(const PixelConfig& cfg)
+        // Derived classes override initialize() to handle additional keys;
+        // call DetectorSimulator<PixelT>::initialize(cfg) to apply the standard keys first.
+        virtual void initialize(const PixelConfig& cfg)
         {
-            _applyMap(cfg, "gain",      [](PixelT& px, double v) { px.setGain(v); });
-            _applyMap(cfg, "dark",      [](PixelT& px, double v) { px.setDarkCurrent(v); });
-            _applyMap(cfg, "readNoise", [](PixelT& px, double v) { px.setReadNoise(v); });
-            _applyMap(cfg, "QE",        [](PixelT& px, double v) { px.setQuantumEfficiency(v); });
-            _applyMap(cfg, "KTCnoise",  [](PixelT& px, double v) { px.setKTCnoise(v); });
-            _applyMap(cfg, "baseline",  [](PixelT& px, double v) { px.setBaseline(v); });
-            _applyCustomConfig(cfg);
+            // Each setter is guarded by if constexpr so that PixelT types that
+            // hide pixsim's interface (e.g. via private inheritance) compile cleanly:
+            // the call is not emitted if the method is not accessible on PixelT.
+            if constexpr (requires(PixelT& px, double v) { px.setGain(v); })
+                _applyMap(cfg, "gain",      [](PixelT& px, double v) { px.setGain(v); });
+            if constexpr (requires(PixelT& px, double v) { px.setDarkCurrent(v); })
+                _applyMap(cfg, "dark",      [](PixelT& px, double v) { px.setDarkCurrent(v); });
+            if constexpr (requires(PixelT& px, double v) { px.setReadNoise(v); })
+                _applyMap(cfg, "readNoise", [](PixelT& px, double v) { px.setReadNoise(v); });
+            if constexpr (requires(PixelT& px, double v) { px.setQuantumEfficiency(v); })
+                _applyMap(cfg, "QE",        [](PixelT& px, double v) { px.setQuantumEfficiency(v); });
+            if constexpr (requires(PixelT& px, double v) { px.setKTCnoise(v); })
+                _applyMap(cfg, "KTCnoise",  [](PixelT& px, double v) { px.setKTCnoise(v); });
+            if constexpr (requires(PixelT& px, double v) { px.setBaseline(v); })
+                _applyMap(cfg, "baseline",  [](PixelT& px, double v) { px.setBaseline(v); });
         }
 
         // Convenience: load config from a JSON file path.
-        void initialize(const std::string& jsonPath) { initialize(PixelConfig(jsonPath)); }
+        virtual void initialize(const std::string& jsonPath) { initialize(PixelConfig(jsonPath)); }
 #pragma endregion
 
 #pragma region - named map setters (protected — use initialize() from public API)
@@ -501,11 +651,6 @@ namespace phot2pix
             for (size_t i = 0; i < m_pixels.size(); ++i)
                 m_pixels[i].setKTCnoise(ktcs[i]);
         }
-
-        // Hook for derived DetectorSimulator classes: handle config keys that
-        // correspond to properties of a derived pixsim subclass.
-        // Called at the end of initialize() after all known keys are processed.
-        virtual void _applyCustomConfig(const PixelConfig&) {}
 
     private:
         // Resolve a config key to a per-pixel valarray:
@@ -606,65 +751,7 @@ namespace phot2pix
             else
                 _engine(flux, exposureTime, 0, n, frame);
 
-            std::shared_ptr< DSL::FITScube > img;
-
-            switch (m_pixelType)
-            {
-                case SBYTE_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int8_t>({m_width, m_height}));
-                    *(img) += convert2int8(frame);
-                    break;
-                
-                case BYTE_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint8_t>({m_width, m_height}));
-                    *(img) += convert2uint8(frame);
-                    break;
-
-                case SHORT_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int16_t>({m_width, m_height}));
-                    *(img) += convert2int16(frame);
-                    break;
-
-                case USHORT_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint16_t>({m_width, m_height}));
-                    *(img) += convert2uint16(frame);
-                    break;
-
-                case LONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int32_t>({m_width, m_height}));
-                    *(img) += convert2int32(frame);
-                    break;
-                
-                case ULONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint32_t>({m_width, m_height}));
-                    *(img) += convert2uint32(frame);
-                    break;
-
-                case LONGLONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int64_t>({m_width, m_height}));
-                    *(img) += convert2int64(frame);
-                    break;
-
-                case ULONGLONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint64_t>({m_width, m_height}));
-                    *(img) += convert2uint64(frame);
-                    break;
-
-                case FLOAT_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<float>({m_width, m_height}));
-                    *(img) += convert2float(frame);
-                    break;
-
-                case DOUBLE_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<double>({m_width, m_height}));
-                    *(img) += frame;
-                    break;
-                
-                default:
-                    throw std::invalid_argument("Unrecognised FITS data type for output.");
-            }
-
-            return img;
+            return _convertFrame(frame, m_width, m_height);
         }
 
         // Windowed: simulate only a detector sub-region.
@@ -693,65 +780,49 @@ namespace phot2pix
             else
                 _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame);
 
-            std::shared_ptr< DSL::FITScube > img;
+            return _convertFrame(frame, m_width, m_height);
+        }
 
-            switch (m_pixelType)
-            {
-                case SBYTE_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int8_t>({m_width, m_height}));
-                    *(img) += convert2int8(frame);
-                    break;
-                
-                case BYTE_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint8_t>({m_width, m_height}));
-                    *(img) += convert2uint8(frame);
-                    break;
+        // cfg-aware simulate overloads — pass a PixelConfig carrying runtime parameters
+        // (e.g. persistence dT) down to pixelresponse() via the cfg-aware _engine hooks.
+        std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux,
+                                                 double                        exposureTime,
+                                                 const PixelConfig&            cfg) const
+        {
+            const size_t n        = m_pixels.size();
+            const size_t nThreads = _computeThreadCount(n);
+            std::valarray<double> frame(0.0, n);
 
-                case SHORT_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int16_t>({m_width, m_height}));
-                    *(img) += convert2int16(frame);
-                    break;
+            if (nThreads > 1)
+                _dispatch_cpu_cfg(flux, exposureTime, frame, nThreads, cfg);
+            else
+                _engine(flux, exposureTime, 0, n, frame, cfg);
 
-                case USHORT_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint16_t>({m_width, m_height}));
-                    *(img) += convert2uint16(frame);
-                    break;
+            return _convertFrame(frame, m_width, m_height);
+        }
 
-                case LONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int32_t>({m_width, m_height}));
-                    *(img) += convert2int32(frame);
-                    break;
-                
-                case ULONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint32_t>({m_width, m_height}));
-                    *(img) += convert2uint32(frame);
-                    break;
+        std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux,
+                                                 double                        exposureTime,
+                                                 const size_t&                 c0,
+                                                 const size_t&                 r0,
+                                                 const size_t&                 ncols,
+                                                 const size_t&                 nrows,
+                                                 const PixelConfig&            cfg) const
+        {
+            if (r0 + nrows > m_height || c0 + ncols > m_width)
+                throw std::out_of_range("Simulation window exceeds detector boundaries.");
+            if (flux.size() != nrows * ncols)
+                throw std::invalid_argument("Flux size does not match window size (nrows*ncols).");
 
-                case LONGLONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<int64_t>({m_width, m_height}));
-                    *(img) += convert2int64(frame);
-                    break;
+            const size_t nThreads = _computeThreadCount(nrows * ncols);
+            std::valarray<double> frame(0.0, nrows * ncols);
 
-                case ULONGLONG_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<uint64_t>({m_width, m_height}));
-                    *(img) += convert2uint64(frame);
-                    break;
+            if (nThreads > 1)
+                _dispatch_cpu_window_cfg(flux, exposureTime, c0, r0, ncols, nrows, frame, nThreads, cfg);
+            else
+                _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame, cfg);
 
-                case FLOAT_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<float>({m_width, m_height}));
-                    *(img) += convert2float(frame);
-                    break;
-
-                case DOUBLE_IMG:
-                    img = std::shared_ptr< DSL::FITScube >(new DSL::FITSimg<double>({m_width, m_height}));
-                    *(img) += frame;
-                    break;
-                
-                default:
-                    throw std::invalid_argument("Unrecognised FITS data type for output.");
-            }
-
-            return img;
+            return _convertFrame(frame, m_width, m_height);
         }
 #pragma endregion
 

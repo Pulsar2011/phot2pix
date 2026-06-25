@@ -1,93 +1,444 @@
-# Phot2Pix
+# phot2pix
 
+**Photon-to-Pixel CCD/CMOS sensor simulator library**
 
+*Centre de Physique des Particules de Marseille (CPPM)*
+*Licence: [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)*
 
-## Getting started
+---
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+## What is phot2pix?
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+`phot2pix` is a C++23 library that simulates the conversion of photon flux into detector pixel values. It provides:
 
-## Add your files
+- A **generic pixel model** (`pixsim`) implementing shot noise, dark current, read noise, KTC noise, gain, and quantum efficiency.
+- A **generic detector** (`DetectorSimulator<PixelT>`) that owns a 2-D array of pixels, dispatches simulation across CPU threads, and writes output to FITS images via the `DSTfits` library.
+- A **typed configuration bag** (`PixelConfig`) that can be loaded from JSON files, inline brace-init lists, or FITS-based per-pixel maps.
+- An **extension model** based on C++ inheritance and virtual hooks, allowing instrument teams to add detector-specific physics (persistence, crosstalk, charge diffusion, custom readout modes) without modifying the core library.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+The library is instrument-agnostic by design. The `src/nisp/` subdirectory provides a worked example for the **Euclid/NISP HAWAII-2RG** infrared detector array.
+
+---
+
+## Dependencies
+
+| Library | Role | Notes |
+|---|---|---|
+| [`DSTmath`]:https://gitlab.in2p3.fr/deepskyproject/deepskymath | RNG and math primitives | Required; part of the DeepSky toolkit |
+| [`DSTfits`]:https://gitlab.in2p3.fr/deepskyproject/dstfits | FITS I/O (read/write) | Required; wraps `cfitsio` + `wcslib` + `Minuit2` |
+| `nlohmann/json` | JSON parsing for `PixelConfig` | Fetched automatically if not found |
+| GoogleTest | Unit test runner | Git submodule; only needed when `-DBUILD_TESTING=ON` |
+
+C++ standard: **C++23**. CMake ≥ 3.20.
+
+---
+
+## Getting the source
+
+```bash
+git clone --recurse-submodules https://gitlab.in2p3.fr/gillard/phot2pix.git
+cd phot2pix
+```
+
+The `--recurse-submodules` flag fetches the bundled GoogleTest submodule used by the test suite.
+
+---
+
+## Building
+
+`phot2pix` requires the DeepSky toolkit libraries (`DSTmath`, `DSTfits`, and their transitive dependencies, both available on the [DeepSkyProject]:https://gitlab.in2p3.fr/deepskyproject git repositories). Point CMake to their install root with `DeepSkyROOT`, or let it inherit the `DeepSkyROOT` environment variable.
+
+```bash
+# Configure (out-of-source build is enforced)
+cmake -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=../install \
+      -DDeepSkyROOT=/path/to/deepsky/install
+
+# Build
+cmake --build build -j$(nproc)
+
+# Run the test suite
+ctest --test-dir build --output-on-failure
+
+# Install headers + shared libraries
+cmake --install build
+```
+
+### CMake options
+
+| Option | Default | Description |
+|---|---|---|
+| `CMAKE_BUILD_TYPE` | `Release` | `Debug` enables AddressSanitizer; `Release`/`RelWithDebInfo` enable LTO |
+| `BUILD_TESTING` | `ON` | Build and register the GoogleTest suite |
+| `DeepSkyROOT` | `CMAKE_INSTALL_PREFIX` | Root of the DeepSky install tree |
+| `CMAKE_INSTALL_PREFIX` | `../install` | Where headers and `.dylib`/`.so` files are placed |
+
+### Using phot2pix in your own CMake project
+
+After installation, `find_package(phot2pix)` is available:
+
+```cmake
+find_package(phot2pix REQUIRED)
+target_link_libraries(myTarget PRIVATE phot2pix::phot2pix)
+```
+
+---
+
+## Core library — `src/phot2pix/`
+
+### `PixelConfig` — typed key-value configuration
+
+`PixelConfig` is a JSON-compatible property bag. Values are stored as `std::variant` over all common numeric types plus `std::string` and raw `nlohmann::json` (for arrays and objects).
+
+```cpp
+#include <phot2pix/PixelConfig.h>
+
+// Inline construction
+phot2pix::PixelConfig cfg = {
+    {"dark",      0.001},   // dark current in e-/s
+    {"readNoise", 5.0  },   // read noise in e-
+    {"gain",      1.5  },   // gain in e-/ADU
+    {"QE",        0.85 },
+    {"KTCnoise",  20.0 },
+    {"baseline",  1000.0}
+};
+
+// From a JSON file
+phot2pix::PixelConfig cfg2("detector.json");
+
+double rn = cfg.get<double>("readNoise");          // throws if absent
+double g  = cfg.get<double>("gain", 1.0);          // with a default
+double d  = cfg.getAsDouble("dark");               // type-erased numeric cast
+```
+
+Per-pixel maps can be provided as FITS paths inside the config:
+
+```json
+{
+  "gain":      "gain_map.fits",
+  "gain.hdu":  "GAIN",
+  "readNoise": 5.0,
+  "dark":      "dark_map.fits"
+}
+```
+
+### `pixsim` — generic pixel model
+
+`phot2pix::pixsim` models a single pixel's response to an incoming photon flux. The default implementation is a linear detector with Poisson shot noise, Gaussian read noise, dark current, KTC noise, gain, and quantum efficiency.
+
+```cpp
+#include <phot2pix/PixelSimulator.h>
+
+phot2pix::pixsim px(
+    /*darkCurrent*/ 0.001,
+    /*readNoise  */ 5.0,
+    /*gain       */ 1.5,
+    /*QE         */ 0.85,
+    /*KTCnoise   */ 20.0,
+    /*baseline   */ 1000.0
+);
+
+double adu = px.pixelresponse(/*flux [ph/s]*/ 1000.0, /*exposureTime [s]*/ 100.0);
+```
+
+The virtual method `pixelresponse()` is the single customisation point for per-pixel physics. A second overload accepting a `PixelConfig` allows runtime parameters (e.g. elapsed time since last exposure) to be passed through the simulation chain without altering the pixel object's state.
+
+### `DetectorSimulator<PixelT>` — generic detector array
+
+`DetectorSimulator<PixelT>` owns a flat row-major array of `PixelT` pixels and orchestrates the simulation across CPU threads. It is parameterised on any class derived from `pixsim`.
+
+```cpp
+#include <phot2pix/DetectorSimulator.h>
+
+// A 4096×4096 detector of default pixels, output as 64-bit floating-point FITS
+phot2pix::DetectorSimulator<phot2pix::pixsim> det(4096, 4096, DOUBLE_IMG);
+
+// Uniform initialisation from a config
+phot2pix::PixelConfig cfg = {{"gain", 1.0}, {"readNoise", 5.0}, {"dark", 0.001},
+                              {"QE", 0.9}, {"KTCnoise", 0.0}, {"baseline", 0.0}};
+det.initialize(cfg);
+
+// Simulate: uniform flux of 500 ph/s for 100 s → FITS image
+std::shared_ptr<DSL::FITScube> frame = det.simulate(500.0, 100.0);
+
+// Per-pixel flux from a FITS image
+std::shared_ptr<DSL::FITScube> skyFlux = /* load from file */;
+std::shared_ptr<DSL::FITScube> frame2  = det.simulate(skyFlux, 100.0);
+
+// Windowed simulation: re-simulate only a 64×64 region at (col=100, row=200)
+std::valarray<double> windowFlux(500.0, 64 * 64);
+std::shared_ptr<DSL::FITScube> patch = det.simulate(windowFlux, 100.0, 100, 200, 64, 64);
+```
+
+**Thread dispatch** is automatic: `simulate()` partitions the pixel range across `std::thread::hardware_concurrency()` workers when the detector is large enough that parallelism pays off. Each thread calls `_engine()` once — virtual dispatch overhead is O(nThreads), not O(nPixels).  `_engine()` is the second customisation point for detector-level physics which allows for the implementation of crosstalk, charge diffusion, persistence, custom readout modes ...
+
+**Initialisation from config**: `initialize(cfg)` understands the standard keys `gain`, `dark`, `readNoise`, `QE`, `KTCnoise`, `baseline`. Each key can be either a scalar (applied uniformly) or a string path to a FITS file containing a per-pixel map, with an optional `<key>.hdu` sibling specifying the HDU.
+
+### `ScenerySequencer` — (planned)
+
+`ScenerySequencer` will own the time loop for multi-exposure sequences, handling static scenes, variable sources, and moving objects with windowed re-simulation for efficiency. It is currently a placeholder pending the sky/scene object model design.
+
+---
+
+## Extending phot2pix — building a custom pixel simulator
+
+The design separates two concerns:
+
+- **Per-pixel physics** → subclass `pixsim`, override `pixelresponse()`.
+- **Detector-level physics** (crosstalk, charge diffusion, persistence, custom readout) → subclass `DetectorSimulator<YourPixel>`, override `_engine()` and/or `initialize()`.
+
+### Step 1: custom pixel
+
+```cpp
+#include <phot2pix/PixelSimulator.h>
+
+namespace myinstrument {
+
+class MyPixel : public phot2pix::pixsim
+{
+    double m_cteFactor = 1.0;   // charge transfer efficiency
+
+protected:
+    void _userValidation() override
+    {
+        if (m_cteFactor < 0.0 || m_cteFactor > 1.0)
+            throw std::invalid_argument("CTE factor must be in [0, 1].");
+    }
+
+public:
+    MyPixel() : phot2pix::pixsim() {}
+    MyPixel(double dark, double rn, double gain, double QE,
+            double ktc, double baseline, double cte)
+        : phot2pix::pixsim(dark, rn, gain, QE, ktc, baseline), m_cteFactor(cte)
+    {
+        _userValidation();
+    }
+
+    void setCTE(double cte) { m_cteFactor = cte; _userValidation(); }
+
+    // Override the response to incorporate CTE loss
+    double pixelresponse(const double& flux, const double& expTime) const override
+    {
+        double baseSignal = phot2pix::pixsim::pixelresponse(flux, expTime);
+        return baseSignal * m_cteFactor;
+    }
+};
+
+} // namespace myinstrument
+```
+
+### Step 2: custom detector
+
+```cpp
+#include <phot2pix/DetectorSimulator.h>
+#include "MyPixel.h"
+
+namespace myinstrument {
+
+class MyDetector : public phot2pix::DetectorSimulator<MyPixel>
+{
+public:
+    MyDetector(size_t w, size_t h)
+        : phot2pix::DetectorSimulator<MyPixel>(w, h, USHORT_IMG) {}
+
+    // Extend initialize() to handle custom config keys
+    void initialize(const phot2pix::PixelConfig& cfg) override
+    {
+        // Apply standard keys first (gain, dark, readNoise, QE, KTCnoise, baseline)
+        phot2pix::DetectorSimulator<MyPixel>::initialize(cfg);
+
+        // Apply custom key
+        if (cfg.has("CTE"))
+        {
+            const double cte = cfg.getAsDouble("CTE");
+            for (size_t i = 0; i < size(); ++i)
+                at(i).setCTE(cte);
+        }
+    }
+
+protected:
+    // Override _engine() to add detector-level effects (e.g. column glow)
+    void _engine(const std::valarray<double>& flux,
+                 double dt, size_t begin, size_t end,
+                 std::valarray<double>& frame) const override
+    {
+        for (size_t i = begin; i < end; ++i)
+            frame[i] = at(i).pixelresponse(flux[i], dt);
+
+        // Add column glow to the last 10 columns
+        for (size_t i = begin; i < end; ++i)
+        {
+            const size_t col = i % m_width;
+            if (col >= m_width - 10)
+                frame[i] += 2.0; // 2 e- glow
+        }
+    }
+};
+
+} // namespace myinstrument
+```
+
+---
+
+## Example: Euclid/NISP (`src/nisp/`)
+
+The `src/nisp/` directory is an in-progress implementation of a pixel simulator for the Euclid **NISP** instrument, which uses **HAWAII-2RG** HgCdTe infrared detector arrays (SCAs).
+
+> **Status:** the persistence model and SCA class are implemented; the full readout mode chain (CDS, MACC, UTR, DPU) is declared but not yet filled in.
+
+### Class hierarchy
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.in2p3.fr/gillard/phot2pix.git
-git branch -M main
-git push -uf origin main
+phot2pix::pixsim
+  └── nisp::pixel                    — HAWAII-2RG pixel (currently thin wrapper)
+
+phot2pix::pixsim
+  └── nisp::persistence::model       — persistence trap pixel (private inheritance)
+
+phot2pix::DetectorSimulator<nisp::persistence::model>
+  └── nisp::persistence::pixelArray  — full-array persistence simulator
+
+phot2pix::DetectorSimulator<nisp::pixel>
+  └── nisp::SCA                      — full NISP SCA (2048×2048, uint16 output)
 ```
 
-## Integrate with your tools
+### `nisp::pixel`
 
-* [Set up project integrations](https://gitlab.in2p3.fr/gillard/phot2pix/-/settings/integrations)
+A thin subclass of `pixsim` reserving room for HAWAII-2RG-specific pixel behaviour:
 
-## Collaborate with your team
+```cpp
+// src/nisp/nispPixel.h
+nisp::pixel px(
+    /*dark*/     0.0007,
+    /*readNoise*/12.0,
+    /*gain*/     2.0,
+    /*QE*/       0.85,
+    /*KTCnoise*/ 0.0,
+    /*baseline*/ 0.0
+);
+```
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### `nisp::SCA`
 
-## Test and Deploy
+A 2048×2048 detector producing `uint16` FITS output. `initialize()` recognises the standard pixel keys plus NISP-specific ones (`offset`/`dpu_offset`, `scale`/`dpu_scale`, `fr_time`/`frame_time`).
 
-Use the built-in continuous integration in GitLab.
+```cpp
+#include <nisp/nispSCA.h>
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+nisp::SCA sca;   // 2048×2048
 
-***
+phot2pix::PixelConfig cfg = {
+    {"gain",       2.0   },
+    {"readNoise",  12.0  },
+    {"dark",       0.0007},
+    {"QE",         0.85  },
+    {"KTCnoise",   0.0   },
+    {"baseline",   0.0   },
+    {"dpu_offset", 0.0   },
+    {"dpu_scale",  1.0   },
+    {"frame_time", 1.45408}
+};
+sca.initialize(cfg);
 
-# Editing this README
+std::shared_ptr<DSL::FITScube> frame = sca.simulate(/*flux ph/s*/ 200.0, /*exp s*/ 100.0);
+```
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+### `nisp::persistence` — trap-based persistence model
 
-## Suggestions for a good README
+The persistence sub-namespace implements a multi-trap exponential decay model:
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+```
+signal(dT, expTime) = flux × Σ_k  f_k × e^{−dT/τ_k} × τ_k × (e^{expTime/τ_k} − 1)
+```
 
-## Name
-Choose a self-explaining name for your project.
+where `f_k` is the trapped fraction and `τ_k` is the decay time for trap species `k`.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+The **`scheduler`** accumulates the charge history of past exposures and computes the total persistence contribution for a new exposure:
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+```cpp
+phot2pix::PixelConfig persistCfg = {
+    /* persistence trap parameters as a JSON array */
+};
+// The JSON value must contain a "persistence" key with trap list:
+// { "persistence": [{"f": 0.02, "t": 100.0}, {"f": 0.005, "t": 1000.0}] }
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+auto sched = std::make_shared<nisp::persistence::scheduler>(persistCfg);
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+// After each science exposure, register its charge image:
+sched->insertCharges(scienceFrame, /*t0=*/ 0.0);
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+// Before the next exposure, compute the persistence signal:
+double gapSeconds    = 30.0;
+double nextExpTime   = 100.0;
+auto persistSignal   = sched->computePersistenceSignal(gapSeconds, nextExpTime);
+// Add persistSignal to the simulated science frame.
+```
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+The `nisp::SCA` can host a `persistence::scheduler` via `insertPersistenceModel()`.
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+### Initialising persistence from JSON config
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+```json
+{
+  "gain":      2.0,
+  "readNoise": 12.0,
+  "dark":      0.0007,
+  "QE":        0.85,
+  "KTCnoise":  0.0,
+  "baseline":  0.0,
+  "persistence": {
+    "dT": 0.0,
+    "traps": [
+      {"f": 0.020, "t":  100.0},
+      {"f": 0.005, "t": 1000.0}
+    ]
+  }
+}
+```
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
+---
 
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
+## Running the tests
 
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+```bash
+cmake --build build --target all
+ctest --test-dir build --output-on-failure
+```
 
-## License
-For open source projects, say how it is licensed.
+Test sources live in `src/test/`:
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+| File | Covers |
+|---|---|
+| `gTest_pixelconfig.cxx` | `PixelConfig` construction, accessors, JSON round-trip |
+| `gTest_pixels.cxx` | `pixsim` response, setters, copy semantics |
+| `gTest_detector.cxx` | `DetectorSimulator` geometry, initialisation, simulate |
+| `gTest_persistence.cxx` | `nisp::persistence` model and scheduler |
+
+---
+
+## Project structure
+
+```
+phot2pix/
+├── CMakeLists.txt
+├── src/
+│   ├── phot2pix/                  ← generic library (instrument-agnostic)
+│   │   ├── PixelConfig.h          ← typed key-value config bag
+│   │   ├── PixelSimulator.h/.cxx  ← pixsim base class
+│   │   ├── DetectorSimulator.h    ← DetectorSimulator<PixelT> template
+│   │   └── ScenerySequencer.h     ← (planned) multi-exposure time loop
+│   ├── nisp/                      ← Euclid/NISP instrument example
+│   │   ├── nispPixel.h/.cxx       ← nisp::pixel
+│   │   └── nispSCA.h/.cxx         ← nisp::SCA + persistence model
+│   └── test/                      ← GoogleTest suite
+├── googletest/                    ← git submodule
+└── cmake/
+    └── phot2pixConfig.cmake.in
+```
+
+---
+
+## Authors
+
+William Gillard — CPPM, Aix-Marseille Université / CNRS

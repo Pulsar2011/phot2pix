@@ -305,6 +305,51 @@ set_target_properties(phot2pix PROPERTIES
     BUILD_RPATH   "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
+# ─── Library: nisppixelsimulator ─────────────────────────────────────────────
+file(GLOB_RECURSE NISP_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/nisp/*.cxx"
+)
+file(GLOB_RECURSE NISP_HEADERS CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/nisp/*.h"
+)
+
+if(NISP_SOURCES)
+    add_library(nisppixelsimulator SHARED ${NISP_SOURCES})
+
+    # Expose both src/ (for <nisp/...>) and src/phot2pix/ (for <PixelSimulator.h>
+    # and <DetectorSimulator.h> used by the nisp headers directly).
+    target_include_directories(nisppixelsimulator
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/phot2pix>
+            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    )
+
+    target_link_libraries(nisppixelsimulator
+        PRIVATE _p2p_opts
+        PUBLIC  phot2pix
+    )
+
+    set_target_properties(nisppixelsimulator PROPERTIES
+        OUTPUT_NAME "nisppixelsimulator"
+        VERSION     ${PROJECT_VERSION}
+        SOVERSION   ${PROJECT_VERSION_MAJOR}
+        INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}"
+        BUILD_RPATH   "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+
+    install(TARGETS nisppixelsimulator
+        LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+    install(FILES ${NISP_HEADERS}
+        DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/nisp"
+    )
+
+    message(STATUS "${_G}  nisp lib      :${_Z} nisppixelsimulator")
+endif()
+
 # ─── Tests ────────────────────────────────────────────────────────────────────
 option(BUILD_TESTING "Build the GoogleTest suite" ON)
 
@@ -333,6 +378,10 @@ if(BUILD_TESTING)
             PRIVATE GTest::gtest
             PRIVATE GTest::gtest_main
         )
+        # nisp tests additionally link against nisppixelsimulator
+        if(TARGET nisppixelsimulator)
+            target_link_libraries(${_test_name} PRIVATE nisppixelsimulator)
+        endif()
         # Register tests with CTest (auto-discovers TEST() macros at build time)
         gtest_discover_tests(${_test_name})
     endforeach()

@@ -1,3 +1,12 @@
+//
+// Created by gillard on 2026-06-25.
+// Centre de Physique des Particule de Marseille (CPPM)
+// Licence under PolyForm Noncommercial License 1.0.0 https://polyformproject.org/licenses/noncommercial/1.0.0
+//  You may share and adapt this code with attribution, Non Comercial use only.
+//
+// gTest_detector.cxx
+//
+
 #include <gtest/gtest.h>
 #include <phot2pix/DetectorSimulator.h>
 //#include <cfitsio/fitsio.h>
@@ -706,7 +715,7 @@ TEST(DetectorConfig, UnknownKeyIgnored)
 {
     DetectorSimulator<> det(4, 4);
     PixelConfig cfg{ {"unknown_field", 99.0} };
-    EXPECT_NO_THROW(det.initialize(cfg)); // _applyCustomConfig default: no-op
+    EXPECT_NO_THROW(det.initialize(cfg));
 }
 
 TEST(DetectorConfig, MultipleKeys)
@@ -730,21 +739,21 @@ TEST(DetectorConfig, MultipleKeys)
     }
 }
 
-TEST(DetectorConfig, CustomConfigHook)
+TEST(DetectorConfig, CustomConfigOverride)
 {
-    // Derived detector that counts how many times _applyCustomConfig is called
-    // and records the config it received.
+    // Derived detector that overrides initialize() to handle an extra key
+    // while delegating standard keys to the base class.
     class TrackingDetector : public DetectorSimulator<>
     {
     public:
         TrackingDetector(size_t w, size_t h) : DetectorSimulator<>(w, h) {}
-        int    hookCallCount = 0;
+        int    initCallCount = 0;
         double receivedCustomValue = -1.0;
 
-    protected:
-        void _applyCustomConfig(const PixelConfig& cfg) override
+        void initialize(const PixelConfig& cfg) override
         {
-            ++hookCallCount;
+            DetectorSimulator<>::initialize(cfg);   // applies gain, dark, etc.
+            ++initCallCount;
             receivedCustomValue = cfg.getAsDouble("custom", -1.0);
         }
     };
@@ -755,11 +764,10 @@ TEST(DetectorConfig, CustomConfigHook)
         {"custom", 7.7}
     });
 
-    EXPECT_EQ(det.hookCallCount, 1);
+    EXPECT_EQ(det.initCallCount, 1);
     EXPECT_DOUBLE_EQ(det.receivedCustomValue, 7.7);
 
-    const auto& cdet = det;  // bind to const to force call to const accessors
-
+    const auto& cdet = det;
     for (size_t i = 0; i < det.size(); ++i)
         EXPECT_DOUBLE_EQ(cdet.at(i).getGain(), 1.5);
 }

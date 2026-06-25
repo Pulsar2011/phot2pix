@@ -40,7 +40,7 @@ namespace phot2pix
     class PixelConfig
     {
     public:
-        using Value = std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t, size_t, float, double, std::string>;
+        using Value = std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t, size_t, float, double, std::string, json>;
 
         PixelConfig() = default;
 
@@ -131,6 +131,17 @@ namespace phot2pix
             }, it->second);
         }
 
+        /// Return the raw json node for array/object keys. Throws if absent or not a json type.
+        const json& getJson(const std::string& key) const
+        {
+            auto it = m_params.find(key);
+            if (it == m_params.end())
+                throw std::out_of_range("PixelConfig: missing key '" + key + "'");
+            if (!std::holds_alternative<json>(it->second))
+                throw std::invalid_argument("PixelConfig: key '" + key + "' is not a JSON array/object.");
+            return std::get<json>(it->second);
+        }
+
         /// Non-throwing overload: returns defaultVal if the key is absent or non-numeric.
         double getAsDouble(const std::string& key, double defaultVal) const noexcept
         {
@@ -160,7 +171,7 @@ namespace phot2pix
                 else if (v.is_number_integer())   m_params[k] = v.get<int64_t>();
                 else if (v.is_number_float())     m_params[k] = v.get<double>();
                 else if (v.is_string())           m_params[k] = v.get<std::string>();
-                // nested objects / arrays are silently skipped
+                else if (v.is_array() || v.is_object()) m_params[k] = v;
             }
         }
     };
