@@ -11,12 +11,13 @@
 #define _NISP_SCA_H_
 
 #include "nispPixel.h"
-#include <PixelSimulator.h>
-#include <DetectorSimulator.h>  // same include-path dir as PixelSimulator.h
+#include "nispOneOverFNoise.h"
 #include <vector>
 #include <map>
 #include <memory>
 #include <algorithm>
+
+#include <phot2pix/phot2pix.h>
 
 namespace nisp
 {
@@ -27,6 +28,17 @@ namespace nisp
         UTR,   ///< Sample Up The Ramp
         DPU,   ///< Flux estimation emulating the onboard DPU algorithm
         FLUX   ///< Fast flux estimation (last frame only)
+    };
+
+    struct macc
+    {
+        size_t nGroups;
+        size_t nFrames;  ///< Number of frames to accumulate
+        size_t nDrop;    ///< Number of frames to skip between accumulations
+
+        macc UTR(const size_t& nFrames) { return {1, nFrames, 0}; }
+        macc MACC(const size_t& nGroups, const size_t& nFrames, const size_t& nDrop) { return {nGroups, nFrames, nDrop}; }
+        macc CDS(const size_t nDrops) { return {2, 1, nDrops}; }
     };
 
 // ── Persistence model ─────────────────────────────────────────────────────────
@@ -116,11 +128,21 @@ namespace nisp
                 std::unique_ptr<pixelArray>  m_pixelModel;
                 std::vector<ExposureRecord>  m_fluxHistory;
                 const phot2pix::PixelConfig& m_cfg;
+                size_t                       m_threadCount{0}; ///< 0 = use pixelArray default
 
             public:
                 explicit scheduler(const phot2pix::PixelConfig& cfg)
                     : m_pixelModel(nullptr), m_fluxHistory(), m_cfg(cfg) {}
                 virtual ~scheduler() = default;
+
+                // Limit the thread budget used by the internal pixelArray.
+                // Mirrors DetectorSimulator::setThreadCount(); pass 0 to restore the default.
+                // Has no effect before the first insertCharges() call (pixelArray not yet created).
+                void setThreadCount(size_t n)
+                {
+                    m_threadCount = n;
+                    if (m_pixelModel) m_pixelModel->setThreadCount(n);
+                }
 
                 // Store a new exposure. t0 is the elapsed time since this exposure
                 // (0 if it just finished, positive if there was a gap before insertion).
@@ -152,9 +174,15 @@ namespace nisp
     private:
         double dpuOffset = 0.0;
         double dpuScale  = 1.0;
+        double dpuGain   = 2.0;  // Mean gain in ADU/electron for the DPU flux estimation algorithm
+        double dpuNoise  = 10.0; // Mean read noise in electrons (RMS) for the DPU flux estimation algorithm
         double frameTime = 1.45408; ///< NISP HAWAII-2RG frame time (seconds)
+        bool   m_enable_persistence = false;
+        bool   m_enable_oneOverF = true;
+        nisp::mode m_mode = nisp::mode::MACC;
 
         std::shared_ptr<persistence::scheduler> persistenceModelling;
+        nisp::OneOverFNoise m_oneOverFNoise;
 
         // Apply DPU scale/offset and saturate to uint16.
         // Output dimensions are read from doubleFrame->Size(1/2).
@@ -170,6 +198,33 @@ namespace nisp
             for (size_t i = begin; i < end; ++i)
                 frame[i] = at(i).pixelresponse(flux[i], exposureTime);
         }
+
+        // oneOverFStream: when non-null (and 1/f noise enabled), consumes the
+        // next chunk of a continuous per-ramp AR(1) process instead of
+        // independently generating a fresh one. Passed by expose_macc() so
+        // every read in a ramp shares one continuous noise stream rather than
+        // each read restarting the amplifier state at zero.
+        void _simulate(const std::valarray<double>& flux,
+                          const double& exposureTime,
+                          std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg = phot2pix::PixelConfig(),
+                          nisp::OneOverFNoise::Stream* oneOverFStream = nullptr);
+
+        void _simulate(const std::valarray<double>& flux,
+                          const double& exposureTime, 
+                          std::shared_ptr<DSL::FITScube>& frame,
+                          size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg = phot2pix::PixelConfig());
+
+        std::shared_ptr<DSL::FITScube> expose_macc(const std::valarray<double>& flux,
+                          const nisp::macc& maccParams);
+
+        std::shared_ptr<DSL::FITScube> expose_cds(const std::valarray<double>& flux,
+                          const double& exposureTime);
+
+        std::shared_ptr<DSL::FITScube> expose_flux(const std::valarray<double>& flux,
+                          const double& exposureTime);
+
+        std::shared_ptr<DSL::FITScube> expose_dpu(const std::valarray<double>& flux,
+                           const nisp::macc& maccParams);
 
     public:
         // ── Selectively re-exported base API ─────────────────────────────────
@@ -199,22 +254,25 @@ namespace nisp
         { persistenceModelling = model; }
 
         // ── Exposure ─────────────────────────────────────────────────────────
-        // Full-frame exposure: pixel response + persistence → uint16 ADU FITS image.
-        // dT: gap in seconds between the end of the previous exposure and this one.
-        std::shared_ptr<DSL::FITScube> expose(
-            const std::valarray<double>& flux,
-            double exposureTime,
-            double dT = 0.0);
-
         // Windowed exposure: only the [c0, r0, ncols, nrows] sub-region is simulated.
         // fullFlux must cover the entire detector and is used for scheduler bookkeeping.
         // Returns a uint16 ADU FITS image of size ncols × nrows.
         std::shared_ptr<DSL::FITScube> expose(
             const std::valarray<double>& fullFlux,
             double exposureTime,
-            double dT,
             size_t c0, size_t r0, size_t ncols, size_t nrows);
+
+        std::shared_ptr<DSL::FITScube> expose(
+            const std::valarray<double>& fullFlux,
+            const nisp::macc& maccParams);
+
+        std::shared_ptr<DSL::FITScube> expose(
+            const std::valarray<double>& fullFlux,
+            const double& exposureTime);
+        
+        void resetSimulationState();
     };
+
 #pragma endregion
 
 } // namespace nisp

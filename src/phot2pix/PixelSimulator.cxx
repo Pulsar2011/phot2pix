@@ -10,7 +10,6 @@
 #include "PixelSimulator.h"
 
 #include<cstring>
-#include <DSTmath/DSTstatistic.h>
 
 namespace phot2pix
 {

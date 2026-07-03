@@ -7,6 +7,8 @@
 // gTest_detector.cxx
 //
 
+#include <filesystem>
+
 #include <gtest/gtest.h>
 #include <phot2pix/DetectorSimulator.h>
 //#include <cfitsio/fitsio.h>
@@ -737,6 +739,157 @@ TEST(DetectorConfig, MultipleKeys)
         EXPECT_DOUBLE_EQ(cdet.at(i).getQuantumEfficiency(), 0.9);
         EXPECT_DOUBLE_EQ(cdet.at(i).getReadNoise(),         3.0);
     }
+}
+
+TEST(DetectorConfig, FromFitsFile_form1)
+{
+    DSL::FITSimg<double> gain({4,4});
+    for(size_t r=0; r<gain.Size(); ++r)
+        gain.SetPixelValue(static_cast<double>(r+1),r);
+
+    std::string url = "test_data";
+
+    if(std::filesystem::exists(url+"/test_gain.fits"))
+        std::filesystem::remove_all(url);
+    
+    std::filesystem::create_directory(url);
+    
+
+    gain.Write(url+"/test_gain.fits");
+
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{
+        {"gain.file",url+"/test_gain.fits"},
+        {"gain.hdu", 1},
+        {"dark",      0.5},
+        {"QE",        0.9},
+        {"readNoise", 3.0}
+    });
+
+    const auto& cdet = det;  // bind to const to force call to const accessors
+    
+    for (size_t i = 0; i < det.size(); ++i)
+    {
+        EXPECT_DOUBLE_EQ(cdet.at(i).getGain(),              static_cast<double>(i+1));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getDarkCurrent(),       0.5);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getQuantumEfficiency(), 0.9);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getReadNoise(),         3.0);
+    }
+
+    std::filesystem::remove_all(url+"/test_gain.fits");
+}
+
+TEST(DetectorConfig, FromFitsFile_form2)
+{
+    DSL::FITSimg<double> gain({4,4});
+    for(size_t r=0; r<gain.Size(); ++r)
+        gain.SetPixelValue(static_cast<double>(r+1),r);
+    gain.SetName("GAIN");
+
+    std::string url = "test_data";
+
+    if(std::filesystem::exists(url+"/test_gain.fits"))
+        std::filesystem::remove_all(url);
+    
+    std::filesystem::create_directory(url);
+    
+
+    gain.Write(url+"/test_gain.fits");
+
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{
+        {"gain.file",url+"/test_gain.fits"},
+        {"gain.hdu", std::string("GAIN")},
+        {"dark",      0.5},
+        {"QE",        0.9},
+        {"readNoise", 3.0}
+    });
+
+    const auto& cdet = det;  // bind to const to force call to const accessors
+    
+    for (size_t i = 0; i < det.size(); ++i)
+    {
+        EXPECT_DOUBLE_EQ(cdet.at(i).getGain(),              static_cast<double>(i+1));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getDarkCurrent(),       0.5);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getQuantumEfficiency(), 0.9);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getReadNoise(),         3.0);
+    }
+
+    std::filesystem::remove_all(url+"/test_gain.fits");
+}
+
+TEST(DetectorConfig, FromFitsFile_form3)
+{
+    DSL::FITSimg<double> gain({4,4});
+    for(size_t r=0; r<gain.Size(); ++r)
+        gain.SetPixelValue(static_cast<double>(r+1),r);
+
+    std::string url = "test_data";
+
+    if(std::filesystem::exists(url+"/test_gain.fits"))
+        std::filesystem::remove_all(url);
+    
+    std::filesystem::create_directory(url);
+    
+
+    gain.Write(url+"/test_gain.fits");
+
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{
+        {"gain","{\"file\":\""+url+"/test_gain.fits\",\"hdu\":" + std::to_string(1) + "}"},
+        {"dark",      0.5},
+        {"QE",        0.9},
+        {"readNoise", 3.0}
+    });
+
+    const auto& cdet = det;  // bind to const to force call to const accessors
+    
+    for (size_t i = 0; i < det.size(); ++i)
+    {
+        EXPECT_DOUBLE_EQ(cdet.at(i).getGain(),              static_cast<double>(i+1));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getDarkCurrent(),       0.5);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getQuantumEfficiency(), 0.9);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getReadNoise(),         3.0);
+    }
+
+    std::filesystem::remove_all(url+"/test_gain.fits");
+}
+
+TEST(DetectorConfig, FromFitsFile_form4)
+{
+    DSL::FITSimg<double> gain({4,4});
+    for(size_t r=0; r<gain.Size(); ++r)
+        gain.SetPixelValue(static_cast<double>(r+1),r);
+    gain.SetName("GAIN");
+
+    std::string url = "test_data";
+
+    if(std::filesystem::exists(url+"/test_gain.fits"))
+        std::filesystem::remove_all(url);
+    
+    std::filesystem::create_directory(url);
+    
+    gain.Write(url+"/test_gain.fits");
+
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{
+        {"gain","{\"file\":\""+url+"/test_gain.fits\",\"hdu\":\"GAIN\"}"},
+        {"dark",      0.5},
+        {"QE",        0.9},
+        {"readNoise", 3.0}
+    });
+
+    const auto& cdet = det;  // bind to const to force call to const accessors
+    
+    for (size_t i = 0; i < det.size(); ++i)
+    {
+        EXPECT_DOUBLE_EQ(cdet.at(i).getGain(),              static_cast<double>(i+1));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getDarkCurrent(),       0.5);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getQuantumEfficiency(), 0.9);
+        EXPECT_DOUBLE_EQ(cdet.at(i).getReadNoise(),         3.0);
+    }
+
+    std::filesystem::remove_all(url+"/test_gain.fits");
 }
 
 TEST(DetectorConfig, CustomConfigOverride)

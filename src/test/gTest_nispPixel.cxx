@@ -1,0 +1,458 @@
+//
+// Created by gillard on 2026-07-03.
+// Centre de Physique des Particule de Marseille (CPPM)
+// Licence under PolyForm Noncommercial License 1.0.0 https://polyformproject.org/licenses/noncommercial/1.0.0
+//  You may share and adapt this code with attribution, Non Comercial use only.
+//
+// gTest_nispPixel.cxx
+//
+
+#include <gtest/gtest.h>
+#include <nisp/nispPixel.h>
+#include <DSTmath/DSTstatistic.h>
+
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <valarray>
+#include <vector>
+
+using namespace nisp;
+using namespace phot2pix;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Deterministic, noise-free UTR ramp: frame[i] = s*i.
+static std::valarray<double> makeLinearRamp(double s, size_t nFrames)
+{
+    std::valarray<double> ramp(nFrames);
+    for (size_t i = 0; i < nFrames; ++i)
+        ramp[i] = s * static_cast<double>(i);
+    return ramp;
+}
+
+// Reproduces Ramp::getSlope()'s closed-form flux for a perfectly constant CDS
+// step `c` with zero read noise (beta == 0) — used to check the Kubic et al.
+// 2016 formula is applied consistently, not to independently re-derive it.
+static double expectedKubicFlux(double c, double gain, size_t nf, size_t nd)
+{
+    const double alpha = (1.0 - static_cast<double>(nf) * static_cast<double>(nf))
+                        / (3.0 * static_cast<double>(nf) * (static_cast<double>(nf) + static_cast<double>(nd)));
+    const double fe    = 1.0 / gain;
+    const double gamma = (2.0 * fe) / (alpha + 1.0);
+    const double ffit  = c * c;
+    return (1.0 / gamma) * (std::sqrt(1.0 + gamma * gamma * ffit) - 1.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  nisp::pixel — construction
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(nispPixel, DefaultConstruction)
+{
+    nisp::pixel p;
+    EXPECT_DOUBLE_EQ(p.getDarkCurrent(),       0.0);
+    EXPECT_DOUBLE_EQ(p.getReadNoise(),         0.0);
+    EXPECT_DOUBLE_EQ(p.getGain(),              1.0);
+    EXPECT_DOUBLE_EQ(p.getQuantumEfficiency(), 1.0);
+    EXPECT_DOUBLE_EQ(p.getKTCnoise(),          0.0);
+    EXPECT_DOUBLE_EQ(p.getBaseline(),          0.0);
+}
+
+TEST(nispPixel, ParameterizedConstruction)
+{
+    nisp::pixel p(1.0, 2.0, 3.0, 0.4, 5.0, 6.0);
+    EXPECT_DOUBLE_EQ(p.getDarkCurrent(),       1.0);
+    EXPECT_DOUBLE_EQ(p.getReadNoise(),         2.0);
+    EXPECT_DOUBLE_EQ(p.getGain(),              3.0);
+    EXPECT_DOUBLE_EQ(p.getQuantumEfficiency(), 0.4);
+    EXPECT_DOUBLE_EQ(p.getKTCnoise(),          5.0);
+    EXPECT_DOUBLE_EQ(p.getBaseline(),          6.0);
+}
+
+TEST(nispPixel, CopyConstructorPreservesBehaviour)
+{
+    // All noise sources zero except a fixed baseline ⇒ deterministic output.
+    nisp::pixel original(0.0, 0.0, 1.0, 1.0, 0.0, 42.0);
+    nisp::pixel copy(original);
+
+    EXPECT_DOUBLE_EQ(copy.getBaseline(), original.getBaseline());
+    EXPECT_DOUBLE_EQ(original.pixelresponse(0.0, 1.0), 42.0);
+    EXPECT_DOUBLE_EQ(copy.pixelresponse(0.0, 1.0),     42.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  nisp::pixel — pixelresponse() and the "baseline" cfg override
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(nispPixel, TwoArgOverloadAlwaysComputesBaseline)
+{
+    // flux=0, dark=0, readNoise=0 ⇒ shot/read term is exactly 0.
+    // KTC=5, baseline=100 ⇒ baseline term ~ N(100, 5).
+    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
+
+    constexpr double k        = 5.0;
+    constexpr size_t nSample  = 10'000;
+    const double     n        = static_cast<double>(nSample);
+    constexpr double mu       = 100.0;
+    constexpr double var      = 25.0;
+
+    double sigMean = 0.0, sigVar = 0.0;
+    for (size_t i = 0; i < nSample; ++i)
+    {
+        const double x = p.pixelresponse(0.0, 1.0);
+        sigMean += x;
+        sigVar  += x * x;
+    }
+    sigMean /= n;
+    sigVar   = sigVar / n - sigMean * sigMean;
+
+    EXPECT_NEAR(sigMean, mu,  k * std::sqrt(var / n));
+    EXPECT_NEAR(sigVar,  var, k * std::sqrt(2.0) * var / std::sqrt(n));
+}
+
+TEST(nispPixel, CfgBaselineOffSuppressesBaseline)
+{
+    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
+    PixelConfig cfg;
+    cfg.set("baseline", std::string("off"));
+
+    constexpr size_t nSample = 10'000;
+    const double     n       = static_cast<double>(nSample);
+
+    double sigMean = 0.0, sigVar = 0.0;
+    for (size_t i = 0; i < nSample; ++i)
+    {
+        const double x = p.pixelresponse(0.0, 1.0, cfg);
+        sigMean += x;
+        sigVar  += x * x;
+    }
+    sigMean /= n;
+    sigVar   = sigVar / n - sigMean * sigMean;
+
+    // With baseline off and all other noise sources zero, output is exactly 0.
+    EXPECT_NEAR(sigMean, 0.0, 1e-9);
+    EXPECT_NEAR(sigVar,  0.0, 1e-9);
+}
+
+TEST(nispPixel, CfgBaselineOnIsExplicitNoOp)
+{
+    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
+    PixelConfig cfg;
+    cfg.set("baseline", std::string("on"));
+
+    constexpr double k       = 5.0;
+    constexpr size_t nSample = 10'000;
+    const double     n       = static_cast<double>(nSample);
+
+    double sigMean = 0.0, sigVar = 0.0;
+    for (size_t i = 0; i < nSample; ++i)
+    {
+        const double x = p.pixelresponse(0.0, 1.0, cfg);
+        sigMean += x;
+        sigVar  += x * x;
+    }
+    sigMean /= n;
+    sigVar   = sigVar / n - sigMean * sigMean;
+
+    EXPECT_NEAR(sigMean, 100.0, k * std::sqrt(25.0 / n));
+    EXPECT_NEAR(sigVar,  25.0,  k * std::sqrt(2.0) * 25.0 / std::sqrt(n));
+}
+
+TEST(nispPixel, CfgUnknownBaselineValueIgnored)
+{
+    // Neither "off" nor "on" ⇒ m_computeBaseline is left at its default (true).
+    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
+    PixelConfig cfg;
+    cfg.set("baseline", std::string("bogus"));
+
+    constexpr double k       = 5.0;
+    constexpr size_t nSample = 10'000;
+    const double     n       = static_cast<double>(nSample);
+
+    double sigMean = 0.0, sigVar = 0.0;
+    for (size_t i = 0; i < nSample; ++i)
+    {
+        const double x = p.pixelresponse(0.0, 1.0, cfg);
+        sigMean += x;
+        sigVar  += x * x;
+    }
+    sigMean /= n;
+    sigVar   = sigVar / n - sigMean * sigMean;
+
+    EXPECT_NEAR(sigMean, 100.0, k * std::sqrt(25.0 / n));
+    EXPECT_NEAR(sigVar,  25.0,  k * std::sqrt(2.0) * 25.0 / std::sqrt(n));
+}
+
+TEST(nispPixel, FullNoiseBudgetViaCfgOverload)
+{
+    // Same setup as PixelSimulator.FullNoiseBudget in gTest_pixels.cxx, but
+    // driven through the 3-arg cfg overload with an empty cfg (no "baseline"
+    // key) to confirm it matches the 2-arg overload's behaviour exactly.
+    constexpr double flux      = 10.0;
+    constexpr double dark      =  1.0;
+    constexpr double readNoise =  5.0;
+    constexpr double gain      =  2.0;
+    constexpr double QE        =  0.75;
+    constexpr double KTC       =  3.0;
+    constexpr double baseline  = 100.0;
+    constexpr double t         = 100.0;
+
+    constexpr double signal_e = (flux * QE + dark) * t;                                    // 850 e
+    constexpr double mu_ADU   = signal_e / gain + baseline;                                // 525 ADU
+    constexpr double var_ADU  = (signal_e + readNoise * readNoise + KTC * KTC) / (gain * gain); // 221 ADU^2
+
+    nisp::pixel p(dark, readNoise, gain, QE, KTC, baseline);
+    PixelConfig cfg; // empty: no "baseline" override
+
+    constexpr double k       = 5.0;
+    constexpr size_t nSample = 10'000;
+    const double     n       = static_cast<double>(nSample);
+
+    double sigMean = 0.0, sigVar = 0.0;
+    for (size_t i = 0; i < nSample; ++i)
+    {
+        const double x = p.pixelresponse(flux, t, cfg);
+        sigMean += x;
+        sigVar  += x * x;
+    }
+    sigMean /= n;
+    sigVar   = sigVar / n - sigMean * sigMean;
+
+    EXPECT_NEAR(sigMean, mu_ADU,  k * std::sqrt(var_ADU / n));
+    EXPECT_NEAR(sigVar,  var_ADU, k * std::sqrt(2.0) * var_ADU / std::sqrt(n));
+}
+
+TEST(nispPixel, ResetStateDoesNotDisableBaseline)
+{
+    // m_computeBaseline is a one-way latch (resetState() does `|= true`) —
+    // there is no public way to make it false except the per-call
+    // cfg["baseline"]="off" override tested above.
+    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 0.0, 77.0);
+    p.resetState();
+    p.resetState();
+    EXPECT_DOUBLE_EQ(p.pixelresponse(0.0, 1.0), 77.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  nisp::Ramp — coadd() / getSlope() / getFowler() on noise-free linear ramps
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(nispRamp, CoaddNoiselessLinearRampMatchesKubicFormula)
+{
+    // For a perfectly linear, noise-free UTR ramp (frame[i] = s*i), every
+    // coadded CDS difference equals the same constant c = s*(nreads+ndrops).
+    // With fsigma=0 (beta=0), Ramp::getSlope() must then report chi2 == 0
+    // exactly (size*pseudo_flux == lf identically, regardless of alpha/gamma),
+    // and its "flux" output must match the Kubic-formula closed form for a
+    // constant CDS step, which does exercise alpha/gamma.
+    struct RampCase { double s; size_t nreads; size_t ndrops; size_t ngr; double gain; };
+    const std::vector<RampCase> cases = {
+        {1.0,  2, 0, 5,  1.0},
+        {3.7,  4, 1, 8,  2.5},
+        {0.5,  8, 3, 6,  1.0},
+        {10.0, 1, 0, 10, 4.0},
+    };
+
+    for (const auto& c : cases)
+    {
+        const size_t N = c.ngr * (c.nreads + c.ndrops);
+        std::valarray<double> utr = makeLinearRamp(c.s, N);
+
+        nisp::Ramp  raw(&utr, std::slice(0, N, 1), 0.0, c.gain);
+        nisp::Ramp& macc = raw.coadd(c.ngr, c.nreads, c.ndrops);
+
+        double flux = 0.0, chi2 = 0.0, err = 0.0;
+        macc.getSlope(flux, chi2, err);
+
+        EXPECT_NEAR(chi2, 0.0, 1e-6)
+            << "s=" << c.s << " nreads=" << c.nreads << " ndrops=" << c.ndrops
+            << " ngr=" << c.ngr << " gain=" << c.gain;
+
+        const double step         = c.s * static_cast<double>(c.nreads + c.ndrops);
+        const double expectedFlux = expectedKubicFlux(step, c.gain, c.nreads, c.ndrops);
+        EXPECT_NEAR(flux, expectedFlux, 1e-6 * std::max(1.0, std::abs(expectedFlux)))
+            << "s=" << c.s << " nreads=" << c.nreads << " ndrops=" << c.ndrops
+            << " ngr=" << c.ngr << " gain=" << c.gain;
+
+        delete &macc;
+    }
+}
+
+TEST(nispRamp, GetFowlerOnRawRamp)
+{
+    std::valarray<double> data = {2.0, 5.0, 3.0, 9.0};
+    nisp::Ramp r(&data, std::slice(0, 4, 1));
+
+    double flux = 0.0;
+    r.getFowler(flux);
+    EXPECT_DOUBLE_EQ(flux, 9.0 - 2.0);
+}
+
+TEST(nispRamp, GetFowlerOnCoaddedRamp)
+{
+    constexpr double s       = 2.0;
+    constexpr size_t nreads  = 3;
+    constexpr size_t ndrops  = 1;
+    constexpr size_t ngr     = 4;
+    constexpr size_t N       = ngr * (nreads + ndrops);
+
+    std::valarray<double> utr = makeLinearRamp(s, N);
+    nisp::Ramp  raw(&utr, std::slice(0, N, 1));
+    nisp::Ramp& macc = raw.coadd(ngr, nreads, ndrops);
+
+    double flux = 0.0;
+    macc.getFowler(flux);
+
+    // Telescoping sum of (ngr-1) equal steps of size s*(nreads+ndrops).
+    const double expected = static_cast<double>(ngr - 1) * s * static_cast<double>(nreads + ndrops);
+    EXPECT_DOUBLE_EQ(flux, expected);
+
+    delete &macc;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  nisp::Ramp — getCDS()
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(nispRamp, GetCDSStandardBranchMatchesHandComputation)
+{
+    // Non-linear ramp (squares), default ndrops=0 <= 1 ⇒ standard whole-ramp
+    // consecutive-difference branch.
+    std::valarray<double> data = {1.0, 4.0, 9.0, 16.0, 25.0}; // diffs: 3,5,7,9
+    nisp::Ramp r(&data, std::slice(0, 5, 1));
+
+    double cds = 0.0, noise = 0.0;
+    r.getCDS(cds, noise);
+
+    EXPECT_NEAR(cds,   6.0,            1e-9); // mean(3,5,7,9)
+    EXPECT_NEAR(noise, std::sqrt(20.0/3.0), 1e-9); // stddev(ddof=1)
+}
+
+TEST(nispRamp, GetCDSThrowsOnTooShortRamp)
+{
+    std::valarray<double> data = {5.0};
+    nisp::Ramp r(&data, std::slice(0, 1, 1));
+
+    double cds = 0.0, noise = 0.0;
+    EXPECT_THROW(r.getCDS(cds, noise), std::runtime_error);
+}
+
+TEST(nispRamp, GetCDSMaccBranchCharacterization)
+{
+    // Characterization test: this locks in CURRENT behaviour of the
+    // `else if (nreads > 1)` branch, which is reached here because ndrops=2
+    // fails the `ndrops <= 1` guard. NOTE: the loop advances each group-start
+    // offset by 1 per iteration rather than by `nreads`, which contradicts
+    // its own doc comment ("within each group of nreads frames..."). This is
+    // NOT asserted to be "correct" — only that it doesn't silently change.
+    std::valarray<double> data(12);
+    for (size_t i = 0; i < 12; ++i)
+        data[i] = static_cast<double>(i * i); // 0,1,4,9,16,25,36,49,64,81,100,121
+
+    nisp::Ramp r(&data, std::slice(0, 12, 1));
+    r.reads_per_group(4);
+    r.drops_per_group(2);
+
+    double cds = 0.0, noise = 0.0;
+    r.getCDS(cds, noise);
+
+    // Hand-derived from the current loop (iS=0..2, k=0..2 per iS):
+    // diffs = [1,3,5, 3,5,7, 5,7,9] -> mean=5.0, stddev(ddof=1)=sqrt(6.0)
+    EXPECT_NEAR(cds,   5.0,            1e-9);
+    EXPECT_NEAR(noise, std::sqrt(6.0), 1e-9);
+}
+
+TEST(nispRamp, AccessorsAndSliceRoundTrip)
+{
+    std::valarray<double> data = {10.0, 20.0, 30.0, 40.0, 50.0};
+    std::slice sl(1, 3, 1); // elements 20,30,40
+
+    nisp::Ramp r(&data, sl, 2.5, 1.5);
+    r.reads_per_group(4);
+    r.drops_per_group(2);
+
+    EXPECT_EQ(r.get_reads_per_group(), 4u);
+    EXPECT_EQ(r.get_drops_per_group(), 2u);
+
+    EXPECT_EQ(r.get_slice().start(),  sl.start());
+    EXPECT_EQ(r.get_slice().size(),   sl.size());
+    EXPECT_EQ(r.get_slice().stride(), sl.stride());
+
+    nisp::rawLines got = r.getRamp();
+    ASSERT_EQ(got.size(), 3u);
+    EXPECT_DOUBLE_EQ(got[0], 20.0);
+    EXPECT_DOUBLE_EQ(got[1], 30.0);
+    EXPECT_DOUBLE_EQ(got[2], 40.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  nisp::Ramp — statistical consistency of the reported flux uncertainty
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(nispRamp, CoaddStatisticalErrorMatchesObservedScatter)
+{
+    // Build many independent noisy realizations of the same underlying ramp
+    // (constant slope s, per-frame read noise sigma) and check that the
+    // *reported* uncertainty `err` from getSlope() is consistent, in order of
+    // magnitude, with the *observed* trial-to-trial scatter of `flux`. This
+    // validates the alpha/beta/gamma error-propagation path without needing
+    // to independently re-derive the Kubic et al. bias-corrected flux formula
+    // in closed form.
+    constexpr double s       = 8.0;
+    constexpr double gain    = 1.0;
+    constexpr double sigma   = 3.0;
+    constexpr size_t nreads  = 4;
+    constexpr size_t ndrops  = 1;
+    constexpr size_t ngr     = 30;
+    constexpr size_t nFrames = ngr * (nreads + ndrops);
+    constexpr size_t nTrials = 1500;
+
+    std::vector<double> fluxSamples;
+    std::vector<double> errSamples;
+    fluxSamples.reserve(nTrials);
+    errSamples.reserve(nTrials);
+
+    for (size_t trial = 0; trial < nTrials; ++trial)
+    {
+        std::valarray<double> utr(nFrames);
+        double cumulative = 0.0;
+        for (size_t i = 0; i < nFrames; ++i)
+        {
+            cumulative += s + DST::Math::sample_normal_distribution(0.0, sigma);
+            utr[i] = cumulative;
+        }
+
+        nisp::Ramp  raw(&utr, std::slice(0, nFrames, 1), sigma, gain);
+        nisp::Ramp& macc = raw.coadd(ngr, nreads, ndrops);
+
+        double flux = 0.0, chi2 = 0.0, err = 0.0;
+        macc.getSlope(flux, chi2, err);
+
+        fluxSamples.push_back(flux);
+        errSamples.push_back(err);
+
+        delete &macc;
+    }
+
+    const double n = static_cast<double>(nTrials);
+    double meanFlux = 0.0, meanErr = 0.0;
+    for (size_t i = 0; i < nTrials; ++i) { meanFlux += fluxSamples[i]; meanErr += errSamples[i]; }
+    meanFlux /= n;
+    meanErr  /= n;
+
+    double varFlux = 0.0;
+    for (double f : fluxSamples) varFlux += (f - meanFlux) * (f - meanFlux);
+    varFlux /= (n - 1.0);
+    const double empiricalStd = std::sqrt(varFlux);
+
+    // Broad factor-of-3 band rather than a tight relative tolerance: this
+    // checks `err` is in the right ballpark (not zero, not orders of
+    // magnitude off), without assuming an exact calibration constant that
+    // would need to be verified empirically against a real build.
+    EXPECT_GT(meanErr, 0.0);
+    EXPECT_GT(empiricalStd, 0.3 * meanErr)
+        << "empiricalStd=" << empiricalStd << " meanErr=" << meanErr;
+    EXPECT_LT(empiricalStd, 3.0 * meanErr)
+        << "empiricalStd=" << empiricalStd << " meanErr=" << meanErr;
+}

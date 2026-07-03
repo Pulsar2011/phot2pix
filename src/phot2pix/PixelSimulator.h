@@ -12,6 +12,7 @@
 #define P2P_PIXEL_SIMULATOR_H
 
 #include "PixelConfig.h"
+#include <DSTmath/DSTstatistic.h>
 
 namespace phot2pix
 {

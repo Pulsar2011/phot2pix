@@ -232,7 +232,8 @@ namespace phot2pix
         const size_t        m_height;
         std::vector<PixelT> m_pixels; ///< Flat row-major pixel array
         const int m_pixelType;        ///< FITS storage type for output cube
-        
+        size_t m_nThreads;            ///< Thread budget for simulate(); set via setThreadCount()
+
 #pragma endregion
 #pragma region -> member functions
 
@@ -527,7 +528,8 @@ namespace phot2pix
 
 #pragma region - ctor/dtor
         DetectorSimulator(size_t width, size_t height, const int& dataType = DOUBLE_IMG)
-            : m_width(width), m_height(height), m_pixels(width * height), m_pixelType(dataType)
+            : m_width(width), m_height(height), m_pixels(width * height), m_pixelType(dataType),
+              m_nThreads(_computeThreadCount(width * height))
         {
             if (width == 0 || height == 0)
                 throw std::invalid_argument("Width and height must be positive integers.");
@@ -540,6 +542,17 @@ namespace phot2pix
         size_t getWidth()  const { return m_width; }
         size_t getHeight() const { return m_height; }
         size_t size()      const { return m_pixels.size(); }
+
+        size_t getThreadCount() const { return m_nThreads; }
+
+        // Set the thread budget used by simulate(). Capped at hardware_concurrency();
+        // pass 0 to restore the default heuristic.
+        void setThreadCount(size_t n)
+        {
+            const size_t hw = std::thread::hardware_concurrency();
+            m_nThreads = (n == 0 || n > hw) ? _computeThreadCount(m_pixels.size())
+                                             : std::max(size_t(1), n);
+        }
 #pragma endregion
 
 #pragma region - read-only pixel access
@@ -653,56 +666,113 @@ namespace phot2pix
         }
 
     private:
-        // Resolve a config key to a per-pixel valarray:
-        //   - empty valarray if key is absent (caller skips the property)
-        //   - uniform valarray if the value is numeric (via PixelConfig::getAsDouble)
-        //   - per-pixel valarray if the value is a FITS path string
-        std::valarray<double> _resolveMap(const PixelConfig& cfg,
-                                           const std::string& key) const
+        // Build a {"file":..., "hdu":...} JSON object from flat cfg siblings, then delegate.
+        std::valarray<double> _loadFitsMap(const std::string& key,
+                                            const std::string& path,
+                                            const PixelConfig& cfg) const
         {
-            if (!cfg.has(key)) return {};
-
-            // Scalar: PixelConfig owns the any-numeric-type → double conversion
-            try
-            {
-                return std::valarray<double>(cfg.getAsDouble(key), m_pixels.size());
-            }
-            catch (const std::invalid_argument&) {}   // not numeric → try FITS path
-
-            // FITS map
-            const std::string path = cfg.get<std::string>(key);
-
-            DSL::FITSmanager mgr(path);
-            std::shared_ptr<DSL::FITScube> cube;
-
+            json j;
+            j["file"] = path;
             if (cfg.has(key + ".hdu"))
             {
-                // HDU spec: integer index or EXTNAME string
-                try
-                {
-                    cube = mgr.GetImageAtIndex(
-                        static_cast<int>(cfg.getAsDouble(key + ".hdu")));
-                }
-                catch (const std::invalid_argument&)
-                {
-                    cube = mgr.GetImage(cfg.get<std::string>(key + ".hdu"));
-                }
+                try   { j["hdu"] = static_cast<int>(cfg.getAsDouble(key + ".hdu")); }
+                catch (const std::invalid_argument&) { j["hdu"] = cfg.get<std::string>(key + ".hdu"); }
+            }
+            return _loadFitsMapFromJson(key, path, j);
+        }
+
+        // Load a FITS image from `path`, selecting HDU via the "hdu" field of a JSON object.
+        // If "hdu" is absent, defaults to the primary HDU (index 1).
+        std::valarray<double> _loadFitsMapFromJson(const std::string& key,
+                                                    const std::string& path,
+                                                    const json& j) const
+        {
+            DSL::FITSmanager mgr(path);
+            std::shared_ptr<DSL::FITScube> cube;
+            if (j.contains("hdu"))
+            {
+                if (j["hdu"].is_string())
+                    cube = mgr.GetImage(j["hdu"].get<std::string>());
+                else
+                    cube = mgr.GetImageAtIndex(j["hdu"].get<int>());
             }
             else
             {
-                cube = mgr.GetImageAtIndex(0);
+                cube = mgr.GetImageAtIndex(1);
             }
 
             if (cube->Nelements() != m_pixels.size())
-                throw std::invalid_argument(
-                    "FITS map for '" + key + "': " +
-                    std::to_string(cube->Nelements()) +
-                    " pixels, detector has " +
-                    std::to_string(m_pixels.size()) + ".");
+                throw std::invalid_argument("FITS map for '" + key + "': " + std::to_string(cube->Nelements()) + " pixels, detector has " + std::to_string(m_pixels.size()) + ".");
 
-            // cast<double>() converts any FITS storage type to double
-            auto doubleCube = cube->cast<double>();
+            std::shared_ptr<DSL::FITScube> doubleCube;
+            if(cube->GetEqBitPerPixel() != DOUBLE_IMG || cube->GetBitPerPixel() != DOUBLE_IMG)
+                doubleCube = cube->cast<double>();
+            else
+                doubleCube = cube;
+
             return *doubleCube->GetData<double>();
+        }
+
+        // Resolve a config key to a per-pixel valarray.  Returns empty if the key
+        // (and its dot-notation siblings) are absent — the caller skips that property.
+        //
+        // Supported forms:
+        //   "param": <number>                          → uniform map
+        //   "param": "<fits_path>"                     → FITS primary HDU
+        //   "param": "<fits_path>", "param.hdu": <h>  → FITS specific HDU (index or EXTNAME)
+        //   "param": {"file":"<path>"}                 → FITS primary HDU (JSON object)
+        //   "param": {"file":"<path>","hdu":<h>}       → FITS specific HDU (JSON object)
+        //   "param.file": "<fits_path>"                → flat notation, primary HDU
+        //   "param.file": "<fits_path>", "param.hdu": <h> → flat notation, specific HDU
+        std::valarray<double> _resolveMap(const PixelConfig& cfg,
+                                           const std::string& key) const
+        {
+            if (cfg.has(key))
+            {
+                // Scalar numeric → uniform map
+                try
+                {
+                    return std::valarray<double>(cfg.getAsDouble(key), m_pixels.size());
+                }
+                catch (const std::invalid_argument&) {}   // not numeric
+
+                // Plain string → FITS path (with optional key.hdu sibling)
+                // Strings starting with '{' are JSON-encoded objects; handled below.
+                try
+                {
+                    const std::string s = cfg.get<std::string>(key);
+                    if (s.empty() || s.front() != '{')
+                        return _loadFitsMap(key, s, cfg);
+                }
+                catch (const std::bad_variant_access&) {}  // not a string
+
+                // JSON object: {"file": "<path>", "hdu": <index_or_name>}
+                // Also handles form2: value stored as a JSON-encoded string.
+                try
+                {
+                    json j;
+                    try                                { j = cfg.getJson(key); }
+                    catch (const std::invalid_argument&)
+                    {
+                        // Value is a string containing JSON — parse it.
+                        j = json::parse(cfg.get<std::string>(key));
+                    }
+                    if (!j.contains("file") || !j["file"].is_string())
+                        throw std::invalid_argument(
+                            "PixelConfig: '" + key + "' object must have a string 'file' field.");
+                    return _loadFitsMapFromJson(key, j["file"].get<std::string>(), j);
+                }
+                catch (const std::invalid_argument& e) { throw; }
+                catch (...) {}
+
+                return {};
+            }
+
+            // Flat dot-notation: key.file [+ key.hdu]
+            if (cfg.has(key + ".file"))
+                return _loadFitsMap(key, cfg.get<std::string>(key + ".file"), cfg);
+
+            return {};
         }
 
         template<typename Setter>
@@ -742,7 +812,7 @@ namespace phot2pix
         std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux, double exposureTime) const
         {
             const size_t n        = m_pixels.size();
-            const size_t nThreads = _computeThreadCount(n);
+            const size_t nThreads = m_nThreads;
 
             std::valarray<double> frame(0.0, n);
 
@@ -772,7 +842,7 @@ namespace phot2pix
             if (flux.size() != nrows * ncols)
                 throw std::invalid_argument("Flux size does not match window size (nrows*ncols).");
 
-            const size_t nThreads = _computeThreadCount(nrows * ncols);
+            const size_t nThreads = std::min(m_nThreads, _computeThreadCount(nrows * ncols));
             std::valarray<double> frame(0.0, nrows * ncols);
 
             if (nThreads > 1)
@@ -790,7 +860,7 @@ namespace phot2pix
                                                  const PixelConfig&            cfg) const
         {
             const size_t n        = m_pixels.size();
-            const size_t nThreads = _computeThreadCount(n);
+            const size_t nThreads = m_nThreads;
             std::valarray<double> frame(0.0, n);
 
             if (nThreads > 1)
@@ -814,7 +884,7 @@ namespace phot2pix
             if (flux.size() != nrows * ncols)
                 throw std::invalid_argument("Flux size does not match window size (nrows*ncols).");
 
-            const size_t nThreads = _computeThreadCount(nrows * ncols);
+            const size_t nThreads = std::min(m_nThreads, _computeThreadCount(nrows * ncols));
             std::valarray<double> frame(0.0, nrows * ncols);
 
             if (nThreads > 1)

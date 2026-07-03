@@ -29,12 +29,30 @@ if(Git_FOUND)
     if(_git_rc EQUAL 0 AND _git_tag MATCHES "^v([0-9]+)\\.([0-9]+)\\.([0-9]+)")
         set(_p2p_version "${CMAKE_MATCH_1}.${CMAKE_MATCH_2}.${CMAKE_MATCH_3}")
     endif()
+    # Full describe string for display (includes commit offset + hash when not on a tag).
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} describe --tags --match "v*" --always --dirty
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE PHOT2PIX_VERSION_STRING
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+if(NOT PHOT2PIX_VERSION_STRING)
+    set(PHOT2PIX_VERSION_STRING "${_p2p_version}")
 endif()
 
 project(phot2pix
     VERSION     ${_p2p_version}
     DESCRIPTION "Photon-to-Pixel CCD/CMOS sensor simulator library"
     LANGUAGES   CXX
+)
+
+# ─── Generated header: version.h ─────────────────────────────────────────────
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/phot2pix/phot2pix.h.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/phot2pix/phot2pix.h"
+    @ONLY
 )
 
 # ─── Sanity: out-of-source build enforced ────────────────────────────────────
@@ -282,10 +300,11 @@ file(GLOB_RECURSE PHOT2PIX_HEADERS CONFIGURE_DEPENDS
 
 add_library(phot2pix SHARED ${PHOT2PIX_SOURCES})
 
-# PUBLIC include path: during build expose src/, at install time expose include/
+# PUBLIC include path: during build expose src/ and generated/, at install time expose include/
 target_include_directories(phot2pix
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
@@ -405,6 +424,9 @@ install(TARGETS phot2pix
 )
 
 install(FILES ${PHOT2PIX_HEADERS}
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/phot2pix"
+)
+install(FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/phot2pix/phot2pix.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/phot2pix"
 )
 
