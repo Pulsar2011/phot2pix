@@ -39,6 +39,15 @@ namespace nisp
         macc UTR(const size_t& nFrames) { return {1, nFrames, 0}; }
         macc MACC(const size_t& nGroups, const size_t& nFrames, const size_t& nDrop) { return {nGroups, nFrames, nDrop}; }
         macc CDS(const size_t nDrops) { return {2, 1, nDrops}; }
+
+        /// True if cfg holds MACC parameters, as "macc"=[ng,nr,nd] or as "ng","nr","nd" keys.
+        static bool inConfig(const phot2pix::PixelConfig& cfg);
+
+        /// Read MACC parameters from cfg, given either as "macc"=[ng,nr,nd] or as
+        /// "ng"=ng, "nr"=nr, "nd"=nd (ng → nGroups, nr → nFrames, nd → nDrop).
+        /// Throws std::invalid_argument if absent, if both forms are given, or if a
+        /// value is not a non-negative integer (ng and nr must be >= 1).
+        static macc fromConfig(const phot2pix::PixelConfig& cfg);
     };
 
 // ── Persistence model ─────────────────────────────────────────────────────────
@@ -174,8 +183,8 @@ namespace nisp
     private:
         double dpuOffset = 0.0;
         double dpuScale  = 1.0;
-        double dpuGain   = 2.0;  // Mean gain in ADU/electron for the DPU flux estimation algorithm
-        double dpuNoise  = 10.0; // Mean read noise in electrons (RMS) for the DPU flux estimation algorithm
+        double dpuGain   = 2.0;  // Mean gain in e-/ADU for the DPU flux estimation algorithm; set by initialize() ("dpu_gain" or mean pixel gain)
+        double dpuNoise  = 10.0; // Mean read noise in electrons (RMS) for the DPU flux estimation algorithm; set by initialize() ("dpu_noise" or mean pixel read noise)
         double frameTime = 1.45408; ///< NISP HAWAII-2RG frame time (seconds)
         bool   m_enable_persistence = false;
         bool   m_enable_oneOverF = true;
@@ -189,6 +198,21 @@ namespace nisp
         std::shared_ptr<DSL::FITScube> _toUint16(
             const std::shared_ptr<DSL::FITScube>& doubleFrame) const;
 
+        // ── Charge engines ───────────────────────────────────────────────────
+        // Every frame the SCA simulates is charge only, built from the pixel stages
+        // resetLevel() + integrate(); read noise and 1/f noise are added per read by
+        // _read() / _accumulate() through pixel::read(). All four DetectorSimulator
+        // hooks are overridden: the default ones call pixelresponse(), which is a
+        // complete single read (read noise included).
+        //
+        // cfg "baseline": absent or "on" → resetLevel() + integrate() (first frame after
+        // a reset), "off" → integrate() only (later ramp increments, the reset level is
+        // already in the accumulated charge). Decoded once per thread, not per pixel.
+        static bool _withReset(const phot2pix::PixelConfig& cfg)
+        {
+            return !(cfg.has("baseline") && cfg.get<std::string>("baseline") == "off");
+        }
+
         void _engine(const std::valarray<double>& flux,
                      double                        exposureTime,
                      size_t                        begin,
@@ -196,23 +220,85 @@ namespace nisp
                      std::valarray<double>&         frame) const override
         {
             for (size_t i = begin; i < end; ++i)
-                frame[i] = at(i).pixelresponse(flux[i], exposureTime);
+                frame[i] = m_pixels[i].resetLevel() + m_pixels[i].integrate(flux[i], exposureTime);
         }
 
-        // oneOverFStream: when non-null (and 1/f noise enabled), consumes the
-        // next chunk of a continuous per-ramp AR(1) process instead of
-        // independently generating a fresh one. Passed by expose_macc() so
-        // every read in a ramp shares one continuous noise stream rather than
-        // each read restarting the amplifier state at zero.
+        void _engine(const std::valarray<double>& flux,
+                     double                        exposureTime,
+                     size_t                        begin,
+                     size_t                        end,
+                     std::valarray<double>&         frame,
+                     const phot2pix::PixelConfig&  cfg) const override
+        {
+            const bool withReset = _withReset(cfg);
+            for (size_t i = begin; i < end; ++i)
+                frame[i] = (withReset ? m_pixels[i].resetLevel() : 0.0) + m_pixels[i].integrate(flux[i], exposureTime, cfg);
+        }
+
+        // Windowed hooks: flux and frame are window-sized (ncols × nrows, row-major).
+        void _engine(const std::valarray<double>& flux,
+                     double                        exposureTime,
+                     size_t                        c0,
+                     size_t                        r0,
+                     size_t                        row_begin,
+                     size_t                        row_end,
+                     size_t                        ncols,
+                     std::valarray<double>&         frame) const override
+        {
+            for (size_t r = row_begin; r < row_end; ++r)
+                for (size_t c = 0; c < ncols; ++c)
+                {
+                    const nisp::pixel& px = m_pixels[(r0 + r) * m_width + c0 + c];
+                    frame[r * ncols + c]  = px.resetLevel() + px.integrate(flux[r * ncols + c], exposureTime);
+                }
+        }
+
+        void _engine(const std::valarray<double>& flux,
+                     double                        exposureTime,
+                     size_t                        c0,
+                     size_t                        r0,
+                     size_t                        row_begin,
+                     size_t                        row_end,
+                     size_t                        ncols,
+                     std::valarray<double>&         frame,
+                     const phot2pix::PixelConfig&  cfg) const override
+        {
+            const bool withReset = _withReset(cfg);
+            for (size_t r = row_begin; r < row_end; ++r)
+                for (size_t c = 0; c < ncols; ++c)
+                {
+                    const nisp::pixel& px = m_pixels[(r0 + r) * m_width + c0 + c];
+                    frame[r * ncols + c]  = (withReset ? px.resetLevel() : 0.0) + px.integrate(flux[r * ncols + c], exposureTime, cfg);
+                }
+        }
+
+        // Charge collected over exposureTime (ADU, double): pixel charge (resetLevel() +
+        // integrate(), see the engines above) + persistence. No read noise and no 1/f noise:
+        // those belong to a read and are added by _read() / _accumulate(), so they never
+        // accumulate along a ramp.
         void _simulate(const std::valarray<double>& flux,
                           const double& exposureTime,
-                          std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg = phot2pix::PixelConfig(),
-                          nisp::OneOverFNoise::Stream* oneOverFStream = nullptr);
+                          std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg = phot2pix::PixelConfig());
 
         void _simulate(const std::valarray<double>& flux,
-                          const double& exposureTime, 
+                          const double& exposureTime,
                           std::shared_ptr<DSL::FITScube>& frame,
                           size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg = phot2pix::PixelConfig());
+
+        // Read a full-frame charge map in place (ADU): every pixel adds its own read
+        // noise (pixel::read), then one independent 1/f noise realisation when enabled.
+        void _read(std::valarray<double>& charge) const;
+
+        // Same for a window: the first ncols × nrows values of charge (row-major) are the
+        // detector region [c0, c0+ncols) × [r0, r0+nrows).
+        void _read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows) const;
+
+        // Ramp step: cumul += charge (charge only). When layer is not null this is also a
+        // read, written as layer[i] = uint16(pixel_i.read(cumul[i]) + oneOverF[i]): the
+        // read noise and 1/f noise go to that layer only, never into cumul.
+        // oneOverF may be null (1/f noise disabled). Threaded over getThreadCount().
+        void _accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
+                         uint16_t* layer, const std::valarray<double>* oneOverF) const;
 
         std::shared_ptr<DSL::FITScube> expose_macc(const std::valarray<double>& flux,
                           const nisp::macc& maccParams);
@@ -269,8 +355,6 @@ namespace nisp
         std::shared_ptr<DSL::FITScube> expose(
             const std::valarray<double>& fullFlux,
             const double& exposureTime);
-        
-        void resetSimulationState();
     };
 
 #pragma endregion

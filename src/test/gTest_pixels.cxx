@@ -520,6 +520,36 @@ TEST(Inheritance, SaturationOverride)
     EXPECT_DOUBLE_EQ(base->pixelresponse(100.0, 100.0), fullWell);
 }
 
+TEST(Inheritance, StageOverrideUsedByPixelresponse)
+{
+    // A derived pixel that only replaces the integration stage (here a
+    // deterministic charge, no shot noise). The default pixelresponse() still
+    // chains it with the base reset level and read stages:
+    // pixelresponse = read(resetLevel() + integrate()).
+    class NoShotNoisePixel : public pixsim
+    {
+    public:
+        NoShotNoisePixel() : pixsim(0.0, 0.0, 2.0, 1.0, 0.0, 10.0) {} // gain 2, baseline 10
+
+        using pixsim::integrate;   // keep the cfg overload visible
+        double integrate(const double& flux, const double& t) const override
+        {
+            return flux * t * m_quantumEfficiency / m_gain;   // ADU
+        }
+    };
+
+    NoShotNoisePixel pixel;
+
+    EXPECT_DOUBLE_EQ(pixel.integrate(5.0, 4.0), 10.0);              // 20 e- / 2
+    EXPECT_DOUBLE_EQ(pixel.resetLevel(),        10.0);              // baseline, no kTC
+    EXPECT_DOUBLE_EQ(pixel.pixelresponse(5.0, 4.0), 20.0);          // read(10 + 10), no read noise
+
+    // Through the base class and the cfg overload as well.
+    const pixsim* base = &pixel;
+    EXPECT_DOUBLE_EQ(base->pixelresponse(5.0, 4.0), 20.0);
+    EXPECT_DOUBLE_EQ(base->pixelresponse(5.0, 4.0, PixelConfig{}), 20.0);
+}
+
 TEST(Inheritance, UserValidationOverride)
 {
     // A derived pixel that constrains dark current to <= 0.01 e/s ("cold pixel").

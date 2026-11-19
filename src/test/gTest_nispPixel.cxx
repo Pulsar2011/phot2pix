@@ -82,13 +82,13 @@ TEST(nispPixel, CopyConstructorPreservesBehaviour)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-//  nisp::pixel — pixelresponse() and the "baseline" cfg override
+//  nisp::pixel — pixel stages (resetLevel / integrate / read) and pixelresponse()
 // ═══════════════════════════════════════════════════════════════════════════════
 
-TEST(nispPixel, TwoArgOverloadAlwaysComputesBaseline)
+TEST(nispPixel, PixelresponseIncludesResetLevel)
 {
-    // flux=0, dark=0, readNoise=0 ⇒ shot/read term is exactly 0.
-    // KTC=5, baseline=100 ⇒ baseline term ~ N(100, 5).
+    // flux=0, dark=0, readNoise=0 ⇒ integrate and read add nothing.
+    // KTC=5, baseline=100 ⇒ single read ~ N(100, 5).
     nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
 
     constexpr double k        = 5.0;
@@ -111,36 +111,15 @@ TEST(nispPixel, TwoArgOverloadAlwaysComputesBaseline)
     EXPECT_NEAR(sigVar,  var, k * std::sqrt(2.0) * var / std::sqrt(n));
 }
 
-TEST(nispPixel, CfgBaselineOffSuppressesBaseline)
+TEST(nispPixel, CfgOverloadMatchesTwoArgOverload)
 {
+    // The base pixelresponse(flux, t, cfg) ignores cfg: same single read as the
+    // two-argument form, whatever the keys (the old per-pixel "baseline" switch
+    // is gone, the reset level is its own stage: resetLevel()).
     nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
     PixelConfig cfg;
     cfg.set("baseline", std::string("off"));
 
-    constexpr size_t nSample = 10'000;
-    const double     n       = static_cast<double>(nSample);
-
-    double sigMean = 0.0, sigVar = 0.0;
-    for (size_t i = 0; i < nSample; ++i)
-    {
-        const double x = p.pixelresponse(0.0, 1.0, cfg);
-        sigMean += x;
-        sigVar  += x * x;
-    }
-    sigMean /= n;
-    sigVar   = sigVar / n - sigMean * sigMean;
-
-    // With baseline off and all other noise sources zero, output is exactly 0.
-    EXPECT_NEAR(sigMean, 0.0, 1e-9);
-    EXPECT_NEAR(sigVar,  0.0, 1e-9);
-}
-
-TEST(nispPixel, CfgBaselineOnIsExplicitNoOp)
-{
-    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
-    PixelConfig cfg;
-    cfg.set("baseline", std::string("on"));
-
     constexpr double k       = 5.0;
     constexpr size_t nSample = 10'000;
     const double     n       = static_cast<double>(nSample);
@@ -159,12 +138,15 @@ TEST(nispPixel, CfgBaselineOnIsExplicitNoOp)
     EXPECT_NEAR(sigVar,  25.0,  k * std::sqrt(2.0) * 25.0 / std::sqrt(n));
 }
 
-TEST(nispPixel, CfgUnknownBaselineValueIgnored)
+TEST(nispPixel, ResetLevelIsBaselinePlusKtc)
 {
-    // Neither "off" nor "on" ⇒ m_computeBaseline is left at its default (true).
-    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 5.0, 100.0);
-    PixelConfig cfg;
-    cfg.set("baseline", std::string("bogus"));
+    // resetLevel() = N(baseline, KTC/gain); exactly the baseline without kTC.
+    nisp::pixel noKtc(0.0, 5.0, 2.0, 1.0, 0.0, 77.0);
+    EXPECT_DOUBLE_EQ(noKtc.resetLevel(), 77.0);
+
+    constexpr double KTC = 10.0, gain = 2.0, baseline = 100.0;
+    constexpr double var = (KTC / gain) * (KTC / gain);   // 25 ADU²
+    nisp::pixel p(0.0, 5.0, gain, 1.0, KTC, baseline);    // read noise must not appear
 
     constexpr double k       = 5.0;
     constexpr size_t nSample = 10'000;
@@ -173,22 +155,38 @@ TEST(nispPixel, CfgUnknownBaselineValueIgnored)
     double sigMean = 0.0, sigVar = 0.0;
     for (size_t i = 0; i < nSample; ++i)
     {
-        const double x = p.pixelresponse(0.0, 1.0, cfg);
+        const double x = p.resetLevel();
         sigMean += x;
         sigVar  += x * x;
     }
     sigMean /= n;
     sigVar   = sigVar / n - sigMean * sigMean;
 
-    EXPECT_NEAR(sigMean, 100.0, k * std::sqrt(25.0 / n));
-    EXPECT_NEAR(sigVar,  25.0,  k * std::sqrt(2.0) * 25.0 / std::sqrt(n));
+    EXPECT_NEAR(sigMean, baseline, k * std::sqrt(var / n));
+    EXPECT_NEAR(sigVar,  var,      k * std::sqrt(2.0) * var / std::sqrt(n));
+}
+
+TEST(nispPixel, IntegrateHasNoResetLevelNorReadNoise)
+{
+    // No flux, no dark ⇒ no charge collected. The reset level (baseline 100,
+    // kTC 5) and the read noise (5) belong to other stages: integrate() is
+    // exactly 0, through both overloads.
+    nisp::pixel p(0.0, 5.0, 1.0, 1.0, 5.0, 100.0);
+    PixelConfig cfg;
+
+    for (size_t i = 0; i < 1000; ++i)
+    {
+        EXPECT_DOUBLE_EQ(p.integrate(0.0, 1.0),      0.0);
+        EXPECT_DOUBLE_EQ(p.integrate(0.0, 1.0, cfg), 0.0);
+    }
 }
 
 TEST(nispPixel, FullNoiseBudgetViaCfgOverload)
 {
     // Same setup as PixelSimulator.FullNoiseBudget in gTest_pixels.cxx, but
-    // driven through the 3-arg cfg overload with an empty cfg (no "baseline"
-    // key) to confirm it matches the 2-arg overload's behaviour exactly.
+    // driven through the 3-arg cfg overload with an empty cfg, to confirm it
+    // matches the 2-arg overload's behaviour exactly: one complete single read
+    // = read(resetLevel() + integrate()).
     constexpr double flux      = 10.0;
     constexpr double dark      =  1.0;
     constexpr double readNoise =  5.0;
@@ -203,7 +201,7 @@ TEST(nispPixel, FullNoiseBudgetViaCfgOverload)
     constexpr double var_ADU  = (signal_e + readNoise * readNoise + KTC * KTC) / (gain * gain); // 221 ADU^2
 
     nisp::pixel p(dark, readNoise, gain, QE, KTC, baseline);
-    PixelConfig cfg; // empty: no "baseline" override
+    PixelConfig cfg; // empty
 
     constexpr double k       = 5.0;
     constexpr size_t nSample = 10'000;
@@ -223,15 +221,38 @@ TEST(nispPixel, FullNoiseBudgetViaCfgOverload)
     EXPECT_NEAR(sigVar,  var_ADU, k * std::sqrt(2.0) * var_ADU / std::sqrt(n));
 }
 
-TEST(nispPixel, ResetStateDoesNotDisableBaseline)
+TEST(nispPixel, ReadAddsOnlyReadNoiseInADU)
 {
-    // m_computeBaseline is a one-way latch (resetState() does `|= true`) —
-    // there is no public way to make it false except the per-call
-    // cfg["baseline"]="off" override tested above.
-    nisp::pixel p(0.0, 0.0, 1.0, 1.0, 0.0, 77.0);
-    p.resetState();
-    p.resetState();
-    EXPECT_DOUBLE_EQ(p.pixelresponse(0.0, 1.0), 77.0);
+    // read(charge) = charge + N(0, readNoise)/gain: mean charge, variance (RN/gain)².
+    constexpr double readNoise = 5.0;
+    constexpr double gain      = 2.0;
+    constexpr double charge    = 1000.0;
+    constexpr double var       = (readNoise / gain) * (readNoise / gain);   // 6.25 ADU²
+
+    nisp::pixel p(0.0, readNoise, gain, 1.0, 0.0, 0.0);
+
+    constexpr double k       = 5.0;
+    constexpr size_t nSample = 10'000;
+    const double     n       = static_cast<double>(nSample);
+
+    double sigMean = 0.0, sigVar = 0.0;
+    for (size_t i = 0; i < nSample; ++i)
+    {
+        const double x = p.read(charge);
+        sigMean += x;
+        sigVar  += x * x;
+    }
+    sigMean /= n;
+    sigVar   = sigVar / n - sigMean * sigMean;
+
+    EXPECT_NEAR(sigMean, charge, k * std::sqrt(var / n));
+    EXPECT_NEAR(sigVar,  var,    k * std::sqrt(2.0) * var / std::sqrt(n));
+}
+
+TEST(nispPixel, ReadWithoutReadNoiseIsExact)
+{
+    nisp::pixel p(0.0, 0.0, 2.0, 1.0, 0.0, 0.0);
+    EXPECT_DOUBLE_EQ(p.read(123.25), 123.25);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -277,6 +298,50 @@ TEST(nispRamp, CoaddNoiselessLinearRampMatchesKubicFormula)
 
         delete &macc;
     }
+}
+
+TEST(nispRamp, CoaddIntoBufferMatchesHeapCoadd)
+{
+    // The allocation-free coadd(groups, ...) used per pixel by SCA::expose_dpu must
+    // give exactly the same groups, settings and slope as the heap-allocating coadd().
+    constexpr size_t nreads = 4, ndrops = 1, ngr = 6, N = ngr * (nreads + ndrops);
+    std::valarray<double> utr(N);
+    for (size_t i = 0; i < N; ++i)
+        utr[i] = 3.0 * static_cast<double>(i) + 0.1 * static_cast<double>(i * i);   // non-linear
+
+    nisp::Ramp raw(&utr, std::slice(0, N, 1), 2.0, 1.5);
+
+    nisp::Ramp& heap = raw.coadd(ngr, nreads, ndrops);
+
+    nisp::rawLines groups(0.0, 2);   // too small on purpose: coadd must resize it
+    nisp::Ramp     buffered = raw.coadd(groups, ngr, nreads, ndrops);
+
+    ASSERT_EQ(groups.size(), ngr);
+    const nisp::rawLines heapGroups = heap.getRamp();
+    for (size_t g = 0; g < ngr; ++g)
+        EXPECT_DOUBLE_EQ(groups[g], heapGroups[g]) << "group " << g;
+
+    EXPECT_EQ(buffered.get_reads_per_group(), nreads);
+    EXPECT_EQ(buffered.get_drops_per_group(), ndrops);
+
+    double f1 = 0., c1 = 0., e1 = 0., f2 = 0., c2 = 0., e2 = 0.;
+    heap.getSlope(f1, c1, e1);
+    buffered.getSlope(f2, c2, e2);
+    EXPECT_DOUBLE_EQ(f1, f2);
+    EXPECT_DOUBLE_EQ(c1, c2);
+    EXPECT_DOUBLE_EQ(e1, e2);
+
+    delete &heap;
+}
+
+TEST(nispRamp, GetSlopeThrowsOnSingleGroup)
+{
+    std::valarray<double> data = {5.0};
+    nisp::Ramp r(&data, std::slice(0, 1, 1));
+    r.reads_per_group(1);
+
+    double flux = 0., chi2 = 0., err = 0.;
+    EXPECT_THROW(r.getSlope(flux, chi2, err), std::runtime_error);
 }
 
 TEST(nispRamp, GetFowlerOnRawRamp)

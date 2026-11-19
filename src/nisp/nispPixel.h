@@ -15,28 +15,26 @@
 
 namespace nisp
 {
+    // NISP H2RG pixel. Uses the phot2pix::pixsim stages as they are:
+    //   resetLevel()  baseline + kTC, once per reset
+    //   integrate()   signal + dark with shot noise, accumulates between reads
+    //   read()        + read noise, once per read (never accumulated)
+    // nisp::SCA chains them for every readout mode (MACC, UTR, CDS, FLUX).
+    // Override them here to add NISP-specific pixel physics.
     class pixel : public phot2pix::pixsim
     {
-    
+
         protected:
             void _userValidation() override
             { }
 
-            bool m_computeBaseline;
-        
         public:
-            pixel() : phot2pix::pixsim(), m_computeBaseline(true) { _userValidation(); }
-            pixel(const double& darkCurrent, const double& readNoise, const double& gain, const double& QE, const double& KTCnoise, const double& baseline) : phot2pix::pixsim(darkCurrent, readNoise, gain, QE, KTCnoise, baseline), m_computeBaseline(true) { _userValidation(); }
+            pixel() : phot2pix::pixsim() { _userValidation(); }
+            pixel(const double& darkCurrent, const double& readNoise, const double& gain, const double& QE, const double& KTCnoise, const double& baseline) : phot2pix::pixsim(darkCurrent, readNoise, gain, QE, KTCnoise, baseline) { _userValidation(); }
 
-            pixel(const pixel& other) : phot2pix::pixsim(other), m_computeBaseline(other.m_computeBaseline) {};
+            pixel(const pixel& other) : phot2pix::pixsim(other) {};
 
             virtual ~pixel() = default;
-
-            double pixelresponse(const double& flux, const double& exposureTime) const override;
-            double pixelresponse(const double& flux, const double& exposureTime, const phot2pix::PixelConfig& cfg) const override;
-
-            void resetState() { m_computeBaseline |= true; }
-
     };
 
 
@@ -126,8 +124,24 @@ namespace nisp
          @param ndrops Number of frames to discard between groups.
          @return Reference to a newly heap-allocated Ramp representing the MACC output.
          @note The caller is responsible for managing the lifetime of the returned object.
+               Deleting the Ramp does not free its group array (Ramp does not own its data):
+               for a per-pixel loop use the buffer overload below.
          **/
         Ramp& coadd(const size_t& ngr, const size_t& nreads, const size_t& ndrops) const;
+
+        /**
+         @brief Same co-addition as coadd(ngr, nreads, ndrops), without any allocation.
+         @details The \p ngr group averages are written into \p groups (resized only if it
+                  is smaller than \p ngr) and the returned Ramp points to it, with
+                  reads_per_group / drops_per_group pre-set. Meant for per-pixel loops:
+                  the caller reuses one buffer for every pixel.
+         @param groups Output buffer for the group averages; must outlive the returned Ramp.
+         @param ngr    Number of output groups.
+         @param nreads Number of reads to average per group.
+         @param ndrops Number of frames to discard between groups.
+         @return Ramp over \p groups.
+         **/
+        Ramp coadd(rawLines& groups, const size_t& ngr, const size_t& nreads, const size_t& ndrops) const;
         
         
         /**

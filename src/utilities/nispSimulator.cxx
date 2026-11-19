@@ -1,0 +1,314 @@
+//
+// Created by GILLARD William on 2026-11-19.
+// Centre de Physique des Particule de Marseille (CPPM)
+// Licence under PolyForm Noncommercial License 1.0.0 https://polyformproject.org/licenses/noncommercial/1.0.0
+//  You may share and adapt this code with attribution, Non Comercial use only.
+//
+//
+
+#include <nisp/nispSCA.h>
+#include <phot2pix/phot2pix.h>
+#include <DSTCore/OptionManager.h>
+
+#include <stdexcept>
+#include <iostream>
+#include <iomanip>
+#include <sstream>
+#include <fstream>
+#include <cmath>
+#include <map>
+#include <set>
+#include <algorithm>
+#include <chrono>
+#include <functional>
+#include <numeric>
+#include <valarray>
+#include <vector>
+
+using namespace DSL;
+
+const std::string DSF_need = "v1.5.0";
+const std::string ThisVersion = "v0.1.0";
+
+class InputParameters : public DOption
+{
+    public:
+    
+    InputParameters():DOption()
+    {
+        AddDescription("Generate NISP exposure simulation for single NISP detectors.");
+        AddParam("JSON_Parameters","JSON configuration file.");
+
+        
+        DOption::prg_name += "nispSimulator -- "+ThisVersion;
+
+        if(DSF::gGIT::version() < DSF_need)
+            throw std::runtime_error("[ERROR] UserParameters::UserParameters: Incompatible DSF version, please update your DSF installation to "+DSF_need+" at minimum.");
+    }
+
+    virtual ~InputParameters(){};
+
+    bool UserParameters(std::vector<std::string>::const_iterator& it, const std::vector<std::string>& arg)
+    {
+        return true;
+    }
+};
+
+// ── Benchmark helpers ─────────────────────────────────────────────────────────
+namespace
+{
+    using Clock = std::chrono::steady_clock;
+
+    const std::string kWarnTag  = "\033[33;40m[WARNING]\033[0m ";
+    const std::string kInfoTag  = "\033[32m[INFO]\033[0m ";
+    const std::string kDebugTag = "\033[35m[DEBUG]\033[0m ";
+
+    double secondsSince(const Clock::time_point& t0)
+    {
+        return std::chrono::duration<double>(Clock::now() - t0).count();
+    }
+
+    // Print the timing of each step and the statistics of the sca.expose() runs.
+    // tWrite < 0 means the output was not written (no -o).
+    void printBenchmark(const std::string& label, size_t width, size_t height, size_t nLayers,
+                        double tSetup, double tFlux, std::vector<double> tExpose, double tWrite)
+    {
+        const size_t n    = tExpose.size();
+        const double mean = std::accumulate(tExpose.begin(), tExpose.end(), 0.0) / n;
+        double var = 0.0;
+        for (double t : tExpose) var += (t - mean) * (t - mean);
+        const double stddev = (n > 1) ? std::sqrt(var / (n - 1)) : 0.0;
+
+        std::sort(tExpose.begin(), tExpose.end());
+        const double median = (n % 2) ? tExpose[n / 2] : 0.5 * (tExpose[n / 2 - 1] + tExpose[n / 2]);
+
+        const double nPix = static_cast<double>(width) * height;
+
+        std::cout << std::fixed << std::setprecision(3)
+                  << "\n── nispSimulator benchmark ─────────────────────────────\n"
+                  << "  detector     : " << width << " x " << height << "\n"
+                  << "  readout      : " << label << "  → " << nLayers << " output layer(s)\n"
+                  << "  runs         : " << n << "\n"
+                  << "  setup        : " << tSetup << " s   (SCA construction + initialize)\n"
+                  << "  flux load    : " << tFlux  << " s\n"
+                  << "  sca.expose   : mean " << mean << " s ± " << stddev
+                  << "   (min " << tExpose.front() << ", median " << median << ", max " << tExpose.back() << ")\n"
+                  << "  per layer    : " << mean / nLayers << " s   ("
+                  << std::setprecision(1) << nPix * nLayers / mean / 1e6 << " Mpix/s)\n"
+                  << std::setprecision(3);
+        if (tWrite < 0.0)
+            std::cout << "  write        : skipped (no -o output file)\n";
+        else
+            std::cout << "  write        : " << tWrite << " s\n";
+        std::cout << "────────────────────────────────────────────────────────\n";
+    }
+}
+
+int main(int argc, char **argv)
+{
+    try
+    {
+        InputParameters fOPT = InputParameters();
+        if (!fOPT.InitParameters(argc, argv))
+            return EXIT_FAILURE;
+
+        const auto tStart = Clock::now();
+
+        // Debug level (-d x):
+        //   0  warnings only (+ benchmark report if "benchmark" > 0)
+        //   1  [INFO]  run summary: detector, readout, flux source, effects, output, timings
+        //   2  [DEBUG] + pixel/SCA parameters, flux statistics, per-step and per-run timings
+        //   3+ [DEBUG] + full configuration dump, DSTfits verbose output
+        const int16_t dbg = fOPT.DebugLevel();
+        switch(dbg)
+        {
+            case 0:  DSL::verbose = DSL::verboseLevel::VERBOSE_NONE;   break;
+            case 1:  DSL::verbose = DSL::verboseLevel::VERBOSE_BASIC;  break;
+            case 2:  DSL::verbose = DSL::verboseLevel::VERBOSE_DETAIL; break;
+            default: DSL::verbose = DSL::verboseLevel::VERBOSE_ALL;    break;
+        }
+
+        // Warn early, before a possibly long simulation.
+        const std::string outputFile = fOPT.GetOutput();
+        if(outputFile.empty())
+            std::cerr << kWarnTag << "No output file given (-o/--output): the simulated exposure will NOT be written." << std::endl;
+
+        const std::string cfgFile = fOPT.GetFiles()[0];
+        phot2pix::PixelConfig cfg(cfgFile);
+
+        // JSON view of the configuration, used only for printing values.
+        const phot2pix::json cfgJson = cfg.toJson();
+        auto show = [&cfgJson](const std::string& key) -> std::string
+        { return cfgJson.contains(key) ? cfgJson.at(key).dump() : std::string("not set (default)"); };
+
+        if(dbg >= 1)
+            std::cout << kInfoTag << "nispSimulator " << ThisVersion << ", configuration '" << cfgFile << "'" << std::endl;
+        if(dbg >= 3)
+            std::cout << kDebugTag << "full configuration:\n" << cfgJson.dump(4) << std::endl;
+
+        // JSON integers are stored as uint64_t, which is not size_t on macOS:
+        // read through getAsDouble() instead of get<size_t>().
+        auto getCount = [&cfg](const std::string& key, size_t def) -> size_t
+        { return cfg.has(key) ? static_cast<size_t>(cfg.getAsDouble(key)) : def; };
+
+        size_t width  = getCount("width",  2048);
+        size_t height = getCount("height", 2048);
+        size_t x0     = getCount("x0",     0);
+        size_t y0     = getCount("y0",     0);
+
+        // "benchmark": N → run sca.expose() N times and print timings; absent or 0 → single silent run.
+        const size_t nRuns = getCount("benchmark", 0);
+
+        if(dbg >= 1)
+            std::cout << kInfoTag << "detector       : " << width << " x " << height
+                      << " pixels, window origin (x0, y0) = (" << x0 << ", " << y0 << ")" << std::endl;
+
+        auto tStep = Clock::now();
+        nisp::SCA sca(width, height);
+        sca.initialize(cfg);
+        const double tSetup = secondsSince(tStep);
+
+        if(dbg >= 1)
+        {
+            bool oneOverF = false;
+            if(cfgJson.contains("oneOverF"))
+            {
+                const auto& o = cfgJson.at("oneOverF");
+                oneOverF = o.is_number() ? (o.get<double>() > 0.0)
+                                         : (o.is_object() && o.value("amplitude", 0.0) > 0.0);
+            }
+            std::cout << kInfoTag << "exposure mode  : " << show("exposureMode") << std::endl
+                      << kInfoTag << "persistence    : " << (cfg.has("persistence") ? "on" : "off") << std::endl
+                      << kInfoTag << "1/f noise      : " << (oneOverF ? "on" : "off") << std::endl;
+        }
+        if(dbg >= 2)
+        {
+            for(const char* key : {"gain", "dark", "readNoise", "QE", "KTCnoise", "baseline"})
+                std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
+            for(const char* key : {"frame_time", "fr_time", "offset", "dpu_offset", "scale", "dpu_scale", "oneOverF", "persistence"})
+                if(cfg.has(key))
+                    std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
+            std::cout << kDebugTag << "SCA setup      : " << tSetup << " s" << std::endl;
+        }
+
+        // Flux (photons/s/pixel):
+        //   absent   → 0 everywhere (dark exposure)
+        //   number   → uniform flux
+        //   string   → FITS file, primary image cropped to [x0, x0+width) × [y0, y0+height)
+        tStep = Clock::now();
+        std::valarray<double> fluxArray(0.0, width*height);
+        std::string fluxSource = "none → dark exposure (flux = 0)";
+        if(cfg.has("flux"))
+        {
+            try
+            {
+                fluxArray  = cfg.getAsDouble("flux");
+                fluxSource = "uniform " + show("flux") + " ph/s/pixel";
+            }
+            catch(const std::invalid_argument&)
+            {
+                const std::string fluxFile = cfg.get<std::string>("flux");
+                fluxSource = "FITS file '" + fluxFile + "', cropped to the detector window";
+                FITSmanager mgr(fluxFile, true);
+
+                std::shared_ptr<DSL::FITScube> inputFlux = mgr.GetPrimary();
+                if(!inputFlux)
+                    throw std::runtime_error("Cannot read the primary image of flux file '" + fluxFile + "'.");
+
+                inputFlux->Resize({x0, width}, {y0, height});   // in place: {corner, size}
+                if(inputFlux->Nelements() != width*height)
+                    throw std::invalid_argument("Flux image '" + fluxFile + "' gives " + std::to_string(inputFlux->Nelements()) +
+                                                " pixels after cropping, expected " + std::to_string(width*height) + ".");
+
+                // GetData<double>() returns nullptr unless the stored type is double.
+                if(inputFlux->GetBitPerPixel() != DOUBLE_IMG || inputFlux->GetEqBitPerPixel() != DOUBLE_IMG)
+                    inputFlux = inputFlux->cast<double>();
+
+                fluxArray = *(inputFlux->GetData<double>());
+            }
+        }
+        const double tFlux = secondsSince(tStep);
+
+        if(dbg >= 1)
+            std::cout << kInfoTag << "flux           : " << fluxSource << std::endl;
+        if(dbg >= 2)
+            std::cout << kDebugTag << "flux stats     : min " << fluxArray.min()
+                      << ", mean " << fluxArray.sum() / fluxArray.size()
+                      << ", max " << fluxArray.max() << " ph/s/pixel  (load " << tFlux << " s)" << std::endl;
+
+        if(cfg.has("exposureTime") && nisp::macc::inConfig(cfg))
+            std::cerr << kWarnTag << "Both 'exposureTime' and MACC parameters are set: using exposureTime, MACC parameters ignored." << std::endl;
+
+        // Pick the exposure call once, so the benchmark loop times only sca.expose().
+        std::function<std::shared_ptr<DSL::FITScube>()> exposeFn;
+        std::string label;
+        if(cfg.has("exposureTime"))
+        {
+            const double exposureTime = cfg.getAsDouble("exposureTime");
+            label    = "exposureTime = " + std::to_string(exposureTime) + " s";
+            exposeFn = [&sca, &fluxArray, exposureTime]() { return sca.expose(fluxArray, exposureTime); };
+        }
+        else if(nisp::macc::inConfig(cfg))
+        {
+            const nisp::macc maccParams = nisp::macc::fromConfig(cfg);
+            label    = "MACC(" + std::to_string(maccParams.nGroups) + "," + std::to_string(maccParams.nFrames) +
+                       "," + std::to_string(maccParams.nDrop) + ")";
+            exposeFn = [&sca, &fluxArray, maccParams]() { return sca.expose(fluxArray, maccParams); };
+        }
+        else
+            throw std::invalid_argument("No exposure time or MACC parameters provided in configuration.");
+
+        if(dbg >= 1)
+            std::cout << kInfoTag << "readout        : " << label << std::endl
+                      << kInfoTag << "output         : " << (outputFile.empty() ? "none (not written)" : outputFile) << std::endl
+                      << kInfoTag << "simulating..." << std::endl;
+
+        const size_t                   nExpose = std::max<size_t>(1, nRuns);
+        std::vector<double>            tExpose;
+        std::shared_ptr<DSL::FITScube> result;
+        for(size_t i = 0; i < nExpose; ++i)
+        {
+            result.reset();   // free the previous ramp outside the timed region
+            const auto t0 = Clock::now();
+            result = exposeFn();
+            tExpose.push_back(secondsSince(t0));
+
+            if(dbg >= 2 && nExpose > 1)
+                std::cout << kDebugTag << "sca.expose run " << i + 1 << "/" << nExpose << ": " << tExpose.back() << " s" << std::endl;
+        }
+
+        const size_t nLayers = std::max<size_t>(1, result->Size(3));
+        if(dbg >= 1)
+            std::cout << kInfoTag << "sca.expose     : " << tExpose.back() << " s, "
+                      << result->Size(1) << " x " << result->Size(2) << " x " << nLayers << " output" << std::endl;
+
+        double tWrite = -1.0;
+        if(!outputFile.empty())
+        {
+            tStep = Clock::now();
+            result->Write(outputFile, true);
+            tWrite = secondsSince(tStep);
+
+            if(dbg >= 1)
+                std::cout << kInfoTag << "written        : " << outputFile << " (" << tWrite << " s)" << std::endl;
+        }
+
+        if(nRuns > 0)
+            printBenchmark(label, width, height, nLayers, tSetup, tFlux, tExpose, tWrite);
+
+        if(dbg >= 1)
+            std::cout << kInfoTag << "total          : " << secondsSince(tStart) << " s" << std::endl;
+
+    }
+    catch (std::exception& e)
+    {
+        std::cerr << e.what() << std::endl;
+        throw;
+    }
+    catch (...)
+    {
+        return EXIT_FAILURE;
+    }
+
+    EXIT_SUCCESS;
+}

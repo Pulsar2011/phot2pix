@@ -78,13 +78,47 @@ namespace phot2pix
             const double& getBaseline() const { return m_baseline;}
 #pragma endregion
 
+#pragma region - pixel stages
+            // The pixel response is split into the three physical stages of a read-out.
+            // Each one can be overridden on its own; pixelresponse() chains them for a
+            // single-read exposure, and a multi-read simulator (e.g. a MACC / UTR ramp)
+            // calls them directly:
+            //   read 1 : charge  = resetLevel() + integrate(...)   value = read(charge)
+            //   read k : charge += integrate(...)                  value = read(charge)
+
+            // @brief Reset level, in ADU: baseline + kTC noise draw. Set once per reset,
+            //        common to every read until the next reset.
+            virtual double resetLevel() const;
+
+            // @brief Charge collected over exposureTime, in ADU: signal + dark current with
+            //        their shot noise. This is what accumulates in the pixel between reads:
+            //        no reset level, no read noise.
+            virtual double integrate(const double& flux, const double& exposureTime) const;
+
+            // @brief Runtime-parameter overload of integrate(). The base class ignores cfg.
+            virtual double integrate(const double& flux, const double& exposureTime, const PixelConfig& cfg) const
+            {
+                return integrate(flux, exposureTime);
+            }
+
+            // @brief One read of the charge accumulated in the pixel, in ADU: charge + one
+            //        independent read-noise draw N(0, readNoise)/gain. Called once per read;
+            //        its result is a measurement and is never fed back into the charge.
+            virtual double read(const double& charge) const;
+#pragma endregion
+
 #pragma region - pixel response
-            // @bdetails Simulate the pixel response to incoming photons. In default behaviour this function emulate purely linear response with shot noise and read noise. This function need to be overridden by derived classes to implement specific pixel response behaviour.
+            // @details Simulate a single-read exposure: read(resetLevel() + integrate(flux, exposureTime)).
+            //          Default behaviour is a purely linear response with shot noise, reset
+            //          level (baseline + kTC) and read noise. Override the stages above to change
+            //          one physical effect, or override pixelresponse() itself to provide a
+            //          completely different single-read model.
             virtual double pixelresponse(const double& flux, const double& exposureTime) const;
 
             // Optional runtime-parameter overload. Derived classes can override this to
             // extract extra parameters (e.g. "dT" for persistence) from cfg.
-            // The base class ignores cfg and delegates to the two-argument form.
+            // The base class ignores cfg and delegates to the two-argument form, so a
+            // model that only overrides pixelresponse(flux, exposureTime) is used by both.
             virtual double pixelresponse(const double& flux, const double& exposureTime, const PixelConfig& cfg) const
             {
                 return pixelresponse(flux, exposureTime);

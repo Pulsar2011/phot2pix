@@ -11,44 +11,7 @@
 
 namespace nisp
 {
-    double pixel::pixelresponse(const double& flux, const double& exposureTime) const
-    {
-        return pixelresponse(flux, exposureTime, phot2pix::PixelConfig());
-    }
-
-    double pixel::pixelresponse(const double& flux, const double& exposureTime, const phot2pix::PixelConfig& cfg) const
-    {
-
-        bool computeBaseline = m_computeBaseline;
-        if(cfg.has("baseline"))
-        {
-            if(!cfg.get<std::string>("baseline").compare("off"))
-                computeBaseline &= false;
-            else if(!cfg.get<std::string>("baseline").compare("on"))
-                computeBaseline |= true;
-        }
-        
-
-        //Randome noise distribution:
-        // Simulate the pixsim response to incoming flux over the exposure time.
-        // This is a placeholder implementation; actual simulation logic would go here.
-        double signal = flux * exposureTime * m_quantumEfficiency ; // Simple linear response expressed in electrons
-
-        signal += m_darkCurrent * exposureTime; // Add dark current contribution
-      
-        double var = sqrt(signal + m_readNoise * m_readNoise); // Total noise (Poisson + read noise)
-
-        double baseline_signal =  0.0;
-        
-        if(computeBaseline)
-        {
-            baseline_signal = ((m_KTCnoise/m_gain > 0.0) ? DST::Math::sample_normal_distribution(m_baseline, m_KTCnoise/m_gain) : m_baseline); // Add KTC noise contribution
-        }   
-
-        return ((var > 0.0) ? DST::Math::sample_normal_distribution(signal, var) / m_gain : 0.0) + // Convert to ADU using gain
-               baseline_signal; // Add KTC noise contribution
-
-    }
+    // nisp::pixel uses phot2pix::pixsim::resetLevel() / integrate() / read() as they are.
 
 #pragma region - Ramp class implementation
 #pragma region -- methods
@@ -126,20 +89,31 @@ namespace nisp
     // The result is stored in a freshly heap-allocated rawLines array of size ngr.
     Ramp& Ramp::coadd(const size_t& ngr, const size_t& nreads, const size_t& ndrops) const
     {
-        nisp::rawLines* COADD = new nisp::rawLines(static_cast<size_t>(ngr));
-        (*COADD) *= 0;
-        
-        for(size_t gr = 0; gr < COADD->size(); gr++)
+        nisp::rawLines* COADD = new nisp::rawLines(0.0, static_cast<size_t>(ngr));
+        return *(new Ramp(coadd(*COADD, ngr, nreads, ndrops)));
+    }
+
+    // Same co-addition into a caller-owned buffer: no allocation (unless groups is too
+    // small), no temporary slice arrays. Used once per pixel by SCA::expose_dpu().
+    Ramp Ramp::coadd(rawLines& groups, const size_t& ngr, const size_t& nreads, const size_t& ndrops) const
+    {
+        if (groups.size() < ngr)
+            groups.resize(ngr);
+
+        const size_t step = fstr.stride();
+        for (size_t gr = 0; gr < ngr; ++gr)
         {
-            size_t f0 = fstr.start()+gr*(nreads+ndrops)*fstr.stride();
-            size_t step =fstr.stride();
-            (*COADD)[gr] = ((nisp::rawLines) (*fdata)[std::slice(f0,nreads,step)]).sum()/static_cast<double>(nreads);
+            const size_t f0 = fstr.start() + gr * (nreads + ndrops) * step;
+            double sum = 0.0;
+            for (size_t r = 0; r < nreads; ++r)
+                sum += (*fdata)[f0 + r * step];
+            groups[gr] = sum / static_cast<double>(nreads);
         }
-        
-        Ramp* macc = new Ramp(COADD, std::slice(0,ngr,1),fsigma,fgain);
-        macc->reads_per_group(static_cast<int16_t>(nreads));
-        macc->drops_per_group(static_cast<int16_t>(ndrops));
-        return *macc;
+
+        Ramp macc(&groups, std::slice(0, ngr, 1), fsigma, fgain);
+        macc.reads_per_group(static_cast<int16_t>(nreads));
+        macc.drops_per_group(static_cast<int16_t>(ndrops));
+        return macc;
     }
     
     // Kubik et al. 2016 (PASP 128:104504) slope estimator for a MACC ramp.
@@ -174,38 +148,46 @@ namespace nisp
         //std::cout<<"alpha :"<<alpha<<std::endl;
         //std::cout<<"beta  :"<<beta<<std::endl;
         //std::cout<<"gamma :"<<gamma<<std::endl;
-        
-        nisp::rawLines _cds1 = (*fdata)[std::slice(fstr.start()              , fstr.size()-1, fstr.stride())];
-        nisp::rawLines _cds2 = (*fdata)[std::slice(fstr.start()+fstr.stride(), fstr.size()-1, fstr.stride())];
-        nisp::rawLines _cds  = _cds2 - _cds1;
-        _cds1.resize(0);
-        _cds2.resize(0);
-        
+
+        if(fstr.size() < 2)
+            throw std::runtime_error("[Ramp::getSlope] At least 2 groups are needed ["+std::to_string(__LINE__)+"]");
+
+        // Mean of (d + beta)² over the CDS differences d[k] = group[k+1] − group[k],
+        // accumulated in one pass: no temporary arrays (called once per pixel).
+        const size_t s0   = fstr.start();
+        const size_t st   = fstr.stride();
+        const double nCds = static_cast<double>(fstr.size() - 1);
+
+        double ffit = 0.0;
+        for(size_t k = 0; k + 1 < fstr.size(); ++k)
+        {
+            const double d = (*fdata)[s0 + (k + 1) * st] - (*fdata)[s0 + k * st] + beta;
+            ffit += d * d;
+        }
+        ffit /= nCds;
+
         double lf;
         this->getFowler(lf);
-        
-        double ffit = pow(_cds + beta,2.).sum() / static_cast<double>( _cds.size() );
+
         double pseudo_flux = sqrt(ffit) - beta;
-        
+
         flux = 1./gamma * (sqrt(1. + gamma*gamma*ffit ) - 1) - beta;
     //        flux /= (nf + nd);
-        
-        chi2 = gamma * (static_cast<double>( _cds.size() )*pseudo_flux - lf);
+
+        chi2 = gamma * (nCds*pseudo_flux - lf);
         chi2 /= ( ng - 2. ); // <- Get Normalized chi2
-        
-        err = 2*(pseudo_flux+beta)*(pseudo_flux+beta)/static_cast<double>( _cds.size() );
+
+        err = 2*(pseudo_flux+beta)*(pseudo_flux+beta)/nCds;
         err /= (1.+gamma*(pseudo_flux+beta));
         err = sqrt(err);
-        
-        _cds.resize(0);
     }
-    
+
     // Fowler sampling: simplest possible slope estimate — last frame minus first frame.
     // Used as a reference value in getSlope() to anchor the reduced χ² calculation.
     // Returns the result in the same units as the pixel data (e⁻ or ADU depending on fgain).
     void Ramp::getFowler(double &flux) const
     {
-        flux = ((nisp::rawLines)(*fdata)[fstr])[fstr.size()-1] - ((nisp::rawLines)(*fdata)[fstr])[0];
+        flux = (*fdata)[fstr.start() + (fstr.size() - 1) * fstr.stride()] - (*fdata)[fstr.start()];
     }
 
 #pragma endregion

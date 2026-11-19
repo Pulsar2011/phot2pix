@@ -11,6 +11,7 @@
 #include "nispPixel.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <future>
 #include <limits>
@@ -21,6 +22,69 @@
 
 namespace nisp
 {
+// ── MACC parameters ───────────────────────────────────────────────────────────
+#pragma region - macc
+    namespace
+    {
+        // Validate that v is a non-negative integer and return it as size_t.
+        // Goes through double so it accepts whatever integer type PixelConfig
+        // stored (JSON gives uint64_t, which is not size_t on macOS).
+        size_t toCount(double v, const char* name)
+        {
+            if (!(v >= 0.0) || v != std::floor(v))
+                throw std::invalid_argument(std::string("macc::fromConfig: '") + name + "' must be a non-negative integer.");
+            return static_cast<size_t>(v);
+        }
+    }
+
+    bool macc::inConfig(const phot2pix::PixelConfig& cfg)
+    {
+        return cfg.has("macc") || cfg.has("ng") || cfg.has("nr") || cfg.has("nd");
+    }
+
+    macc macc::fromConfig(const phot2pix::PixelConfig& cfg)
+    {
+        const bool hasArray = cfg.has("macc");
+        const bool hasKeys  = cfg.has("ng") || cfg.has("nr") || cfg.has("nd");
+
+        if (hasArray && hasKeys)
+            throw std::invalid_argument("macc::fromConfig: give either 'macc'=[ng,nr,nd] or 'ng','nr','nd', not both.");
+        if (!hasArray && !hasKeys)
+            throw std::invalid_argument("macc::fromConfig: no 'macc'=[ng,nr,nd] or 'ng','nr','nd' in configuration.");
+
+        const char* names[3] = {"ng", "nr", "nd"};
+        size_t      v[3]     = {0, 0, 0};
+
+        if (hasArray)
+        {
+            const phot2pix::json& j = cfg.getJson("macc");
+            if (!j.is_array() || j.size() != 3)
+                throw std::invalid_argument("macc::fromConfig: 'macc' must be an array [ng, nr, nd].");
+
+            for (size_t i = 0; i < 3; ++i)
+            {
+                if (!j[i].is_number())
+                    throw std::invalid_argument(std::string("macc::fromConfig: 'macc' element '") + names[i] + "' is not a number.");
+                v[i] = toCount(j[i].get<double>(), names[i]);
+            }
+        }
+        else
+        {
+            for (size_t i = 0; i < 3; ++i)
+            {
+                if (!cfg.has(names[i]))
+                    throw std::invalid_argument(std::string("macc::fromConfig: missing key '") + names[i] + "'.");
+                v[i] = toCount(cfg.getAsDouble(names[i]), names[i]);
+            }
+        }
+
+        if (v[0] == 0 || v[1] == 0)
+            throw std::invalid_argument("macc::fromConfig: ng and nr must be >= 1.");
+
+        return macc{v[0], v[1], v[2]};   // {nGroups, nFrames, nDrop}
+    }
+#pragma endregion
+
     namespace persistence
     {
 
@@ -222,9 +286,137 @@ namespace nisp
 // ── SCA ───────────────────────────────────────────────────────────────────────
 #pragma region - SCA
 
+    namespace
+    {
+        // Same result as FITScube::cast<uint16_t>(): round to nearest, clamp to [0, 65535], NaN → 0.
+        inline uint16_t toUint16(double x)
+        {
+            if (!(x >= 0.5))  return 0;        // also catches NaN
+            if (x >= 65534.5) return 65535;
+            return static_cast<uint16_t>(x + 0.5);
+        }
+
+        // Run work(begin, end) over [0, n), split into contiguous chunks on nThreads
+        // std::threads (so the compiler can vectorise each loop); a single call when the
+        // job is too small to be worth threading.
+        template <typename Work>
+        void parallelFor(size_t n, size_t nThreads, const Work& work)
+        {
+            if (nThreads <= 1 || n < 100 * nThreads)
+            {
+                work(size_t(0), n);
+                return;
+            }
+
+            const size_t chunk = (n + nThreads - 1) / nThreads;
+            std::vector<std::thread> workers;
+            workers.reserve(nThreads);
+            for (size_t b = 0; b < n; b += chunk)
+                workers.emplace_back(work, b, std::min(n, b + chunk));
+            for (auto& w : workers)
+                w.join();
+        }
+    }
+
+    // One pass over memory: accumulate the charge and, for a read, write the measured
+    // value straight into the output layer. A std::slice / std::gslice version would need
+    // temporaries for the double → uint16 conversion and run on a single thread.
+    void SCA::_accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
+                          uint16_t* layer, const std::valarray<double>* oneOverF) const
+    {
+        parallelFor(cumul.size(), getThreadCount(),
+            [this, &charge, &cumul, layer, oneOverF](size_t begin, size_t end)
+            {
+                if (!layer)                 // dropped frames: charge only
+                    for (size_t i = begin; i < end; ++i)
+                        cumul[i] += charge[i];
+                else if (!oneOverF)
+                    for (size_t i = begin; i < end; ++i)
+                    {
+                        cumul[i] += charge[i];
+                        layer[i]  = toUint16(m_pixels[i].read(cumul[i]));
+                    }
+                else
+                    for (size_t i = begin; i < end; ++i)
+                    {
+                        cumul[i] += charge[i];
+                        layer[i]  = toUint16(m_pixels[i].read(cumul[i]) + (*oneOverF)[i]);
+                    }
+            });
+    }
+
+    void SCA::_read(std::valarray<double>& charge) const
+    {
+        // 1/f noise generated concurrently with the pixel read noise.
+        std::future<std::valarray<double>> oneOverF;
+        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
+            oneOverF = std::async(std::launch::async,
+                [this]() { return m_oneOverFNoise.generate(getWidth(), getHeight()); });
+
+        parallelFor(size(), getThreadCount(),
+            [this, &charge](size_t begin, size_t end)
+            {
+                for (size_t i = begin; i < end; ++i)
+                    charge[i] = m_pixels[i].read(charge[i]);
+            });
+
+        if (oneOverF.valid())
+            charge += oneOverF.get();
+    }
+
+    void SCA::_read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+    {
+        // The windowed generate() still computes the full channel time series for each
+        // overlapping channel (AR(1) correlation from frame start), but only returns
+        // the ncols × nrows window portion.
+        std::future<std::valarray<double>> oneOverF;
+        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
+            oneOverF = std::async(std::launch::async,
+                [this, c0, r0, ncols, nrows]() { return m_oneOverFNoise.generate(getWidth(), getHeight(), c0, r0, ncols, nrows); });
+
+        const size_t width = getWidth();
+        parallelFor(nrows, getThreadCount(),
+            [this, &charge, c0, r0, ncols, width](size_t rowBegin, size_t rowEnd)
+            {
+                for (size_t r = rowBegin; r < rowEnd; ++r)
+                    for (size_t c = 0; c < ncols; ++c)
+                        charge[r * ncols + c] = m_pixels[(r0 + r) * width + c0 + c].read(charge[r * ncols + c]);
+            });
+
+        if (oneOverF.valid())
+        {
+            const std::valarray<double> noiseMap = oneOverF.get();   // ncols × nrows
+            charge[std::slice(0, noiseMap.size(), 1)] += noiseMap;
+        }
+    }
+
     void SCA::initialize(const phot2pix::PixelConfig& cfg)
     {
         phot2pix::DetectorSimulator<nisp::pixel>::initialize(cfg);
+
+        // DPU flux-estimation parameters, written as GAIN / RN in the output header:
+        // explicit "dpu_gain" (e-/ADU) / "dpu_noise" (e-) if given, otherwise the mean
+        // pixel gain / read noise (uniform value or FITS map), so the header matches
+        // the simulated detector.
+        if (cfg.has("dpu_gain"))
+            dpuGain = cfg.getAsDouble("dpu_gain");
+        else
+        {
+            double sum = 0.0;
+            for (size_t i = 0; i < size(); ++i)
+                sum += at(i).getGain();
+            dpuGain = sum / static_cast<double>(size());
+        }
+
+        if (cfg.has("dpu_noise"))
+            dpuNoise = cfg.getAsDouble("dpu_noise");
+        else
+        {
+            double sum = 0.0;
+            for (size_t i = 0; i < size(); ++i)
+                sum += at(i).getReadNoise();
+            dpuNoise = sum / static_cast<double>(size());
+        }
 
         if (cfg.has("offset"))
             dpuOffset = cfg.getAsDouble("offset");
@@ -240,6 +432,23 @@ namespace nisp
             frameTime = cfg.getAsDouble("fr_time");
         else if (cfg.has("frame_time"))
             frameTime = cfg.getAsDouble("frame_time");
+
+        if (cfg.has("exposureMode"))
+        {
+            const std::string modeName = cfg.get<std::string>("exposureMode");
+            std::string key = modeName;
+            std::transform(key.begin(), key.end(), key.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+            if      (key == "MACC") m_mode = nisp::mode::MACC;
+            else if (key == "UTR")  m_mode = nisp::mode::UTR;
+            else if (key == "CDS")  m_mode = nisp::mode::CDS;
+            else if (key == "DPU")  m_mode = nisp::mode::DPU;
+            else if (key == "FLUX") m_mode = nisp::mode::FLUX;
+            else
+                throw std::invalid_argument("SCA::initialize: unknown exposureMode '" + modeName +
+                                            "' (expected MACC, UTR, CDS, DPU or FLUX).");
+        }
 
         if(cfg.has("persistence"))
         {
@@ -282,6 +491,7 @@ namespace nisp
         std::shared_ptr<DSL::FITScube> frame;
 
         _simulate(fullFlux, exposureTime, frame, c0, r0, ncols, nrows);
+        _read(*(frame->GetData<double>()), c0, r0, ncols, nrows);   // single read: read noise + 1/f
 
         // Register full-frame charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)
@@ -347,26 +557,46 @@ namespace nisp
 
     std::shared_ptr<DSL::FITScube> SCA::expose_macc(const std::valarray<double>& fullFlux, const nisp::macc& maccParams)
     {
-        size_t nG = maccParams.nGroups;
-        size_t nF = maccParams.nFrames;
-        size_t nD = maccParams.nDrop;
+        const size_t nG      = maccParams.nGroups;
+        const size_t nF      = maccParams.nFrames;
+        const size_t nD      = maccParams.nDrop;
+        const size_t nPix    = size();
+        const size_t nLayers = nG * nF;
 
-        std::shared_ptr<DSL::FITScube> ramp        = nullptr;
-        std::shared_ptr<DSL::FITScube> skipped     = nullptr;
-        std::shared_ptr<DSL::FITScube> frame       = nullptr;
-        std::shared_ptr<DSL::FITScube> cummul      = nullptr;
+        if(nLayers == 0)
+            throw std::invalid_argument("SCA::expose: MACC needs nGroups >= 1 and nFrames >= 1.");
 
         double exposureTime = 0;
         double integrationTime = frameTime;
-        resetSimulationState();
 
+        // Reset level (baseline + kTC) belongs to the reset: drawn in the very first
+        // frame of the ramp only (pixel::resetLevel()), switched off for every later increment.
+        const phot2pix::PixelConfig firstRead;
         phot2pix::PixelConfig cfg;
         cfg.set("baseline", std::string("off"));
 
-        // One continuous 1/f noise stream for the whole ramp: every read
-        // (kept or dropped) consumes the next chunk of a single per-channel
-        // AR(1) process instead of each _simulate() call independently
-        // restarting the amplifier state at zero.
+        // Output ramp allocated once (uint16, W × H × nLayers). Each read is written
+        // straight into its own layer: no AddLayer() regrowth of the whole cube,
+        // no double-precision copy of the ramp and no final cast<uint16_t>().
+        std::vector<size_t> axes = {getWidth(), getHeight()};
+        if(nLayers > 1)
+            axes.push_back(nLayers);
+
+        auto out = std::make_shared<DSL::FITSimg<uint16_t>>(axes);
+        std::valarray<uint16_t>* outData = out->GetData<uint16_t>();
+        if(!outData)
+            throw std::runtime_error("SCA::expose: cannot allocate the output ramp.");
+
+        // Charge accumulated in the pixels (ADU): signal + dark + shot noise + reset level.
+        // Read noise and 1/f noise are added to each read's layer only, never to cumul.
+        std::valarray<double>          cumul(0.0, nPix);
+        std::shared_ptr<DSL::FITScube> frame    = nullptr;
+        std::shared_ptr<DSL::FITScube> skipped  = nullptr;
+        size_t                         layer    = 0;
+
+        // One continuous 1/f noise stream for the whole ramp: every frame (read or
+        // dropped) consumes the next chunk of a single per-channel AR(1) process
+        // instead of restarting the amplifier state at zero for each read.
         std::optional<nisp::OneOverFNoise::Stream> oneOverFStream;
         if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
             oneOverFStream = m_oneOverFNoise.beginStream(getWidth(), getHeight());
@@ -378,25 +608,25 @@ namespace nisp
                 integrationTime = frameTime;
                 exposureTime   += integrationTime;
 
-                _simulate(fullFlux, integrationTime, frame, ((g < 1)? phot2pix::PixelConfig() : cfg),
-                          oneOverFStream ? &(*oneOverFStream) : nullptr);
+                // This read's 1/f chunk, generated concurrently with the pixel charge.
+                std::future<std::valarray<double>> oneOverFFuture;
+                if (oneOverFStream)
+                    oneOverFFuture = std::async(std::launch::async,
+                        [&stream = *oneOverFStream]() { return stream.next(); });
+
+                _simulate(fullFlux, integrationTime, frame, ((layer == 0) ? firstRead : cfg));
                 if(!frame)
                     throw std::runtime_error("SCA::expose: failed to simulate frame ["+std::to_string(g)+","+std::to_string(f)+"]");
 
-                if(!ramp)
-                {
-                    ramp = frame;
-                    cummul = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<double>({frame->Size(1), frame->Size(2)}));
-                    *(cummul) += *(frame->GetData<double>());
-                }
-                else
-                {
-                    *(frame->GetData<double>()) += *(cummul->GetData<double>());
-                    ramp->AddLayer(*(frame));
+                std::valarray<double> oneOverF;
+                if (oneOverFFuture.valid())
+                    oneOverF = oneOverFFuture.get();
 
-                    std::swap(cummul,frame);
-                    frame.reset();
-                }
+                // cumul += this frame's charge, then read it: layer = pixel read (read noise) + 1/f.
+                _accumulate(*(frame->GetData<double>()), cumul, &(*outData)[layer * nPix],
+                            oneOverF.size() ? &oneOverF : nullptr);
+                frame.reset();
+                ++layer;
             }
 
             if(nD <= 0)
@@ -407,25 +637,26 @@ namespace nisp
 
             if(g+1 < nG)
             {
-                _simulate(fullFlux, integrationTime, skipped, cfg,
-                          oneOverFStream ? &(*oneOverFStream) : nullptr);
+                // Dropped frames are read and discarded: their nD 1/f chunks are consumed
+                // so the amplifier process stays continuous in time, but never stored.
+                std::future<void> oneOverFSkip;
+                if (oneOverFStream)
+                    oneOverFSkip = std::async(std::launch::async,
+                        [&stream = *oneOverFStream, nD]() { for (size_t k = 0; k < nD; ++k) stream.next(); });
+
+                _simulate(fullFlux, integrationTime, skipped, cfg);
                 if(!skipped)
                     throw std::runtime_error("SCA::expose: failed to simulate skipped frame ["+std::to_string(g)+","+std::to_string(nF-1)+",0]");
-                
-                if(!cummul)
-                {
-                    cummul = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<double>({getWidth(), getHeight()}));
-                    *(cummul->GetData<double>()) *=0.;
-                }
-                
-                *(cummul) += *(skipped->GetData<double>());
+
+                _accumulate(*(skipped->GetData<double>()), cumul, nullptr, nullptr);   // dropped frames: charge only, no layer
                 skipped.reset();
+
+                if (oneOverFSkip.valid())
+                    oneOverFSkip.get();
             }
         }
 
-        cummul.reset();
-        skipped.reset();
-        frame.reset();
+        cumul.resize(0);
 
         // Register accumulated charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)
@@ -439,8 +670,8 @@ namespace nisp
             persistenceModelling->insertCharges(chargeImg, 0.0);
         }
 
-        std::shared_ptr<DSL::FITScube> result = ramp->cast<uint16_t>();
-        result->HDU().ValueForKey("INTTIME", integrationTime, "Integration time in seconds");
+        std::shared_ptr<DSL::FITScube> result = out;
+        result->HDU().ValueForKey("INTTIME", static_cast<double>(nG*(nF+nD)-nD)*frameTime, "Integration time in seconds");
         result->HDU().ValueForKey("EXPTIME", exposureTime, "Exposure time in seconds");
         result->HDU().ValueForKey("MODE", std::string("MACC"), "Simulation mode");
         result->HDU().ValueForKey("NG", nG, "Number of groups");
@@ -455,10 +686,12 @@ namespace nisp
         result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
 
         result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX", PHOT2PIX_VERSION, "phot2pix version");
+        result->HDU().ValueForKey("PHOT2PIX", std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
+                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar,  "phot2pix version");
         
 
-        ramp.reset();
         return result;
     }
 
@@ -467,33 +700,40 @@ namespace nisp
         if(exposureTime < 2*frameTime)
             throw std::invalid_argument("SCA::expose_cds: exposure time must be at least 2*"+std::to_string(frameTime)+" seconds for CDS mode.");
 
-        resetSimulationState();
+        // Small margin so that rounding (75.9999… instead of 76) cannot drop a frame.
+        const double nFrames          = std::floor(exposureTime / frameTime + 1e-9);
+        const double eff_exposureTime = nFrames * frameTime;            // reset → read N
+        const double cdsTime          = eff_exposureTime - frameTime;   // read 1 → read N
 
-        double nFrames = std::floor(exposureTime / frameTime);
-        double eff_exposureTime = nFrames * frameTime;
-        
-        std::shared_ptr<DSL::FITScube> f0 = nullptr;
-        std::shared_ptr<DSL::FITScube> f1 = nullptr;
-        
-        double this_exposureTime = frameTime;
+        std::shared_ptr<DSL::FITScube> f0 = nullptr;   // read 1
+        std::shared_ptr<DSL::FITScube> f1 = nullptr;   // read N
 
-        
-        _simulate(fullFlux, this_exposureTime, f0);
+        // Charge at read 1: reset level (baseline + kTC) + one frame of signal.
+        _simulate(fullFlux, frameTime, f0);
         if(!f0)
             throw std::runtime_error("SCA::expose_cds: failed to simulate frame [f0]");
 
-        this_exposureTime = eff_exposureTime - frameTime;
-
+        // Charge collected between read 1 and read N (baseline off: no new reset).
         phot2pix::PixelConfig cfg;
         cfg.set("baseline", std::string("off"));
-        
-        _simulate(fullFlux, this_exposureTime, f1, cfg);
+
+        _simulate(fullFlux, cdsTime, f1, cfg);
         if(!f1)
             throw std::runtime_error("SCA::expose_cds: failed to simulate frame [f1]");
-        
-        *(f0->GetData<double>()) -= *(f1->GetData<double>());
 
-        f1.reset();
+        std::valarray<double>& read1 = *(f0->GetData<double>());
+        std::valarray<double>& readN = *(f1->GetData<double>());
+
+        readN += read1;   // charge at read N = charge at read 1 + charge collected since
+
+        // Each read adds its own, independent read noise (pixel::read) and 1/f noise.
+        _read(read1);
+        _read(readN);
+
+        // CDS = read N − read 1: reset level and kTC cancel, the read noise of both reads remains.
+        *(f1->GetData<double>()) -= *(f0->GetData<double>());
+
+        f0.reset();
 
         // Register accumulated charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)
@@ -507,8 +747,10 @@ namespace nisp
             persistenceModelling->insertCharges(chargeImg, 0.0);
         }
 
-        std::shared_ptr<DSL::FITScube> result = f0->cast<uint16_t>();
-        result->HDU().ValueForKey("INTTIME", eff_exposureTime, "Integration time in seconds");
+        // DPU scale / offset applied like the FLUX mode, so negative CDS values (noise on
+        // dark pixels) survive when an offset is set, instead of being clipped to 0.
+        std::shared_ptr<DSL::FITScube> result = _toUint16(f1);
+        result->HDU().ValueForKey("INTTIME", cdsTime, "Integration time in seconds");   // read 1 → read N
         result->HDU().ValueForKey("EXPTIME", eff_exposureTime, "Exposure time in seconds");
         result->HDU().ValueForKey("MODE", std::string("CDS"), "Simulation mode");
         if(m_enable_persistence)
@@ -520,9 +762,12 @@ namespace nisp
         result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
 
         result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX", PHOT2PIX_VERSION, "phot2pix version");
+        result->HDU().ValueForKey("POT2PIX",  std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
+                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
 
-        f0.reset();
+        f1.reset();
         return result;
     }
 
@@ -531,9 +776,9 @@ namespace nisp
         std::shared_ptr<DSL::FITScube> frame;
 
         double effectiveExposureTime = std::floor(exposureTime/frameTime)*frameTime;
-        
-        resetSimulationState();
+
         _simulate(flux, effectiveExposureTime, frame);
+        _read(*(frame->GetData<double>()));   // single read: read noise + 1/f
 
         // Register accumulated charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)
@@ -559,7 +804,10 @@ namespace nisp
         result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
 
         result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX", PHOT2PIX_VERSION, "phot2pix version");
+        result->HDU().ValueForKey("POT2PIX",  std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
+                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
 
         frame.reset();
         return result;
@@ -567,36 +815,79 @@ namespace nisp
 
     std::shared_ptr<DSL::FITScube> SCA::expose_dpu(const std::valarray<double>& flux, const nisp::macc& maccParams)
     {
+        const size_t nG = maccParams.nGroups;
+        const size_t nR = maccParams.nFrames;
+        const size_t nD = maccParams.nDrop;
+        if(nG < 2)
+            throw std::invalid_argument("SCA::expose_dpu: the DPU slope estimator needs at least 2 groups.");
+
         std::shared_ptr<DSL::FITScube> MACC = expose_macc(flux, maccParams);
-        if(MACC->Size(3) < 2)
-            throw std::runtime_error("SCA::expose_dpu: insufficient number of groups for DPU flux estimation.");
+        const std::valarray<uint16_t>* rampData = MACC->GetData<uint16_t>();
+        if(!rampData)
+            throw std::runtime_error("SCA::expose_dpu: the MACC ramp is not a uint16 cube.");
+
+        const size_t nPix = MACC->Size(1) * MACC->Size(2);
 
         std::shared_ptr<DSL::FITScube> result = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint16_t>({MACC->Size(1), MACC->Size(2)}));
         *(result) *=0;
+        std::valarray<uint16_t>& outData = *(result->GetData<uint16_t>());
+
+        // nisp::Ramp works on doubles, in the units of the data: the read noise is
+        // converted from e- to ADU like the ramp.
+        const double sigmaADU = dpuNoise / dpuGain;
 
         setThreadCount(0);
 
-        for(size_t i = 0; i < MACC->Size(1) * MACC->Size(2); ++i)
+        // One pixel per iteration, pixels split over the threads. Each thread owns two
+        // double buffers reused for all its pixels (no allocation per pixel):
+        //   reads  : the pixel's uint16 reads, converted to double for nisp::Ramp
+        //   groups : their group averages, filled by Ramp::coadd
+        parallelFor(nPix, getThreadCount(), [&](size_t begin, size_t end)
         {
-            double slope=0.;
-            double chi2 =0.;
-            double err  =0.;
+            nisp::rawLines reads(0.0, nG * nR);
+            nisp::rawLines groups(0.0, nG);
 
-            if((*(MACC->GetData<double>()))[i*MACC->Size(1)*MACC->Size(2)] >= 65535) // Reset the first group to zero for slope estimation
+            for(size_t i = begin; i < end; ++i)
             {
-                (*(result->GetData<uint16_t>()))[i] = 65535;
-                continue;
+                // Copy the reads group by group, up to the first saturated group: a
+                // saturated read makes the rest of the ramp unusable, only the groups
+                // before it are fitted.
+                size_t nGood = 0;
+                for(size_t g = 0; g < nG; ++g)
+                {
+                    bool saturated = false;
+                    for(size_t r = 0; r < nR; ++r)
+                    {
+                        const uint16_t v = (*rampData)[(g * nR + r) * nPix + i];
+                        saturated |= (v >= 65535);
+                        reads[g * nR + r] = static_cast<double>(v);
+                    }
+                    if(saturated)
+                        break;
+                    ++nGood;
+                }
+
+                if(nGood < 2)
+                {
+                    outData[i] = 65535;   // saturated before two groups: no slope
+                    continue;
+                }
+
+                // The MACC cube holds the reads only (dropped frames are not stored), so
+                // the reads are co-added with no drops; nD is then set for the estimator.
+                const nisp::Ramp raw(&reads, std::slice(0, nGood * nR, 1), sigmaADU, dpuGain);
+                nisp::Ramp       grouped = raw.coadd(groups, nGood, nR, 0);
+                grouped.drops_per_group(static_cast<int16_t>(nD));
+
+                double slope = 0., chi2 = 0., err = 0.;
+                grouped.getSlope(slope, chi2, err);
+
+                outData[i] = toUint16(slope * dpuScale + dpuOffset);   // rounded, clamped to [0, 65535], NaN → 0
             }
+        });
 
-            nisp::Ramp dpu = nisp::Ramp(MACC->GetData<double>(), std::slice(i, MACC->Size(3), MACC->Size(1)*MACC->Size(2)),dpuNoise, dpuGain);
-            dpu.getSlope(slope, chi2, err);
-
-            uint16_t dpuValue = (slope >= 65535) ? 65535 : ((slope <= 0) ? 0 : static_cast<uint16_t>(slope * dpuScale + dpuOffset +0.5));
-            (*(result->GetData<uint16_t>()))[i] = dpuValue;
-        }
-
-        result->HDU().ValueForKey("INTTIME", maccParams.nFrames * frameTime, "Integration time in seconds");
-        result->HDU().ValueForKey("EXPTIME", maccParams.nFrames * frameTime, "Exposure time in seconds");
+        result->HDU().ValueForKey("INTTIME", static_cast<double>(maccParams.nGroups*(maccParams.nFrames+maccParams.nDrop) - maccParams.nDrop) * frameTime, "Integration time in seconds");
+        result->HDU().ValueForKey("EXPTIME", static_cast<double>(maccParams.nGroups*(maccParams.nFrames+maccParams.nDrop)) * frameTime, "Exposure time in seconds");
         result->HDU().ValueForKey("MODE", std::string("DPU"), "Simulation mode");
         result->HDU().ValueForKey("NG", maccParams.nGroups, "Number of groups");
         result->HDU().ValueForKey("NR", maccParams.nFrames, "Number of reads/group");
@@ -610,7 +901,10 @@ namespace nisp
         result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
 
         result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX", PHOT2PIX_VERSION, "phot2pix version");
+        result->HDU().ValueForKey("POT2PIX",  std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
+                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
+                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
 
         return result;
     }
@@ -618,23 +912,9 @@ namespace nisp
 
 
     void SCA::_simulate(const std::valarray<double>& flux, const double& exposureTime,
-                        std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg,
-                        nisp::OneOverFNoise::Stream* oneOverFStream)
+                        std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg)
     {
         std::shared_ptr<DSL::FITScube>       persistenceSignal;
-        std::future<std::valarray<double>>   oneOverFFuture;
-
-        // Launch 1/f noise generation before pixel simulation so both run concurrently.
-        // generate()/Stream::next() are themselves parallel over H2RG output channels.
-        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
-        {
-            if (oneOverFStream)
-                oneOverFFuture = std::async(std::launch::async,
-                    [oneOverFStream]() { return oneOverFStream->next(); });
-            else
-                oneOverFFuture = std::async(std::launch::async,
-                    [this]() { return m_oneOverFNoise.generate(getWidth(), getHeight()); });
-        }
 
         if (persistenceModelling && persistenceModelling->getHistory().size() > 0)
         {
@@ -665,9 +945,6 @@ namespace nisp
             *(frame->GetData<double>()) += *(persistenceSignal->GetData<double>());
             persistenceSignal.reset();
         }
-
-        if (oneOverFFuture.valid())
-            *(frame->GetData<double>()) += oneOverFFuture.get();
     }
 
     void SCA::_simulate(const std::valarray<double>& flux,
@@ -676,22 +953,11 @@ namespace nisp
                         size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg)
     {
         std::shared_ptr<DSL::FITScube>      persistenceSignal;
-        std::future<std::valarray<double>>  oneOverFFuture;
 
         // Extract window flux first — pure data copy, no compute cost.
         std::valarray<double> windowFlux(0.0, ncols * nrows);
         for (size_t r = 0; r < nrows; ++r)
             windowFlux[std::slice(r * ncols, ncols, 1)] = flux[std::slice((r0 + r) * getWidth() + c0, ncols, 1)];
-
-        // Launch 1/f noise concurrently with pixel simulation.
-        // The windowed generate() still computes the full channel time series for each
-        // overlapping channel (preserving AR(1) correlation from frame start), but only
-        // returns the ncols × nrows window portion.
-        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
-            oneOverFFuture = std::async(std::launch::async,
-                [this, c0, r0, ncols, nrows]() {
-                    return m_oneOverFNoise.generate(getWidth(), getHeight(), c0, r0, ncols, nrows);
-                });
 
         if (persistenceModelling && persistenceModelling->getHistory().size() > 0)
         {
@@ -720,20 +986,6 @@ namespace nisp
 
         if (persistenceSignal && m_enable_persistence)
             *(frame->GetData<double>()) += *(persistenceSignal->GetData<double>());
-
-        // frame->GetData() has W×H elements; window data occupies the first ncols*nrows.
-        // Use a slice to add only to the window portion.
-        if (oneOverFFuture.valid())
-        {
-            auto noiseMap = oneOverFFuture.get();   // ncols × nrows
-            (*frame->GetData<double>())[std::slice(0, noiseMap.size(), 1)] += noiseMap;
-        }
-    }
-
-    void SCA::resetSimulationState()
-    {
-        for (size_t i = 0; i < size(); ++i)
-            phot2pix::DetectorSimulator<nisp::pixel>::at(i).resetState();
     }
 
 #pragma endregion

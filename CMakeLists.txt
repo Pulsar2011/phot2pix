@@ -290,6 +290,29 @@ set_target_properties(DST::fits PROPERTIES
 message(STATUS "${_G}  DSTfits lib   :${_Z} ${DSTfits_LIB}")
 message(STATUS "${_G}  DSTfits inc   :${_Z} ${DSTfits_INCLUDE_DIR}")
 
+# ─── Dependency: DSTCore (dynamic, optional — only needed by src/utilities) ──
+# Provides DOption (OptionManager.h) and DSF::gGIT. If absent, the libraries
+# still build and the utilities are skipped.
+find_library(DSTCore_LIB
+    NAMES DSTCore libDSTCore
+    HINTS "${DeepSkyROOT}/${CMAKE_INSTALL_LIBDIR}"
+          "${DeepSkyROOT}/lib"
+)
+if(DSTCore_LIB)
+    cmake_path(GET DSTCore_LIB PARENT_PATH _dstcore_libdir)
+    cmake_path(GET _dstcore_libdir PARENT_PATH _dstcore_root)
+    set(DSTCore_INCLUDE_DIR "${_dstcore_root}/include")
+
+    add_library(DST::core SHARED IMPORTED GLOBAL)
+    set_target_properties(DST::core PROPERTIES
+        IMPORTED_LOCATION             "${DSTCore_LIB}"
+        INTERFACE_INCLUDE_DIRECTORIES "${DSTCore_INCLUDE_DIR}"
+    )
+    message(STATUS "${_G}  DSTCore lib   :${_Z} ${DSTCore_LIB}")
+else()
+    message(STATUS "${_Y}  DSTCore lib   : not found — utilities will be skipped${_Z}")
+endif()
+
 # ─── Library: phot2pix ────────────────────────────────────────────────────────
 file(GLOB_RECURSE PHOT2PIX_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/phot2pix/*.cxx"
@@ -367,6 +390,29 @@ if(NISP_SOURCES)
     )
 
     message(STATUS "${_G}  nisp lib      :${_Z} nisppixelsimulator")
+endif()
+
+# ─── Utilities: nispSimulator ────────────────────────────────────────────────
+if(TARGET nisppixelsimulator AND TARGET DST::core)
+    add_executable(nispSimulator
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/utilities/nispSimulator.cxx"
+    )
+
+    target_link_libraries(nispSimulator
+        PRIVATE nisppixelsimulator
+        PRIVATE DST::core
+        PRIVATE _p2p_opts
+    )
+
+    set_target_properties(nispSimulator PROPERTIES
+        INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/${CMAKE_INSTALL_LIBDIR}"
+    )
+
+    install(TARGETS nispSimulator
+        RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
+    )
+
+    message(STATUS "${_G}  utility       :${_Z} nispSimulator")
 endif()
 
 # ─── Tests ────────────────────────────────────────────────────────────────────

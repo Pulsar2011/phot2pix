@@ -1,0 +1,32 @@
+{
+    "width"        : 2048,
+    "height"       : 2048,
+    "x0"           : 0,
+    "y0"           : 0,
+
+    "benchmark"    : 10,
+
+    "flux"         : 0.0,
+
+    "exposureMode" : "MACC",
+    "macc"         : [4, 16, 4],
+
+    "frame_time"   : 1.45408,
+    "offset"       : 0.0,
+    "scale"        : 1.0,
+
+    "gain"         : 1.92,
+    "dark"         : 0.01,
+    "readNoise"    : 13.0,
+    "QE"           : 0.94,
+    "KTCnoise"     : 48.0,
+    "baseline"     : 10000.0,
+
+    "oneOverF"     : {
+        "amplitude"     : 0.0,
+        "slope"         : 1.0,
+        "nChannels"     : 0,
+        "colPerChannel" : 64,
+        "nPoles"        : 16
+    }
+}

@@ -74,18 +74,34 @@ namespace phot2pix
 
     pixsim::~pixsim() {}
 
-    double pixsim::pixelresponse(const double& flux, const double& exposureTime) const
+    double pixsim::resetLevel() const
     {
-        //Randome noise distribution:
-        // Simulate the pixsim response to incoming flux over the exposure time.
-        // This is a placeholder implementation; actual simulation logic would go here.
-        double signal = flux * exposureTime * m_quantumEfficiency ; // Simple linear response expressed in electrons
+        // Baseline with kTC (reset) noise, converted to ADU.
+        return (m_KTCnoise / m_gain > 0.0) ? DST::Math::sample_normal_distribution(m_baseline, m_KTCnoise / m_gain) : m_baseline;
+    }
+
+    double pixsim::integrate(const double& flux, const double& exposureTime) const
+    {
+        double signal = flux * exposureTime * m_quantumEfficiency; // Simple linear response expressed in electrons
 
         signal += m_darkCurrent * exposureTime; // Add dark current contribution
-      
-        double var = sqrt(signal + m_readNoise * m_readNoise); // Total noise (Poisson + read noise)
 
-        return ((var > 0.0) ? DST::Math::sample_normal_distribution(signal, var) / m_gain : 0.0) + // Convert to ADU using gain
-               ((m_KTCnoise/m_gain > 0.0) ? DST::Math::sample_normal_distribution(m_baseline, m_KTCnoise/m_gain) : m_baseline); // Add KTC noise contribution
+        // Shot noise only (Poisson, Gaussian approximation): read noise is added by read().
+        const double sigma = sqrt(signal);
+
+        return (sigma > 0.0) ? DST::Math::sample_normal_distribution(signal, sigma) / m_gain : 0.0; // Convert to ADU using gain
+    }
+
+    double pixsim::read(const double& charge) const
+    {
+        if (m_readNoise > 0.0)
+            return charge + DST::Math::sample_normal_distribution(0.0, m_readNoise) / m_gain;   // e- → ADU
+        return charge;
+    }
+
+    double pixsim::pixelresponse(const double& flux, const double& exposureTime) const
+    {
+        // Single-read exposure: reset, integrate, read.
+        return read(resetLevel() + integrate(flux, exposureTime));
     }
 } // namespace phot2pix

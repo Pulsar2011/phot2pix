@@ -11,11 +11,9 @@
 // checks, (c) persistence, (d) 1/f noise, (e) all three combined as a smoke
 // test, (f) a full 2048x2048 exposure timed for a CPU-cost sanity check.
 //
-// Only expose(flux, nisp::macc{...}) and the 6-arg windowed expose() are
-// used here — these are the only two entry points reachable from m_mode's
-// fixed default (nisp::mode::MACC, no public setter), so expose_cds /
-// expose_flux / expose_dpu are not exercised (unreachable from the public
-// API today).
+// Most tests use the default MACC mode. The readout modes (selected with
+// "exposureMode") are validated on a full detector in gTest_nispReadoutModes.cxx;
+// here only the CDS read-noise budget is checked (ExposeCdsTwoReadsOfReadNoiseAndKtcCancels).
 //
 
 #include <gtest/gtest.h>
@@ -23,6 +21,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <filesystem>
 #include <iostream>
 #include <string>
 #include <valarray>
@@ -32,6 +31,19 @@ using namespace nisp;
 using namespace phot2pix;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+// Write a test output to ./build/<name> for inspection. CFITSIO refuses to create
+// a file that already exists (status 105), so the file left by a previous run is
+// purged first; the directory is created if missing.
+static void writeTestOutput(const std::shared_ptr<DSL::FITScube>& img, const std::string& name)
+{
+    const std::filesystem::path dir  = "./build";
+    const std::filesystem::path file = dir / name;
+
+    std::filesystem::create_directories(dir);
+    std::filesystem::remove(file);   // no-op when absent
+    img->Write(file.string());
+}
 
 static std::valarray<double> makeUniformFlux(size_t w, size_t h, double value)
 {
@@ -117,7 +129,7 @@ TEST(SCA, InitializeAcceptsDpuAliasKeys)
     auto flux = makeUniformFlux(2, 2, 0.0);
     auto windowed = sca.expose(flux, 1.0, 0, 0, 2, 2);
 
-    windowed->Write("./build/test_expose_macc_windows.fits");
+    writeTestOutput(windowed, "test_expose_macc_windows.fits");
 
     ASSERT_NE(windowed, nullptr);
     const auto& data = *(windowed->GetData<uint16_t>());
@@ -125,7 +137,7 @@ TEST(SCA, InitializeAcceptsDpuAliasKeys)
         EXPECT_EQ(data[i], 100u); // round(0*2.0 + 100.0 + 0.5) truncated -> 100
 
     auto ramp = sca.expose(flux, nisp::macc{2, 1, 0});
-    ramp->Write("./build/test_expose_macc_ramp.fits");
+    writeTestOutput(ramp, "test_expose_macc_ramp.fits");
     ASSERT_NE(ramp, nullptr);
     EXPECT_NEAR(ramp->HDU().GetDoubleValueForKey("FRTIME"), 0.5, 1e-9);
 }
@@ -155,12 +167,12 @@ TEST(SCA, ExposeMaccReturnsExpectedLayerCount)
     ASSERT_NE(result, nullptr);
     EXPECT_EQ(result->Size(3), 5u);
 
-    result->Write("./build/test_expose_macc01.fits");
+    writeTestOutput(result, "test_expose_macc01.fits");
 }
 
 TEST(SCA, ExposeMaccLayerMeansGrowLinearlyStatistical)
 {
-    // NOTE: pixelresponse()'s shot-noise sigma is sqrt(signal + readNoise^2),
+    // NOTE: pixelresponse()'s shot-noise sigma is sqrt(signal),
     // where signal = flux*QE*t + dark*t. With flux=20, QE=1 that signal is
     // itself nonzero, so photon shot noise is present regardless of
     // readNoise/KTC/baseline being zeroed -- there is no way to get an
@@ -179,7 +191,7 @@ TEST(SCA, ExposeMaccLayerMeansGrowLinearlyStatistical)
 
     constexpr size_t nG = 4;
     auto result = sca.expose(flux, nisp::macc{nG, 1, 0});
-    result->Write("./build/test_expose_macc02.fits");
+    writeTestOutput(result, "test_expose_macc02.fits");
 
     ASSERT_NE(result, nullptr);
     ASSERT_EQ(result->Size(3), nG);
@@ -261,6 +273,98 @@ TEST(SCA, ExposeMaccBaselineDrawnOnceNotPerLayer)
     EXPECT_EQ(data[3], data[0]);
 }
 
+TEST(SCA, ExposeMaccReadNoiseNotAccumulated)
+{
+    // Zero flux: every read is baseline + its own read noise. Read noise is a
+    // read property, not charge, so every layer of the ramp must show RN²
+    // (not k*RN² for the k-th read), and two consecutive reads differ by 2*RN².
+    // Baseline 1000 keeps every value far from the uint16 clamp at 0.
+    constexpr double RN = 13.0, base = 1000.0;
+    constexpr size_t W = 256, H = 256, nG = 4, nR = 16, nD = 4;
+    nisp::SCA sca(W, H);
+    sca.initialize(PixelConfig{
+        {"gain", 1.0}, {"dark", 0.0}, {"readNoise", RN}, {"QE", 1.0},
+        {"KTCnoise", 0.0}, {"baseline", base}, {"frame_time", 1.0}
+    });
+    auto flux = makeUniformFlux(W, H, 0.0);
+
+    auto result = sca.expose(flux, nisp::macc{nG, nR, nD});
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(result->Size(3), nG * nR);
+
+    const auto&  data  = *(result->GetData<uint16_t>());
+    const size_t plane = W * H;
+    const double n     = static_cast<double>(plane);
+
+    // Mean and population variance of plane a, or of (plane a − plane b) when b >= 0.
+    auto stats = [&data, plane, n](size_t a, long b) -> std::pair<double, double>
+    {
+        double sum = 0.0, sum2 = 0.0;
+        for (size_t p = 0; p < plane; ++p)
+        {
+            double x = static_cast<double>(data[a * plane + p]);
+            if (b >= 0)
+                x -= static_cast<double>(data[static_cast<size_t>(b) * plane + p]);
+            sum  += x;
+            sum2 += x * x;
+        }
+        const double mean = sum / n;
+        return {mean, sum2 / n - mean * mean};
+    };
+
+    constexpr double k       = 5.0;
+    const double     varRead = RN * RN + 1.0 / 12.0;   // read noise + uint16 rounding
+    for (size_t L = 0; L < nG * nR; ++L)
+    {
+        const auto [mean, var] = stats(L, -1);
+        EXPECT_NEAR(mean, base,    k * std::sqrt(varRead / n) + 0.01)                  << "layer " << L;
+        EXPECT_NEAR(var,  varRead, k * std::sqrt(2.0 / n) * varRead + 0.01 * varRead) << "layer " << L << " (read noise must not accumulate)";
+
+        if (L == 0)
+            continue;
+        const auto [dMean, dVar] = stats(L, static_cast<long>(L - 1));
+        EXPECT_NEAR(dMean, 0.0,         k * std::sqrt(2.0 * varRead / n) + 0.01)                    << "read " << L << " - read " << L - 1;
+        EXPECT_NEAR(dVar,  2.0 * varRead, k * std::sqrt(2.0 / n) * 2.0 * varRead + 0.02 * varRead) << "read " << L << " - read " << L - 1;
+    }
+}
+
+TEST(SCA, ExposeCdsTwoReadsOfReadNoiseAndKtcCancels)
+{
+    // Zero flux, CDS over 10 frames: CDS = read N − read 1. The reset level
+    // (baseline + kTC) is common to both reads and cancels; each read keeps
+    // its own read noise, so the CDS variance is 2*RN² (not RN², not + kTC²).
+    // The DPU offset keeps the zero-mean CDS away from the uint16 clamp at 0.
+    constexpr double RN = 13.0, KTC = 20.0, base = 1000.0, offset = 500.0;
+    constexpr size_t W = 256, H = 256;
+    nisp::SCA sca(W, H);
+    sca.initialize(PixelConfig{
+        {"gain", 1.0}, {"dark", 0.0}, {"readNoise", RN}, {"QE", 1.0},
+        {"KTCnoise", KTC}, {"baseline", base}, {"frame_time", 1.0},
+        {"offset", offset}, {"exposureMode", std::string("CDS")}
+    });
+    auto flux = makeUniformFlux(W, H, 0.0);
+
+    auto result = sca.expose(flux, 10.0);
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(result->GetDimension(), 2u);
+
+    const auto&  data = *(result->GetData<uint16_t>());
+    const double n    = static_cast<double>(data.size());
+    double sum = 0.0;
+    for (auto v : data) sum += static_cast<double>(v);
+    const double mean = sum / n;
+    const double var  = populationVariance(data);
+
+    constexpr double k      = 5.0;
+    const double     varCds = 2.0 * RN * RN + 1.0 / 12.0;
+    EXPECT_NEAR(mean, offset, k * std::sqrt(varCds / n) + 0.01) << "baseline must cancel";
+    EXPECT_NEAR(var,  varCds, k * std::sqrt(2.0 / n) * varCds + 0.01 * varCds) << "CDS variance: 2*RN², kTC must cancel";
+
+    EXPECT_EQ  (result->HDU().GetValueForKey("MODE"), "CDS");
+    EXPECT_NEAR(result->HDU().GetDoubleValueForKey("INTTIME"), 9.0,  1e-9);   // read 1 → read 10
+    EXPECT_NEAR(result->HDU().GetDoubleValueForKey("EXPTIME"), 10.0, 1e-9);   // reset → read 10
+}
+
 TEST(SCA, ExposeMaccHDUKeys)
 {
     nisp::SCA sca(2, 2);
@@ -274,8 +378,8 @@ TEST(SCA, ExposeMaccHDUKeys)
     EXPECT_NEAR(result->HDU().GetDoubleValueForKey("NG"),   3.0,  1e-9);
     EXPECT_NEAR(result->HDU().GetDoubleValueForKey("NR"),   2.0,  1e-9);
     EXPECT_NEAR(result->HDU().GetDoubleValueForKey("ND"),   1.0,  1e-9);
-    EXPECT_NEAR(result->HDU().GetDoubleValueForKey("GAIN"), 2.0,  1e-9); // dpuGain default
-    EXPECT_NEAR(result->HDU().GetDoubleValueForKey("RN"),   10.0, 1e-9); // dpuNoise default
+    EXPECT_NEAR(result->HDU().GetDoubleValueForKey("GAIN"), 1.0,  1e-9); // mean pixel gain ("gain": 1.0)
+    EXPECT_NEAR(result->HDU().GetDoubleValueForKey("RN"),   0.0,  1e-9); // mean pixel read noise (pixsim default 0)
     EXPECT_FALSE(result->HDU().Exists("PERSIST"));
 }
 
@@ -512,8 +616,8 @@ TEST(SCA, CombinedPersistenceOneOverFAndBaseNoiseSmokeTest)
     ASSERT_NE(first,  nullptr);
     ASSERT_NE(second, nullptr);
 
-    first->Write("./build/test_expose_macc_combined01.fits");
-    second->Write("./build/test_expose_macc_combined02.fits");
+    writeTestOutput(first,  "test_expose_macc_combined01.fits");
+    writeTestOutput(second, "test_expose_macc_combined02.fits");
 
     EXPECT_EQ(first->Size(3),  2u);
     EXPECT_EQ(second->Size(3), 2u);
@@ -574,7 +678,7 @@ TEST(SCA, FullDetectorMaccExposureCompletesWithinBudget)
     // normal machine-to-machine performance variation.
     EXPECT_LT(seconds, 30.0);
 
-    result->Write("./build/test_expose_macc_full_detector.fits");
+    writeTestOutput(result, "test_expose_macc_full_detector.fits");
 }
 
 TEST(SCA, FullDetectorMaccExposureCorrectSize)
