@@ -292,12 +292,12 @@ TEST(SCA, ExposeMaccReadNoiseNotAccumulated)
     ASSERT_NE(result, nullptr);
     ASSERT_EQ(result->Size(3), nG * nR);
 
-    const auto&  data  = *(result->GetData<uint16_t>());
-    const size_t plane = W * H;
-    const double n     = static_cast<double>(plane);
+    const auto&      data  = *(result->GetData<uint16_t>());
+    constexpr size_t plane = W * H;   // constant expression: usable in the lambda without capture
+    const double     n     = static_cast<double>(plane);
 
     // Mean and population variance of plane a, or of (plane a − plane b) when b >= 0.
-    auto stats = [&data, plane, n](size_t a, long b) -> std::pair<double, double>
+    auto stats = [&data, n](size_t a, long b) -> std::pair<double, double>
     {
         double sum = 0.0, sum2 = 0.0;
         for (size_t p = 0; p < plane; ++p)
