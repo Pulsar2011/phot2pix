@@ -29,6 +29,7 @@ stages:
 - build
 - test
 - deploy
+- secret-detection
 
 .install_packages: &install_packages
   - apt-get update -qq
