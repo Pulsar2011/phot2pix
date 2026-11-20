@@ -90,6 +90,36 @@ test:
   - export DeepSkyROOT=$(pwd)/deepskyproject
   - ctest --output-on-failure --test-dir .
 
+# ─── Wiki: publish wiki/*.md to the GitLab project wiki ──────────────────────
+# The project wiki is a separate repository (<project>.wiki.git). On every push
+# to the default branch that touches wiki/, this job copies wiki/ into it.
+# wiki/ is the source of truth: pages edited in the web interface are
+# overwritten, pages removed from wiki/ are deleted from the wiki.
+# One-time setup:
+#   - create any page in the web interface (the wiki repository only exists
+#     once it has a page);
+#   - add a masked CI/CD variable WIKI_TOKEN: a project access token with the
+#     write_repository scope and the Developer role (CI_JOB_TOKEN cannot push
+#     to the wiki).
+wiki:
+  stage: .post
+  image: alpine:3.20
+  before_script: []        # skip the global before_script (whole toolchain install)
+  needs: []                # independent of build/test
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - wiki/**/*
+  script:
+    - apk add --no-cache git rsync
+    - git clone "https://oauth2:${WIKI_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH}.wiki.git" /tmp/wiki
+    - rsync -a --delete --exclude .git wiki/ /tmp/wiki/
+    - cd /tmp/wiki
+    - git config user.name "wiki-bot"
+    - git config user.email "wiki-bot@${CI_SERVER_HOST}"
+    - git add -A
+    - git diff --cached --quiet || (git commit -m "Sync wiki from ${CI_COMMIT_SHORT_SHA}" && git push origin HEAD)
+
 sast:
   stage: test
 include:
