@@ -73,6 +73,7 @@ deps:
 
 build:
   stage: build
+  before_script: *install_packages
   needs:
     - job: deps
       artifacts: true
@@ -88,6 +89,7 @@ build:
 
 test:
   stage: test
+  before_script: *install_packages
   needs:
     - job: build
       artifacts: true
