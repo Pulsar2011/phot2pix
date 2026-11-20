@@ -1,0 +1,33 @@
+# phot2pix
+
+**From photons to pixels: a statistically faithful simulator of image-sensor readout.**
+
+phot2pix converts a photon flux falling on each pixel of a detector into the digital numbers (ADU) that the detector's electronics would produce. That includes the noise, the reset level, the readout sequence and any onboard processing. It is a C++23 library developed at CPPM (Centre de Physique des Particules de Marseille).
+
+phot2pix does **not** model optics. Its input is the flux on each pixel (in photons/s); the PSF, sky and sources are computed upstream. Its output is FITS images, cubes or slope maps, as the real instrument would deliver them.
+
+---
+
+## Two parts
+
+| Part | Where | Content |
+|---|---|---|
+| **The generic core** | `src/phot2pix/` | Instrument-agnostic: a pixel model, a detector array, a configuration system. Nothing in it knows about a particular instrument. |
+| **Instrument examples** | `src/nisp/` | A complete instrument built on top of the core: the Euclid NISP HAWAII-2RG infrared detectors, with their readout modes, noise sources, persistence and onboard slope fitting. |
+
+An instrument is added by **inheriting** from the core and **composing** its building blocks; the core itself is never modified. The NISP example is the reference for how to do that.
+
+---
+
+## Where to start
+
+- **[Philosophy](Philosophy)**: how phot2pix is organised and why: the four layers, the *reset → integrate → read* pixel model, units, configuration, how to extend the library, and how it is tested.
+- **[NISP example](NISP-example)**: the Euclid/NISP H2RG simulator in detail: readout modes (MACC, UTR, CDS, FLUX, DPU), noise model, persistence, the `nispSimulator` command-line tool and its validation.
+
+For build instructions and dependencies, see the `README.md` at the root of the repository.
+
+---
+
+*Licence: [PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0). Author: William Gillard, CPPM (Aix-Marseille Université / CNRS).*
+
+<!-- This page is generated from wiki/home.md in the phot2pix repository. Edit it there: changes made in the web interface are overwritten on the next push. -->
