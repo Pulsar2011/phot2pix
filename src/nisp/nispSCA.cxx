@@ -321,6 +321,8 @@ namespace nisp
     // One pass over memory: accumulate the charge and, for a read, write the measured
     // value straight into the output layer. A std::slice / std::gslice version would need
     // temporaries for the double → uint16 conversion and run on a single thread.
+    // The readout noise map is in electrons: it is converted with each pixel's gain,
+    // like the read noise in pixel::read().
     void SCA::_accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
                           uint16_t* layer, const std::valarray<double>* oneOverF) const
     {
@@ -340,18 +342,18 @@ namespace nisp
                     for (size_t i = begin; i < end; ++i)
                     {
                         cumul[i] += charge[i];
-                        layer[i]  = toUint16(m_pixels[i].read(cumul[i]) + (*oneOverF)[i]);
+                        layer[i]  = toUint16(m_pixels[i].read(cumul[i]) + (*oneOverF)[i] / m_pixels[i].getGain());   // e- → ADU
                     }
             });
     }
 
-    void SCA::_read(std::valarray<double>& charge) const
+    void SCA::_read(std::valarray<double>& charge, double tStart) const
     {
-        // 1/f noise generated concurrently with the pixel read noise.
+        // Readout noise (1/f, bias voltage, pedestal) generated concurrently with the pixel read noise.
         std::future<std::valarray<double>> oneOverF;
         if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
             oneOverF = std::async(std::launch::async,
-                [this]() { return m_oneOverFNoise.generate(getWidth(), getHeight()); });
+                [this, tStart]() { return m_oneOverFNoise.generate(getWidth(), getHeight(), tStart); });
 
         parallelFor(size(), getThreadCount(),
             [this, &charge](size_t begin, size_t end)
@@ -361,10 +363,18 @@ namespace nisp
             });
 
         if (oneOverF.valid())
-            charge += oneOverF.get();
+        {
+            const std::valarray<double> noiseMap = oneOverF.get();   // W × H, electrons
+            parallelFor(size(), getThreadCount(),
+                [this, &charge, &noiseMap](size_t begin, size_t end)
+                {
+                    for (size_t i = begin; i < end; ++i)
+                        charge[i] += noiseMap[i] / m_pixels[i].getGain();   // e- → ADU
+                });
+        }
     }
 
-    void SCA::_read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+    void SCA::_read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows, double tStart) const
     {
         // The windowed generate() still computes the full channel time series for each
         // overlapping channel (AR(1) correlation from frame start), but only returns
@@ -372,7 +382,7 @@ namespace nisp
         std::future<std::valarray<double>> oneOverF;
         if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
             oneOverF = std::async(std::launch::async,
-                [this, c0, r0, ncols, nrows]() { return m_oneOverFNoise.generate(getWidth(), getHeight(), c0, r0, ncols, nrows); });
+                [this, c0, r0, ncols, nrows, tStart]() { return m_oneOverFNoise.generate(getWidth(), getHeight(), c0, r0, ncols, nrows, tStart); });
 
         const size_t width = getWidth();
         parallelFor(nrows, getThreadCount(),
@@ -385,8 +395,14 @@ namespace nisp
 
         if (oneOverF.valid())
         {
-            const std::valarray<double> noiseMap = oneOverF.get();   // ncols × nrows
-            charge[std::slice(0, noiseMap.size(), 1)] += noiseMap;
+            const std::valarray<double> noiseMap = oneOverF.get();   // ncols × nrows, electrons
+            parallelFor(nrows, getThreadCount(),
+                [this, &charge, &noiseMap, c0, r0, ncols, width](size_t rowBegin, size_t rowEnd)
+                {
+                    for (size_t r = rowBegin; r < rowEnd; ++r)
+                        for (size_t c = 0; c < ncols; ++c)
+                            charge[r * ncols + c] += noiseMap[r * ncols + c] / m_pixels[(r0 + r) * width + c0 + c].getGain();   // e- → ADU
+                });
         }
     }
 
@@ -433,6 +449,9 @@ namespace nisp
         else if (cfg.has("frame_time"))
             frameTime = cfg.getAsDouble("frame_time");
 
+        // The readout noise needs the frame time to place each read in time (pedestal drift).
+        m_oneOverFNoise.setFrameTime(frameTime);
+
         if (cfg.has("exposureMode"))
         {
             const std::string modeName = cfg.get<std::string>("exposureMode");
@@ -457,7 +476,9 @@ namespace nisp
                 persistenceModelling = std::make_shared<persistence::scheduler>(cfg);
         }
 
-        if(cfg.has("oneOverF"))
+        // Readout noise added at each read: per-channel 1/f ("oneOverF"), 1/f common to
+        // every channel ("bias_voltage_noise") and channel offsets ("pedestal_drift").
+        if(cfg.has("oneOverF") || cfg.has("bias_voltage_noise") || cfg.has("pedestal_drift"))
         {
             m_enable_oneOverF |= true;
             m_oneOverFNoise.initialize(cfg);
@@ -491,7 +512,8 @@ namespace nisp
         std::shared_ptr<DSL::FITScube> frame;
 
         _simulate(fullFlux, exposureTime, frame, c0, r0, ncols, nrows);
-        _read(*(frame->GetData<double>()), c0, r0, ncols, nrows);   // single read: read noise + 1/f
+        // Single read: read noise + readout noise, the read being the last frame of the exposure.
+        _read(*(frame->GetData<double>()), c0, r0, ncols, nrows, std::max(0.0, exposureTime - frameTime));
 
         // Register full-frame charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)
@@ -726,9 +748,10 @@ namespace nisp
 
         readN += read1;   // charge at read N = charge at read 1 + charge collected since
 
-        // Each read adds its own, independent read noise (pixel::read) and 1/f noise.
-        _read(read1);
-        _read(readN);
+        // Each read adds its own, independent read noise (pixel::read) and readout noise.
+        // Read 1 is frame 0, read N is frame N−1: it starts cdsTime = (N−1)·t_f after the reset.
+        _read(read1, 0.0);
+        _read(readN, cdsTime);
 
         // CDS = read N − read 1: reset level and kTC cancel, the read noise of both reads remains.
         *(f1->GetData<double>()) -= *(f0->GetData<double>());
@@ -778,7 +801,8 @@ namespace nisp
         double effectiveExposureTime = std::floor(exposureTime/frameTime)*frameTime;
 
         _simulate(flux, effectiveExposureTime, frame);
-        _read(*(frame->GetData<double>()));   // single read: read noise + 1/f
+        // Single read: read noise + readout noise, the read being the last frame of the exposure.
+        _read(*(frame->GetData<double>()), std::max(0.0, effectiveExposureTime - frameTime));
 
         // Register accumulated charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)

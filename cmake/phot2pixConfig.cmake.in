@@ -1,5 +1,12 @@
 @PACKAGE_INIT@
 
+include(CMakeFindDependencyMacro)
+
+# phot2pix::phot2pix links nlohmann_json::nlohmann_json PUBLIC (PixelConfig.h includes
+# <nlohmann/json.hpp>). When phot2pix fetched it at build time, it was installed under the
+# same prefix as phot2pix: search there too.
+find_dependency(nlohmann_json 3.10 PATHS "${PACKAGE_PREFIX_DIR}")
+
 include("${CMAKE_CURRENT_LIST_DIR}/phot2pixTargets.cmake")
 
 check_required_components(phot2pix)

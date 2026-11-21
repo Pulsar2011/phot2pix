@@ -21,7 +21,7 @@
 |---|---|
 | `nispPixel.h/.cxx` | `nisp::pixel`: the H2RG pixel. `nisp::Ramp`: the DPU slope estimator (group co-adding, Kubik slope, Fowler, CDS) |
 | `nispSCA.h/.cxx` | `nisp::SCA`: the detector and its readout modes. `nisp::macc`: MACC parameters. `nisp::persistence`: the persistence model (`model`, `pixelArray`, `scheduler`) |
-| `nispOneOverFNoise.h/.cxx` | `nisp::OneOverFNoise`: correlated 1/f noise of the output channels |
+| `nispOneOverFNoise.h/.cxx` | `nisp::OneOverFNoise`: readout noise of the output channels (1/f noise per channel, bias voltage noise common to all channels, pedestal drift) |
 | `../utilities/nispSimulator.cxx` | Command-line tool driven by a JSON file |
 | `../utilities/*.json` | A default configuration with averaged NISP values, and one test configuration per readout mode |
 
@@ -33,7 +33,7 @@ classDiagram
     DetectorSimulator~model~ <|-- pixelArray
     SCA o-- scheduler : persistence
     scheduler o-- pixelArray
-    SCA o-- OneOverFNoise : 1/f noise
+    SCA o-- OneOverFNoise : readout noise
     SCA ..> Ramp : DPU slope
 ```
 
@@ -41,7 +41,7 @@ How the layers map onto the [philosophy](Philosophy):
 
 - **Pixel:** `nisp::pixel` uses the three `pixsim` stages unchanged (reset level, integration, read). NISP-specific pixel physics would go there, by overriding a stage.
 - **Detector:** `nisp::SCA` inherits `DetectorSimulator<nisp::pixel>` **privately**. Its simulation engines produce **charge only** (`resetLevel() + integrate()`), never a complete read.
-- **Instrument:** `nisp::SCA` sequences the reads of each readout mode, adds the read noise (through `pixel::read()`) and the 1/f noise at each read, and runs the DPU processing. Its only public simulation entry point is `expose()`.
+- **Instrument:** `nisp::SCA` sequences the reads of each readout mode, adds the read noise (through `pixel::read()`) and the readout noise of the output channels at each read, and runs the DPU processing. Its only public simulation entry point is `expose()`.
 
 ---
 
@@ -114,7 +114,7 @@ The last relation is the CDS: the reset level *R* and its kTC noise cancel. Thes
 
 Pixel *i* sits at column *x* and row *y*, with i = y·W + x (W × H = 2048 × 2048). Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}`$. Pixels remain independent, except through two terms that the SCA adds on top of the pixel model:
 
-- the **1/f noise** $`\mathcal{N}`$, shared by all the pixels of one output channel and added at each read;
+- the **readout noise** $`\mathcal{R}`$, in electrons, added at each read: the 1/f noise of each output channel, the bias voltage noise shared by all channels and the pedestal drift of each channel;
 - the **persistence** *P*, which depends on the previous exposures and is added to the charge.
 
 A quantiser then converts each value to `uint16`:
@@ -148,10 +148,25 @@ $`R_i`$ is drawn at the first step only; the later steps are run with `baseline 
 #### MACC and UTR: one layer of the output cube
 
 ```math
-Y_i[\ell] = \mathcal{Q}\Big( Q_i[m_\ell] + \frac{\sigma_{\mathrm{RN},i}}{g_i}\,\varepsilon_{i,\ell} + \mathcal{N}_{c(i)}\big[(n_\ell - 1)\,L_c + u_i\big] \Big)
+Y_i[\ell] = \mathcal{Q}\Big( Q_i[m_\ell] + \frac{\sigma_{\mathrm{RN},i}}{g_i}\,\varepsilon_{i,\ell} + \frac{\mathcal{R}_i[n_\ell]}{g_i} \Big)
 ```
 
 where $`m_\ell`$ is the step that ends at frame $`n_\ell`$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
+
+#### Readout noise
+
+The readout noise of pixel *i* (column *x*, row *y*, channel *c*) in frame *n* is the sum of three components, in electrons:
+
+```math
+\mathcal{R}_i[n] =
+\underbrace{\mathcal{N}_{c}\big[(n - 1)\,L_c + u_i\big]}_{\texttt{oneOverF}}
++ \underbrace{\mathcal{C}\big[(n - 1)\,L + v_i\big]}_{\texttt{bias\_voltage\_noise}}
++ \underbrace{f\big(t_0 + t_{n,y}\big) + \sigma_P\,\varepsilon_{c,n}}_{\texttt{pedestal\_drift}},
+\qquad
+t_{n,y} = \Big(n - 1 + \frac{y + \frac12}{H}\Big)\,t_f
+```
+
+$`t_{n,y}`$ is the time since the reset at which row *y* of frame *n* is read. Every component is off by default.
 
 #### 1/f noise of channel *c*
 
@@ -177,7 +192,21 @@ z_{c,p}[-1] = 0
 \sum_p \frac{\sigma_p^2}{1 - \rho_p^2} = 1
 ```
 
-The corner frequencies ν_p are in cycles per sample and log-spaced (ν_0 = ν_min when n_p = 1). *A* is `amplitude` and *a* is `slope`. The normalisation gives a stationary variance A², and together the poles approximate a spectrum ∝ 1/ν^a. Every frame, read or dropped, consumes L_c consecutive samples, so t = (n_ℓ − 1)·L_c + u_i is the time at which the amplifier reads pixel *i* in read ℓ.
+The corner frequencies ν_p are in cycles per sample and log-spaced (ν_0 = ν_min when n_p = 1). *A* is `amplitude` and *a* is `slope`. The normalisation gives a stationary variance A², and together the poles approximate a spectrum ∝ 1/ν^a. Every frame, read or dropped, consumes L_c consecutive samples, so t = (n_ℓ − 1)·L_c + u_i is the time at which the amplifier reads pixel *i* in read ℓ. The AR(1) processes of different channels are driven by independent draws, so channels are uncorrelated.
+
+#### Bias voltage noise
+
+$`\mathcal{C}`$ is one series built like $`\mathcal{N}_c`$ (amplitude and slope of `bias_voltage_noise`), but **shared by every channel**. The channels are read in parallel, so it is indexed by the pixel clock within a row, $`v_i = y\,w + o_c + (x - x_c)`$, with w = `colPerChannel`, L = H·w, and $`o_c`$ = 4 for the left edge channel of a 2040-wide frame (its 4 reference columns were read first), 0 otherwise. In every channel, the pixel read at the same instant gets the same value: this is the horizontal banding across the full width that the left/right reference columns measure.
+
+#### Pedestal drift
+
+Each channel is offset by the same amount over all its pixels: a mean drift *f*, common to all channels and evaluated at the read time of each row, plus $`\sigma_P\,\varepsilon_{c,n}`$, one independent draw per channel and per frame (read or dropped). The top/bottom reference rows of a channel measure it.
+
+```math
+f(t) = \sum_k a_k\,t^k + \sum_j A_j\,e^{-t/\tau_j} + \sum_m B_m \sin\!\Big(\frac{2\pi t}{P_m} + \varphi_m\Big)
+```
+
+$`t_0`$ places the exposure in time (for example after a power-on or a mode change). A constant offset belongs to the `baseline` map instead: it is drawn at the reset and cancels in every difference, whereas the pedestal drift changes from one read to the next.
 
 #### Persistence
 
@@ -191,11 +220,11 @@ Exposures are simulated back to back, so $`\Delta_j[m]`$ counts only simulated s
 
 #### FLUX and CDS
 
-Both modes read the array once or twice. Each read draws a new 1/f realisation that starts from a zero state ($`\mathcal{N}`$ and $`\mathcal{N}'`$ below, with t = u_i).
+Both modes read the array once or twice. Each read draws a new readout-noise realisation whose AR(1) processes start from a zero state ($`\mathcal{R}`$ and $`\mathcal{R}'`$ below, with t = u_i and v_i). The pedestal drift is evaluated at the frame of the read: the last frame for FLUX, frames 1 and N for CDS.
 
 ```math
-\text{FLUX:}\qquad Y_i = \mathcal{Q}_{so}\Big( M_i\big(R_i + I_i(T') + P_i[1]\big) + \mathcal{N}_{c(i)}[u_i] \Big),
-\qquad T' = \lfloor T/t_f \rfloor\, t_f
+\text{FLUX:}\qquad Y_i = \mathcal{Q}_{so}\Big( M_i\big(R_i + I_i(T') + P_i[1]\big) + \frac{\mathcal{R}_i[N]}{g_i} \Big),
+\qquad T' = \lfloor T/t_f \rfloor\, t_f = N\,t_f
 ```
 
 ```math
@@ -203,9 +232,11 @@ Both modes read the array once or twice. Each read draws a new 1/f realisation t
 \begin{aligned}
 Q_i^{(1)} &= R_i + I_i(t_f) + P_i[1], \qquad
 Q_i^{(N)} = Q_i^{(1)} + I_i\big((N-1)\,t_f\big) + P_i[2], \qquad N = \lfloor T/t_f \rfloor\\[4pt]
-Y_i &= \mathcal{Q}_{so}\Big( \big[M_i(Q_i^{(N)}) + \mathcal{N}'_{c(i)}[u_i]\big] - \big[M_i(Q_i^{(1)}) + \mathcal{N}_{c(i)}[u_i]\big] \Big)
+Y_i &= \mathcal{Q}_{so}\Big( \Big[M_i(Q_i^{(N)}) + \frac{\mathcal{R}'_i[N]}{g_i}\Big] - \Big[M_i(Q_i^{(1)}) + \frac{\mathcal{R}_i[1]}{g_i}\Big] \Big)
 \end{aligned}
 ```
+
+In CDS, the pedestal drift leaves $`f(t_0 + t_{N,y}) - f(t_0 + t_{1,y})`$.
 
 $`M_i`$ is the read of §3.1 with the parameters of pixel *i*. Each call draws a new ε. The windowed single read `expose(flux, t, c0, r0, nc, nr)` uses the FLUX expression on the window, with *T* not rounded to whole frames.
 
@@ -281,9 +312,9 @@ flowchart TD
 flowchart TD
     START["expose(flux, macc) or expose(flux, T)"] --> MODE{"exposureMode"}
 
-    MODE -->|"FLUX"| FL["one charge step over $$T'$$, + persistence<br/>one read: $$M_i(Q_i) + \mathcal{N}_{c(i)}$$<br/>output $$\mathcal{Q}_{so}$$, $$W \times H$$"]
+    MODE -->|"FLUX"| FL["one charge step over $$T'$$, + persistence<br/>one read: $$M_i(Q_i) + \mathcal{R}_i/g_i$$<br/>output $$\mathcal{Q}_{so}$$, $$W \times H$$"]
     MODE -->|"CDS"| CD["charge at read 1, then at read N, + persistence<br/>two independent reads, difference<br/>output $$\mathcal{Q}_{so}$$, $$W \times H$$"]
-    MODE -->|"MACC, UTR, DPU"| INIT["$$\mathrm{cumul}_i = 0$$ in ADU<br/>open the 1/f stream: one AR(1) state per channel<br/>allocate the uint16 cube $$W \times H \times n_g n_r$$"]
+    MODE -->|"MACC, UTR, DPU"| INIT["$$\mathrm{cumul}_i = 0$$ in ADU<br/>open the readout-noise stream: AR(1) states per channel and for the bias voltage<br/>allocate the uint16 cube $$W \times H \times n_g n_r$$"]
 
     INIT --> STEP
 
@@ -291,19 +322,19 @@ flowchart TD
         direction TB
         subgraph PAR ["Concurrent tasks"]
             direction LR
-            A1["1/f noise<br/>stream.next(), one task per channel<br/>$$\mathcal{N}_c[t]$$"]
+            A1["readout noise<br/>stream.next(), one task per channel + one for the bias voltage<br/>$$\mathcal{R}_i[n_\ell]$$"]
             A2["pixel charge<br/>DetectorSimulator::simulate<br/>$$R_i\ (\text{first step only}) + I_i(t_f)$$<br/>pixel ranges split over threads"]
             A3["persistence scheduler<br/>$$P_i[m]$$ over the past exposures $$j$$<br/>other half of the threads"]
         end
         SUM["$$\mathrm{frame}_i = \mathrm{charge}_i + P_i[m]$$"]
-        ACC["_accumulate, threaded<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$<br/>$$Y_i[\ell] = \mathcal{Q}\big(M_i(\mathrm{cumul}_i) + \mathcal{N}_{c(i)}\big)$$"]
+        ACC["_accumulate, threaded<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$<br/>$$Y_i[\ell] = \mathcal{Q}\big(M_i(\mathrm{cumul}_i) + \mathcal{R}_i/g_i\big)$$"]
         PAR --> SUM --> ACC
     end
 
     ACC --> LASTR{"last read<br/>of the group?"}
     LASTR -->|"no"| STEP
     LASTR -->|"yes"| LASTG{"last group?"}
-    LASTG -->|"no"| DROP["dropped frames, if $$n_d \ge 1$$<br/>one charge step of $$n_d\,t_f$$, + persistence<br/>skip $$n_d$$ chunks of the 1/f stream<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$, no layer written"]
+    LASTG -->|"no"| DROP["dropped frames, if $$n_d \ge 1$$<br/>one charge step of $$n_d\,t_f$$, + persistence<br/>skip $$n_d$$ chunks of the readout-noise stream<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$, no layer written"]
     DROP --> STEP
     LASTG -->|"yes"| REG["store the charge map $$E_i = \eta_i\,\phi_i\,T$$<br/>in the persistence history"]
 
@@ -315,8 +346,8 @@ flowchart TD
 
 Two invariants hold throughout the loop:
 
-- `cumul` contains **charge only**: R_i, the integrated signal and dark, and the persistence. The read noise and the 1/f noise are added to the layer that is written and never fed back, so read noise does not accumulate along the ramp.
-- Pixels are independent within a step, so the charge pass needs no synchronisation. The only coupling between pixels is the 1/f stream, generated per channel. The only coupling in time, apart from `cumul`, is the persistence history.
+- `cumul` contains **charge only**: R_i, the integrated signal and dark, and the persistence. The read noise and the readout noise are added to the layer that is written and never fed back, so read noise does not accumulate along the ramp.
+- Pixels are independent within a step, so the charge pass needs no synchronisation. The only coupling between pixels is the readout-noise stream, generated per channel (plus the bias voltage series shared by all channels). The only coupling in time, apart from `cumul`, is the persistence history.
 
 ---
 
@@ -333,10 +364,28 @@ A `nisp::SCA` is configured with one `PixelConfig`, typically a JSON file.
 | `offset` (or `dpu_offset`) | ADU added before conversion to `uint16` | 0 |
 | `scale` (or `dpu_scale`) | Factor applied before conversion to `uint16` | 1 |
 | `dpu_gain`, `dpu_noise` | Gain (e⁻/ADU) and read noise (e⁻) assumed by the DPU slope estimator, written as `GAIN` and `RN` in the header | Mean pixel gain and read noise |
-| `oneOverF` | 1/f noise: a number (amplitude), or `{"amplitude", "slope", "nChannels", "colPerChannel", "nPoles"}` | Off |
+| `oneOverF` | 1/f noise of each channel (e⁻): a number (amplitude), or `{"amplitude", "slope", "nChannels", "colPerChannel", "nPoles"}` | Off |
+| `bias_voltage_noise` | 1/f noise common to all channels (e⁻): a number (amplitude), or `{"amplitude", "slope", "nPoles"}` | Off |
+| `pedestal_drift` | Channel offsets (e⁻): a number (σ of the white noise, no drift), or `{"sigma", "t0", "drift": {"poly", "exp", "sin"}}` (see below) | Off |
 | `persistence` | Trap list `[{"f": …, "t": …}, …]`, or `{"traps": [...], "dT": seconds}` | Off |
 
 `dpu_gain` and `dpu_noise` exist to simulate a DPU whose calibration differs from the real detector. Without them, the DPU uses the detector's own mean values.
+
+The readout-noise amplitudes are in electrons and converted to ADU with the gain of each pixel, like the read noise. The pedestal drift equation f(t) (§3.2) is the sum of every term given, with *t* in seconds since the reset plus `t0`:
+
+```json
+"pedestal_drift": {
+    "sigma": 4.0,
+    "t0":    0.0,
+    "drift": {
+        "poly": [0.0, 0.05],
+        "exp":  [{"amplitude": 20.0, "tau": 30.0}],
+        "sin":  [{"amplitude": 2.0, "period": 300.0, "phase": 0.0}]
+    }
+}
+```
+
+`poly` holds [a₀, a₁, …]; `exp` and `sin` take one object or an array of them, `phase` is in radians. Unknown keys are rejected.
 
 Example, averaged NISP values (Euclid Collaboration 2025, arXiv:2507.11326), from `src/utilities/nispSimulator_default.json`:
 
@@ -393,9 +442,9 @@ read  : R  R ··· R  │  · · · · │ R  R ··· R   │  · · · · │
 1. One array `cumul` holds the **charge** of every pixel, in ADU.
 2. For each frame that is read:
    - `cumul += resetLevel() + integrate()` on the first frame, `cumul += integrate()` afterwards;
-   - then the layer is written as `uint16( pixel.read(cumul) + 1/f )`.
-3. For dropped frames: `cumul += integrate()` over nd frames; nothing is read or stored.
-4. Read noise and 1/f noise are added to the layer **only**, never to `cumul`. Every read has RN², and two consecutive reads differ by 2·RN², as on the real detector.
+   - then the layer is written as `uint16( pixel.read(cumul) + readout noise / gain )`.
+3. For dropped frames: `cumul += integrate()` over nd frames; nothing is read or stored, but the readout-noise stream advances by nd frames.
+4. Read noise and readout noise are added to the layer **only**, never to `cumul`. Every read has RN², and two consecutive reads differ by 2·RN², as on the real detector.
 
 The output cube is allocated once at its final size. Each ramp step (accumulate, read, convert) is a single threaded pass over memory.
 
@@ -409,7 +458,7 @@ f1 = read( charge at read N )            charge = charge at read 1 + (N−1) fra
 CDS = f1 − f0
 ```
 
-The reset level and kTC noise cancel. The read noise and 1/f noise of the **two** reads remain (variance 2·RN²). The result goes through `offset`/`scale`, so negative values (noise on dark pixels) survive when an offset is set.
+The reset level and kTC noise cancel. The read noise and readout noise of the **two** reads remain (variance 2·RN²), as does the change of the pedestal drift between them. The result goes through `offset`/`scale`, so negative values (noise on dark pixels) survive when an offset is set.
 
 ### FLUX
 
@@ -448,7 +497,9 @@ To convert to a flux: flux [e⁻/s] = slope × gain / ((nr+nd)·t_frame).
 | Shot noise (signal, dark) | `pixsim::integrate()` | Gaussian approximation of Poisson; accumulates |
 | Reset (kTC) noise, baseline | `pixsim::resetLevel()` | Drawn once per ramp, at the first frame |
 | Read noise | `pixsim::read()` | Independent at each read |
-| 1/f noise | `nisp::OneOverFNoise` | Per output channel, independent at each read, continuous in time over a ramp |
+| 1/f noise | `nisp::OneOverFNoise` | Per output channel, independent between channels, continuous in time over a ramp |
+| Bias voltage noise | `nisp::OneOverFNoise` | 1/f series common to all channels, at the same pixel clock |
+| Pedestal drift | `nisp::OneOverFNoise` | Offset per channel and per frame: drift equation + white noise |
 | Persistence | `nisp::persistence` | Charge released by traps filled during previous exposures |
 | Digitisation | `nisp::SCA` | Rounding and clamping to `uint16`; `offset`/`scale` are applied in CDS, FLUX and DPU, not to MACC/UTR layers |
 
@@ -459,6 +510,16 @@ The H2RG is read through parallel output amplifiers, each covering a vertical st
 The noise is generated per channel as a sum of `nPoles` AR(1) processes with log-spaced corner frequencies. Together they approximate a power spectrum A²/f^slope without any FFT. Channels are generated in parallel.
 
 Within a ramp, a single continuous stream is used: each read, and each dropped frame, consumes the next chunk of the same process, so the amplifier noise is correlated in time as on the real detector. A 2040-wide science frame (reference pixels removed) is recognised automatically.
+
+### Bias voltage noise, pedestal drift and reference pixels
+
+The 4-pixel border of reference pixels has no photodiode (set their `QE` and `dark` to 0 with a FITS map), but it is read through the same channels as the active pixels. A reference-pixel correction can therefore only remove the readout noise the two share:
+
+- **`pedestal_drift`**: one offset per channel and per frame. The top and bottom reference rows of a channel measure it.
+- **`bias_voltage_noise`**: the same 1/f series in every channel at the same pixel clock, so horizontal bands across the full width. The left and right reference columns measure it row by row.
+- **`oneOverF`**: independent in each channel. Only its slow part is seen by the reference rows; the rest stays in the data, as on the real detector.
+
+If `oneOverF` was fitted as the total 1/f noise of a channel, split it: oneOverF² = total² − bias_voltage_noise².
 
 ### Persistence
 
@@ -513,7 +574,10 @@ Ready-made configurations:
 - Every MACC read carries RN² and read-to-read differences carry 2·RN² (read noise does not accumulate).
 - A CDS carries 2·RN² while the reset level and kTC noise cancel.
 - 1/f noise produces column-correlated banding.
+- The readout noise is converted to ADU with the pixel gain; the bias voltage noise is identical in every channel; a pedestal drift survives in CDS.
 - Persistence raises the signal of the next exposure.
+
+`src/test/gTest_nispOneOverFNoise.cxx` checks the readout-noise components on their own: configuration parsing and errors, bias voltage noise shared by all channels (including the pixel-clock offset of a 2040-wide frame), one pedestal offset per channel and per frame with RMS σ, and the drift equation evaluated at the read time of each row, in windows and along a stream.
 
 `src/test/gTest_nispPixel.cxx` checks the pixel stages and the `Ramp` estimator.
 
@@ -523,7 +587,7 @@ Ready-made configurations:
 
 - With MACC parameters, the UTR mode produces the same output as MACC, and the MACC output always writes `MODE = MACC`.
 - The gain convention inside `Ramp::getSlope()` has only been validated at gain 1.
-- The 1/f amplitude is documented in electrons but added in ADU.
+- The readout-noise model reads every channel in the same direction and has no row or frame overhead.
 - The charge stored for persistence after a MACC ramp uses the last integration interval instead of the total exposure.
 - Saturation is applied at `uint16` conversion only; there is no full-well model on the accumulated charge yet.
 - The version keyword is `PHOT2PIX` in MACC output and `POT2PIX` elsewhere.

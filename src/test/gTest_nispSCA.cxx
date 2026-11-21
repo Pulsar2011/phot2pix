@@ -589,6 +589,75 @@ TEST(SCA, OneOverFNoiseHDUAndPersistenceIndependentFlags)
     EXPECT_FALSE(result->HDU().Exists("PERSIST"));
 }
 
+// ── Readout noise: units, bias voltage noise, pedestal drift ─────────────────
+
+TEST(SCA, ReadoutNoiseIsConvertedToAduWithPixelGain)
+{
+    // Constant pedestal of 400 e- (drift = a0 only), gain 4 e-/ADU, every other
+    // effect off: each read is 400 / 4 = 100 ADU.
+    const size_t W = 128, H = 8;
+    PixelConfig cfg{
+        {"gain", 4.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 0.0},
+        {"KTCnoise", 0.0}, {"baseline", 0.0}
+    };
+    nlohmann::json ped;
+    ped["drift"]["poly"] = nlohmann::json::array({400.0});
+    cfg.set("pedestal_drift", ped);
+
+    nisp::SCA sca(W, H);
+    sca.initialize(cfg);
+
+    auto result = sca.expose(makeUniformFlux(W, H, 0.0), nisp::macc{2, 1, 0});
+    for (auto v : *(result->GetData<uint16_t>()))
+        ASSERT_EQ(v, 100u);
+}
+
+TEST(SCA, BiasVoltageNoiseIsIdenticalInEveryChannel)
+{
+    // Bias voltage noise only (baseline 1000 ADU keeps the reads away from 0): pixel s
+    // of a row reads the same value in every channel, unlike the per-channel 1/f noise.
+    const size_t W = 128, H = 32;   // 2 channels of 64 columns
+    PixelConfig cfg{
+        {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 0.0},
+        {"KTCnoise", 0.0}, {"baseline", 1000.0}, {"bias_voltage_noise", 15.0}
+    };
+    nisp::SCA sca(W, H);
+    sca.initialize(cfg);
+
+    auto result = sca.expose(makeUniformFlux(W, H, 0.0), nisp::macc{2, 1, 0});
+    const auto& data = *(result->GetData<uint16_t>());
+
+    EXPECT_GT(populationVariance(data), 1.0);   // the noise is there
+    for (size_t layer = 0; layer < 2; ++layer)
+        for (size_t y = 0; y < H; ++y)
+            for (size_t s = 0; s < 64; ++s)
+                ASSERT_EQ(data[layer * W * H + y * W + s], data[layer * W * H + y * W + 64 + s])
+                    << "layer " << layer << ", row " << y << ", column " << s;
+}
+
+TEST(SCA, PedestalDriftSurvivesInCds)
+{
+    // Linear drift f(t) = 3 t e-, gain 1, frame time 1 s, CDS over 10 s: read 1 is
+    // frame 0 and read N is frame 9. Each row is read at the same point of both frames,
+    // so CDS = f(9 + u) − f(u) = 27 ADU for every pixel.
+    const size_t W = 128, H = 8;
+    PixelConfig cfg{
+        {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 0.0},
+        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"frame_time", 1.0},
+        {"exposureMode", std::string("CDS")}
+    };
+    nlohmann::json ped;
+    ped["drift"]["poly"] = nlohmann::json::array({0.0, 3.0});
+    cfg.set("pedestal_drift", ped);
+
+    nisp::SCA sca(W, H);
+    sca.initialize(cfg);
+
+    auto result = sca.expose(makeUniformFlux(W, H, 0.0), 10.0);
+    for (auto v : *(result->GetData<uint16_t>()))
+        ASSERT_EQ(v, 27u);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  (e) Combined smoke test — persistence + 1/f + base noise together
 // ═══════════════════════════════════════════════════════════════════════════════

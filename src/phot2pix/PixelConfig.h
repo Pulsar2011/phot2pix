@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <variant>
 #include <stdexcept>
@@ -28,7 +29,8 @@ namespace phot2pix
      * @class PixelConfig
      * @brief Typed key-value configuration bag, JSON-compatible.
      *
-     * Stores parameters as std::variant<bool, int{8..64}_t, uint{8..64}_t, size_t, float, double, std::string>.
+     * Stores parameters as std::variant<bool, int{8..64}_t, uint{8..64}_t, size_t, float, double, std::string, json>
+     * (size_t only where it differs from uint64_t, see Value).
      * Child-class configs simply call set() for their own keys before
      * passing the config up to the parent constructor.
      *
@@ -40,7 +42,12 @@ namespace phot2pix
     class PixelConfig
     {
     public:
-        using Value = std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t, size_t, float, double, std::string, json>;
+        // size_t is listed only when it is a type of its own. On macOS it is (unsigned long, while
+        // uint64_t is unsigned long long); on 64-bit Linux both are unsigned long, and a variant
+        // holding the same type twice rejects assignment, get<T>() and holds_alternative<T>() for it.
+        using Value = std::conditional_t<std::is_same_v<size_t, uint64_t>,
+            std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t,         float, double, std::string, json>,
+            std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t, size_t, float, double, std::string, json>>;
 
         PixelConfig() = default;
 

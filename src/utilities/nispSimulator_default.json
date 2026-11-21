@@ -28,5 +28,17 @@
         "nChannels"     : 0,
         "colPerChannel" : 64,
         "nPoles"        : 16
+    },
+
+    "bias_voltage_noise" : {
+        "amplitude"     : 0.0,
+        "slope"         : 1.0,
+        "nPoles"        : 16
+    },
+
+    "pedestal_drift" : {
+        "sigma"         : 0.0,
+        "t0"            : 0.0,
+        "drift"         : { "poly": [] }
     }
 }

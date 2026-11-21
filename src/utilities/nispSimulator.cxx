@@ -185,7 +185,7 @@ int main(int argc, char **argv)
         {
             for(const char* key : {"gain", "dark", "readNoise", "QE", "KTCnoise", "baseline"})
                 std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
-            for(const char* key : {"frame_time", "fr_time", "offset", "dpu_offset", "scale", "dpu_scale", "oneOverF", "persistence"})
+            for(const char* key : {"frame_time", "fr_time", "offset", "dpu_offset", "scale", "dpu_scale", "oneOverF", "bias_voltage_noise", "pedestal_drift", "persistence"})
                 if(cfg.has(key))
                     std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
             std::cout << kDebugTag << "SCA setup      : " << tSetup << " s" << std::endl;

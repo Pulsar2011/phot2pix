@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numbers>
 #include <valarray>
 #include <vector>
 
@@ -381,4 +382,301 @@ TEST(OneOverFNoise, WindowNotAlignedToChannelZeroStillWorks)
     const auto series = extractChannelSeries(out, 64, 500, 0, 64);
 
     expectRmsWithinBand(rms(series), 10.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Frame time
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(OneOverFNoise, SetFrameTimeRejectsNonPositive)
+{
+    OneOverFNoise n;
+    EXPECT_DOUBLE_EQ(n.getFrameTime(), 1.45408);   // NISP default
+    EXPECT_THROW(n.setFrameTime(0.0),  std::invalid_argument);
+    EXPECT_THROW(n.setFrameTime(-1.0), std::invalid_argument);
+    n.setFrameTime(2.0);
+    EXPECT_DOUBLE_EQ(n.getFrameTime(), 2.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  bias_voltage_noise: 1/f noise common to every channel
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(OneOverFNoise, InitializeBiasVoltageNoiseScalarAndObject)
+{
+    OneOverFNoise n;
+    PixelConfig scalar;
+    scalar.set("bias_voltage_noise", 3.0);
+    n.initialize(scalar);
+
+    EXPECT_TRUE(n.isEnabled());                 // enabled on its own, without "oneOverF"
+    EXPECT_DOUBLE_EQ(n.getAmplitude(),        0.0);
+    EXPECT_DOUBLE_EQ(n.getBiasVoltageNoise(), 3.0);
+    EXPECT_DOUBLE_EQ(n.getBiasSlope(),        1.0);
+    EXPECT_EQ(n.getBiasNPoles(),              16u);
+
+    nlohmann::json obj;
+    obj["amplitude"] = 2.0;
+    obj["slope"]     = 1.5;
+    obj["nPoles"]    = 8;
+    PixelConfig object;
+    object.set("bias_voltage_noise", obj);
+    n.initialize(object);
+
+    EXPECT_DOUBLE_EQ(n.getBiasVoltageNoise(), 2.0);
+    EXPECT_DOUBLE_EQ(n.getBiasSlope(),        1.5);
+    EXPECT_EQ(n.getBiasNPoles(),              8u);
+}
+
+TEST(OneOverFNoise, InvalidBiasVoltageNoiseThrows)
+{
+    auto initWith = [](const PixelConfig& cfg) { OneOverFNoise n; n.initialize(cfg); };
+
+    PixelConfig negative;
+    negative.set("bias_voltage_noise", -1.0);
+    EXPECT_THROW(initWith(negative), std::invalid_argument);
+
+    nlohmann::json typo;
+    typo["amplitud"] = 2.0;
+    PixelConfig unknownKey;
+    unknownKey.set("bias_voltage_noise", typo);
+    EXPECT_THROW(initWith(unknownKey), std::invalid_argument);
+
+    nlohmann::json zeroPoles;
+    zeroPoles["amplitude"] = 2.0;
+    zeroPoles["nPoles"]    = 0;
+    PixelConfig badPoles;
+    badPoles.set("bias_voltage_noise", zeroPoles);
+    EXPECT_THROW(initWith(badPoles), std::invalid_argument);
+}
+
+TEST(OneOverFNoise, BiasVoltageNoiseIsCommonToAllChannels)
+{
+    // Bias voltage noise only: every channel carries the same series, so sample s
+    // of a row is identical in every channel (uniform layout, time offset 0).
+    OneOverFNoise n;
+    PixelConfig cfg;
+    cfg.set("bias_voltage_noise", 10.0);
+    n.initialize(cfg);
+
+    const size_t W = 256, H = 800;   // 4 channels of 64 columns
+    const auto out = n.generate(W, H);
+
+    const auto ch0 = extractChannelSeries(out, W, H, 0, 64);
+    for (size_t c = 1; c < 4; ++c)
+    {
+        const auto chc = extractChannelSeries(out, W, H, c * 64, 64);
+        for (size_t i = 0; i < ch0.size(); ++i)
+            ASSERT_DOUBLE_EQ(chc[i], ch0[i]) << "channel " << c << ", sample " << i;
+    }
+
+    expectRmsWithinBand(rms(ch0), 10.0);
+}
+
+TEST(OneOverFNoise, BiasVoltageNoiseFollowsPixelClockInReferenceLayout)
+{
+    // 2040-wide frame: channel 0 lost its 4 reference columns, which were read first,
+    // so its column s is pixel-clock sample s + 4. Channel 1 starts at column 60 and
+    // channel 31 at column 1980, both at sample 0.
+    OneOverFNoise n;
+    PixelConfig cfg;
+    cfg.set("bias_voltage_noise", 10.0);
+    n.initialize(cfg);
+
+    const size_t W = 2040, H = 4;
+    const auto out = n.generate(W, H);
+
+    for (size_t y = 0; y < H; ++y)
+        for (size_t s = 0; s < 60; ++s)
+        {
+            ASSERT_DOUBLE_EQ(out[y * W + s],        out[y * W + 60 + s + 4]) << "row " << y << ", column " << s;
+            ASSERT_DOUBLE_EQ(out[y * W + 1980 + s], out[y * W + 60 + s])     << "row " << y << ", column " << s;
+        }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  pedestal_drift: channel offsets, mean f(t) + noise per channel and per frame
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(OneOverFNoise, InitializePedestalDriftScalarIsWhiteNoiseOnly)
+{
+    OneOverFNoise n;
+    PixelConfig cfg;
+    cfg.set("pedestal_drift", 4.0);
+    n.initialize(cfg);
+
+    EXPECT_TRUE(n.isEnabled());
+    EXPECT_DOUBLE_EQ(n.getPedestalSigma(), 4.0);
+    EXPECT_FALSE(n.hasPedestalDrift());
+    EXPECT_DOUBLE_EQ(n.pedestalMean(10.0), 0.0);
+}
+
+TEST(OneOverFNoise, PedestalDriftEquationSumsEveryTerm)
+{
+    nlohmann::json expTerm;
+    expTerm["amplitude"] = 20.0;
+    expTerm["tau"]       = 30.0;
+
+    nlohmann::json sinTerm;               // a single object is accepted as well as an array
+    sinTerm["amplitude"] = 2.0;
+    sinTerm["period"]    = 300.0;
+    sinTerm["phase"]     = 0.25;
+
+    nlohmann::json ped;
+    ped["sigma"]         = 1.5;
+    ped["t0"]            = 100.0;
+    ped["drift"]["poly"] = nlohmann::json::array({1.0, 0.5, 0.01});   // 1 + 0.5 t + 0.01 t²
+    ped["drift"]["exp"]  = nlohmann::json::array({expTerm});
+    ped["drift"]["sin"]  = sinTerm;
+
+    OneOverFNoise n;
+    PixelConfig cfg;
+    cfg.set("pedestal_drift", ped);
+    n.initialize(cfg);
+
+    EXPECT_DOUBLE_EQ(n.getPedestalSigma(), 1.5);
+    EXPECT_DOUBLE_EQ(n.getPedestalT0(),    100.0);
+    EXPECT_TRUE(n.hasPedestalDrift());
+
+    const double t  = 7.0;
+    const double tt = 100.0 + t;          // t0 + time since reset
+    const double expected = 1.0 + 0.5 * tt + 0.01 * tt * tt
+                          + 20.0 * std::exp(-tt / 30.0)
+                          + 2.0 * std::sin(2.0 * std::numbers::pi * tt / 300.0 + 0.25);
+    EXPECT_NEAR(n.pedestalMean(t), expected, 1e-9);
+}
+
+TEST(OneOverFNoise, InvalidPedestalDriftThrows)
+{
+    auto initWith = [](const nlohmann::json& ped)
+    {
+        OneOverFNoise n;
+        PixelConfig cfg;
+        cfg.set("pedestal_drift", ped);
+        n.initialize(cfg);
+    };
+
+    nlohmann::json negativeSigma;
+    negativeSigma["sigma"] = -1.0;
+    EXPECT_THROW(initWith(negativeSigma), std::invalid_argument);
+
+    nlohmann::json typo;
+    typo["sigma"] = 1.0;
+    typo["drfit"] = nlohmann::json::object();
+    EXPECT_THROW(initWith(typo), std::invalid_argument);
+
+    nlohmann::json polyNotArray;
+    polyNotArray["drift"]["poly"] = 3.0;
+    EXPECT_THROW(initWith(polyNotArray), std::invalid_argument);
+
+    nlohmann::json zeroTau;
+    zeroTau["amplitude"] = 1.0;
+    zeroTau["tau"]       = 0.0;
+    nlohmann::json badTau;
+    badTau["drift"]["exp"] = zeroTau;
+    EXPECT_THROW(initWith(badTau), std::invalid_argument);
+
+    nlohmann::json sinNoPeriod;
+    sinNoPeriod["amplitude"] = 1.0;
+    nlohmann::json noPeriod;
+    noPeriod["drift"]["sin"] = sinNoPeriod;
+    EXPECT_THROW(initWith(noPeriod), std::invalid_argument);
+}
+
+TEST(OneOverFNoise, PedestalNoiseIsOneOffsetPerChannelPerFrame)
+{
+    // Pedestal noise only: within a frame every pixel of a channel carries the same
+    // offset; offsets are independent between channels and frames, with RMS sigma.
+    OneOverFNoise n;
+    PixelConfig cfg;
+    cfg.set("pedestal_drift", 4.0);
+    n.initialize(cfg);
+
+    const size_t W = 2048, H = 2, nCh = 32, nFrames = 100;
+    std::vector<double> offsets, ch0, ch1;
+    for (size_t frame = 0; frame < nFrames; ++frame)
+    {
+        const auto out = n.generate(W, H);
+        for (size_t ch = 0; ch < nCh; ++ch)
+        {
+            const double v = out[ch * 64];
+            for (size_t y = 0; y < H; ++y)
+                for (size_t s = 0; s < 64; ++s)
+                    ASSERT_DOUBLE_EQ(out[y * W + ch * 64 + s], v) << "frame " << frame << ", channel " << ch;
+            offsets.push_back(v);
+        }
+        ch0.push_back(out[0]);
+        ch1.push_back(out[64]);
+    }
+
+    // 3200 draws: the RMS is known to ~1.3 % and the mean to σ/√3200 ≈ 0.07,
+    // so these bands are > 5σ margins.
+    EXPECT_NEAR(rms(offsets),  4.0, 0.4);
+    EXPECT_NEAR(mean(offsets), 0.0, 0.4);
+    // 100 frames: σ(r) ≈ 0.1 for independent channels.
+    EXPECT_LT(std::abs(crossCorr(ch0, ch1)), 0.4);
+}
+
+TEST(OneOverFNoise, PedestalDriftEvaluatedAtEachRowReadTime)
+{
+    // f(t) = 2 t, t0 = 1 s, frame time 1 s, H = 4: row y of the frame read from
+    // tStart = 3 s is read at 3 + (y + 0.5)/4 s, so its offset is 2·(1 + 3 + (y + 0.5)/4).
+    nlohmann::json ped;
+    ped["t0"]            = 1.0;
+    ped["drift"]["poly"] = nlohmann::json::array({0.0, 2.0});
+
+    OneOverFNoise n;
+    n.setFrameTime(1.0);
+    PixelConfig cfg;
+    cfg.set("pedestal_drift", ped);
+    n.initialize(cfg);
+
+    const size_t W = 128, H = 4;
+    const auto out = n.generate(W, H, 3.0);
+    for (size_t y = 0; y < H; ++y)
+    {
+        const double expected = 2.0 * (1.0 + 3.0 + (static_cast<double>(y) + 0.5) / 4.0);
+        for (size_t x = 0; x < W; ++x)
+            ASSERT_NEAR(out[y * W + x], expected, 1e-12) << "row " << y << ", column " << x;
+    }
+}
+
+TEST(OneOverFNoise, WindowedPedestalDriftUsesDetectorRows)
+{
+    // f(t) = t, frame time 1 s. A window on rows 2–3 of an 8-row detector: those
+    // rows are read at 2.5/8 s and 3.5/8 s into the frame.
+    nlohmann::json ped;
+    ped["drift"]["poly"] = nlohmann::json::array({0.0, 1.0});
+
+    OneOverFNoise n;
+    n.setFrameTime(1.0);
+    PixelConfig cfg;
+    cfg.set("pedestal_drift", ped);
+    n.initialize(cfg);
+
+    const auto out = n.generate(128, 8, /*c0=*/64, /*r0=*/2, /*ncols=*/32, /*nrows=*/2, /*tStart=*/0.0);
+    for (size_t r = 0; r < 2; ++r)
+        for (size_t c = 0; c < 32; ++c)
+            ASSERT_NEAR(out[r * 32 + c], (2.0 + static_cast<double>(r) + 0.5) / 8.0, 1e-12);
+}
+
+TEST(OneOverFNoise, StreamCountsFramesForPedestalDrift)
+{
+    // f(t) = t, frame time 2 s, H = 1: frame k of the stream is read at (k + 0.5)·2 s.
+    nlohmann::json ped;
+    ped["drift"]["poly"] = nlohmann::json::array({0.0, 1.0});
+
+    OneOverFNoise n;
+    n.setFrameTime(2.0);
+    PixelConfig cfg;
+    cfg.set("pedestal_drift", ped);
+    n.initialize(cfg);
+
+    auto stream = n.beginStream(64, 1);
+    for (size_t k = 0; k < 5; ++k)
+    {
+        const auto out = stream.next();
+        for (size_t x = 0; x < 64; ++x)
+            ASSERT_NEAR(out[x], (static_cast<double>(k) + 0.5) * 2.0, 1e-12) << "frame " << k;
+    }
 }

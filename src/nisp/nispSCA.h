@@ -286,17 +286,21 @@ namespace nisp
                           size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg = phot2pix::PixelConfig());
 
         // Read a full-frame charge map in place (ADU): every pixel adds its own read
-        // noise (pixel::read), then one independent 1/f noise realisation when enabled.
-        void _read(std::valarray<double>& charge) const;
+        // noise (pixel::read), then one independent readout-noise realisation when
+        // enabled (1/f, bias voltage noise, pedestal drift; generated in electrons and
+        // divided by each pixel's gain). tStart is the time since the reset at which
+        // this frame's read starts (s), used by the pedestal drift.
+        void _read(std::valarray<double>& charge, double tStart = 0.0) const;
 
         // Same for a window: the first ncols × nrows values of charge (row-major) are the
         // detector region [c0, c0+ncols) × [r0, r0+nrows).
-        void _read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows) const;
+        void _read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows, double tStart = 0.0) const;
 
         // Ramp step: cumul += charge (charge only). When layer is not null this is also a
-        // read, written as layer[i] = uint16(pixel_i.read(cumul[i]) + oneOverF[i]): the
-        // read noise and 1/f noise go to that layer only, never into cumul.
-        // oneOverF may be null (1/f noise disabled). Threaded over getThreadCount().
+        // read, written as layer[i] = uint16(pixel_i.read(cumul[i]) + oneOverF[i] / gain_i):
+        // the read noise and readout noise go to that layer only, never into cumul.
+        // oneOverF is the readout-noise map in electrons, from OneOverFNoise::Stream; it
+        // may be null (readout noise disabled). Threaded over getThreadCount().
         void _accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
                          uint16_t* layer, const std::valarray<double>* oneOverF) const;
 
