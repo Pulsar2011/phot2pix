@@ -45,7 +45,282 @@ How the layers map onto the [philosophy](Philosophy):
 
 ---
 
-## 3. Configuration
+## 3. The model in equations
+
+This section writes down what the code computes. Every ε is an independent draw from a standard normal N(0, 1): draws are independent between pixels, between stages and between reads.
+
+### 3.1 One pixel
+
+| Symbol | Meaning | Unit | Config key |
+|---|---|---|---|
+| $`\phi`$ | Incident flux | ph s⁻¹ | input array |
+| $`\eta`$ | Quantum efficiency | — | `QE` |
+| $`D`$ | Dark current | e⁻ s⁻¹ | `dark` |
+| $`g`$ | Gain | e⁻ ADU⁻¹ | `gain` |
+| $`B`$ | Baseline | ADU | `baseline` |
+| $`\sigma_{\mathrm{kTC}}`$ | Reset (kTC) noise | e⁻ | `KTCnoise` |
+| $`\sigma_{\mathrm{RN}}`$ | Read noise | e⁻ | `readNoise` |
+| $`t_f`$ | Frame time | s | `frame_time` |
+
+**The three stages** (`phot2pix::pixsim`, used unchanged by `nisp::pixel`). Every stage returns ADU:
+
+```math
+\begin{aligned}
+\text{reset:}\quad & R = B + \frac{\sigma_{\mathrm{kTC}}}{g}\,\varepsilon_R && \texttt{resetLevel()}\\[6pt]
+\text{integration over } \Delta t\text{:}\quad & I(\Delta t) = \frac{S + \sqrt{S}\,\varepsilon_I}{g}, \qquad S = (\eta\,\phi + D)\,\Delta t && \texttt{integrate}(\phi, \Delta t)\\[6pt]
+\text{read of a charge } Q\text{:}\quad & M(Q) = Q + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_M && \texttt{read}(Q)
+\end{aligned}
+```
+
+*S* is the mean number of electrons collected. Its shot noise √S is the Gaussian approximation of Poisson, and I(Δt) = 0 when S = 0.
+
+**A single read** (`pixelresponse()`, the FLUX mode) chains the three stages:
+
+```math
+y = M\big(R + I(T)\big) = B + \frac{S + \sqrt{S}\,\varepsilon_I + \sigma_{\mathrm{kTC}}\,\varepsilon_R + \sigma_{\mathrm{RN}}\,\varepsilon_M}{g},
+\qquad
+\langle y\rangle = B + \frac{S}{g},
+\qquad
+\mathrm{Var}(y) = \frac{S + \sigma_{\mathrm{kTC}}^2 + \sigma_{\mathrm{RN}}^2}{g^2}
+```
+
+**A ramp** reads the pixel once per frame without resetting it. With $`S_f = (\eta\,\phi + D)\,t_f`$ the mean charge collected in one frame, the charge after frame *n* and the value of read *n* are
+
+```math
+Q_1 = R + I_1, \qquad Q_n = Q_{n-1} + I_n, \qquad y_n = M(Q_n) = Q_n + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_n
+```
+
+where each $`I_n`$ is an independent draw of $`I(t_f)`$. The charge carries the memory of the ramp and the read noise does not. The statistics of the ramp follow:
+
+```math
+\langle y_n\rangle = B + n\,\frac{S_f}{g},
+\qquad
+\mathrm{Cov}(y_m, y_n) = \frac{\sigma_{\mathrm{kTC}}^2 + \min(m,n)\,S_f + \delta_{mn}\,\sigma_{\mathrm{RN}}^2}{g^2}
+```
+
+so that
+
+```math
+\mathrm{Var}(y_n) = \frac{\sigma_{\mathrm{kTC}}^2 + n\,S_f + \sigma_{\mathrm{RN}}^2}{g^2},
+\qquad
+\mathrm{Var}(y_{n+1} - y_n) = \frac{S_f + 2\,\sigma_{\mathrm{RN}}^2}{g^2},
+\qquad
+\mathrm{Var}(y_N - y_1) = \frac{(N-1)\,S_f + 2\,\sigma_{\mathrm{RN}}^2}{g^2}
+```
+
+The last relation is the CDS: the reset level *R* and its kTC noise cancel. These relations are the ones checked by `gTest_nispSCA.cxx` ([§8](#8-validation)).
+
+### 3.2 The full array
+
+Pixel *i* sits at column *x* and row *y*, with i = y·W + x (W × H = 2048 × 2048). Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}`$. Pixels remain independent, except through two terms that the SCA adds on top of the pixel model:
+
+- the **1/f noise** $`\mathcal{N}`$, shared by all the pixels of one output channel and added at each read;
+- the **persistence** *P*, which depends on the previous exposures and is added to the charge.
+
+A quantiser then converts each value to `uint16`:
+
+```math
+\mathcal{Q}(x) = \min\big(65535,\ \max(0,\ \lfloor x + \tfrac{1}{2} \rfloor)\big),
+\qquad
+\mathcal{Q}_{so}(x) = \mathcal{Q}(s\,x + o)
+```
+
+with *s* = `scale` and *o* = `offset`.
+
+#### Steps of a ramp
+
+An exposure is simulated as a sequence of charge steps m = 1 … M of duration Δt_m. In MACC(n_g, n_r, n_d), each group contributes n_r steps of t_f, each followed by a read. Between two groups there is one step of n_d·t_f with no read (the dropped frames). Read *r* of group *g* is stored in layer ℓ = g·n_r + r and taken at frame
+
+```math
+n_\ell = g\,(n_r + n_d) + r + 1
+```
+
+that is, n_ℓ·t_f after the reset. UTR is MACC(N, 1, 0).
+
+#### Charge
+
+```math
+Q_i[m] = R_i + \sum_{m'=1}^{m} \Big( I_i(\Delta t_{m'}) + P_i[m'] \Big)
+```
+
+$`R_i`$ is drawn at the first step only; the later steps are run with `baseline = "off"`.
+
+#### MACC and UTR: one layer of the output cube
+
+```math
+Y_i[\ell] = \mathcal{Q}\Big( Q_i[m_\ell] + \frac{\sigma_{\mathrm{RN},i}}{g_i}\,\varepsilon_{i,\ell} + \mathcal{N}_{c(i)}\big[(n_\ell - 1)\,L_c + u_i\big] \Big)
+```
+
+where $`m_\ell`$ is the step that ends at frame $`n_\ell`$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
+
+#### 1/f noise of channel *c*
+
+Channel *c* covers the columns $`[x_c,\ x_c + w_c)`$: w_c = 64 by default, and 60 for the two edge channels of a 2040-wide frame. During one frame its amplifier reads L_c = H·w_c pixels, row by row, and pixel *i* is sample $`u_i = y\,w_c + (x - x_c)`$. The noise of the channel is a single time series over the whole ramp, a sum of n_p AR(1) processes:
+
+```math
+\mathcal{N}_c[t] = A \sum_{p=0}^{n_p-1} z_{c,p}[t],
+\qquad
+z_{c,p}[t] = \rho_p\, z_{c,p}[t-1] + \sigma_p\,\varepsilon_{c,p,t},
+\qquad
+z_{c,p}[-1] = 0
+```
+
+```math
+\nu_p = \nu_{\min} \left(\frac{0.5}{\nu_{\min}}\right)^{p/(n_p-1)},
+\quad
+\nu_{\min} = \frac{1}{2 L_c},
+\qquad
+\rho_p = e^{-2\pi\nu_p},
+\qquad
+\sigma_p \propto \nu_p^{(1-a)/2},
+\quad
+\sum_p \frac{\sigma_p^2}{1 - \rho_p^2} = 1
+```
+
+The corner frequencies ν_p are in cycles per sample and log-spaced (ν_0 = ν_min when n_p = 1). *A* is `amplitude` and *a* is `slope`. The normalisation gives a stationary variance A², and together the poles approximate a spectrum ∝ 1/ν^a. Every frame, read or dropped, consumes L_c consecutive samples, so t = (n_ℓ − 1)·L_c + u_i is the time at which the amplifier reads pixel *i* in read ℓ.
+
+#### Persistence
+
+Each past exposure *j* leaves a stored charge $`E_i^{(j)} = \eta_i\,\phi_i^{(j)}\,T^{(j)}`$, in electrons, where $`T^{(j)}`$ is the integration time registered for that exposure (see [§9](#9-known-limitations) for MACC). For traps $`(f_k, \tau_k)`$, and with $`\Delta_j[m]`$ the time between the end of exposure *j* and the start of step *m*:
+
+```math
+P_i[m] = \sum_j E_i^{(j)} \sum_k f_k\, e^{-\Delta_j[m]/\tau_k}\, \tau_k \left( e^{\Delta t_m/\tau_k} - 1 \right)
+```
+
+Exposures are simulated back to back, so $`\Delta_j[m]`$ counts only simulated steps. $`P_i[m]`$ is added to the charge as it is, without conversion by $`g_i`$.
+
+#### FLUX and CDS
+
+Both modes read the array once or twice. Each read draws a new 1/f realisation that starts from a zero state ($`\mathcal{N}`$ and $`\mathcal{N}'`$ below, with t = u_i).
+
+```math
+\text{FLUX:}\qquad Y_i = \mathcal{Q}_{so}\Big( M_i\big(R_i + I_i(T') + P_i[1]\big) + \mathcal{N}_{c(i)}[u_i] \Big),
+\qquad T' = \lfloor T/t_f \rfloor\, t_f
+```
+
+```math
+\text{CDS:}\qquad
+\begin{aligned}
+Q_i^{(1)} &= R_i + I_i(t_f) + P_i[1], \qquad
+Q_i^{(N)} = Q_i^{(1)} + I_i\big((N-1)\,t_f\big) + P_i[2], \qquad N = \lfloor T/t_f \rfloor\\[4pt]
+Y_i &= \mathcal{Q}_{so}\Big( \big[M_i(Q_i^{(N)}) + \mathcal{N}'_{c(i)}[u_i]\big] - \big[M_i(Q_i^{(1)}) + \mathcal{N}_{c(i)}[u_i]\big] \Big)
+\end{aligned}
+```
+
+$`M_i`$ is the read of §3.1 with the parameters of pixel *i*. Each call draws a new ε. The windowed single read `expose(flux, t, c0, r0, nc, nr)` uses the FLUX expression on the window, with *T* not rounded to whole frames.
+
+#### DPU: the onboard slope, per pixel
+
+The DPU starts from the MACC layers $`Y_i[\ell]`$. Let $`n_{\mathrm{good}}`$ be the number of groups before the first group that contains a saturated read (65535). Then
+
+```math
+G_g = \frac{1}{n_r} \sum_{r=0}^{n_r-1} Y_i[g\,n_r + r],
+\qquad
+d_g = G_{g+1} - G_g,
+\qquad
+g < n_{\mathrm{good}}
+```
+
+and the Kubik et al. (2016) estimator, with $`\sigma_{\mathrm{DPU}}`$ = `dpu_noise` and $`g_{\mathrm{DPU}}`$ = `dpu_gain`, is
+
+```math
+\alpha = \frac{1 - n_r^2}{3\,n_r\,(n_r + n_d)},
+\qquad
+\sigma = \frac{\sigma_{\mathrm{DPU}}}{g_{\mathrm{DPU}}},
+\qquad
+\beta = \frac{2\,\sigma^2}{g_{\mathrm{DPU}}\, n_r\,(1 + \alpha)},
+\qquad
+\gamma = \frac{2}{g_{\mathrm{DPU}}\,(1 + \alpha)}
+```
+
+```math
+\bar F = \frac{1}{n_{\mathrm{good}} - 1} \sum_{g=0}^{n_{\mathrm{good}}-2} (d_g + \beta)^2,
+\qquad
+\hat F = \frac{\sqrt{1 + \gamma^2 \bar F} - 1}{\gamma} - \beta,
+\qquad
+Y_i =
+\begin{cases}
+\mathcal{Q}_{so}(\hat F) & n_{\mathrm{good}} \ge 2\\
+65535 & \text{otherwise}
+\end{cases}
+```
+
+$`\hat F`$ is in ADU per group interval. For an unsaturated pixel, $`\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i`$.
+
+### 3.3 The algorithm
+
+#### One pixel
+
+The pixel provides three stages and holds no state. The charge *Q* is kept by the caller, the SCA readout loop, which decides when to reset, how long each step lasts and when to read.
+
+<!-- Diagram labels use Mermaid's KaTeX syntax $$…$$ (Mermaid ≥ 10.9). -->
+
+```mermaid
+flowchart TD
+    RST["① resetLevel()<br/>$$R = B + \frac{\sigma_{\mathrm{kTC}}}{g}\,\varepsilon_R$$"]
+    INT["② integrate(φ, Δt)<br/>$$S = (\eta\,\phi + D)\,\Delta t$$<br/>$$I = \frac{S + \sqrt{S}\,\varepsilon_I}{g}$$"]
+    Q[("charge $$Q$$ in ADU<br/>kept by the SCA")]
+    RD["③ read(Q)<br/>$$y = Q + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_M$$"]
+    Y["read value $$y_n$$"]
+
+    RST -->|"first step only: $$Q = R$$"| Q
+    INT -->|"every step: $$Q \leftarrow Q + I$$"| Q
+    Q -->|"read steps only"| RD
+    RD --> Y
+    RD -.->|"$$Q$$ is not changed by the read"| Q
+```
+
+- **Single read (FLUX):** reset, one step of *T*, one read.
+- **Ramp (MACC, UTR):** reset, then one step per frame, with a read after each frame that is not dropped. The n_d dropped frames are a single step of n_d·t_f.
+
+#### Full array: one exposure
+
+`nisp::SCA::expose()` dispatches on `exposureMode`. In the ramp loop, each step runs three tasks concurrently and then makes one threaded pass over memory.
+
+```mermaid
+flowchart TD
+    START["expose(flux, macc) or expose(flux, T)"] --> MODE{"exposureMode"}
+
+    MODE -->|"FLUX"| FL["one charge step over $$T'$$, + persistence<br/>one read: $$M_i(Q_i) + \mathcal{N}_{c(i)}$$<br/>output $$\mathcal{Q}_{so}$$, $$W \times H$$"]
+    MODE -->|"CDS"| CD["charge at read 1, then at read N, + persistence<br/>two independent reads, difference<br/>output $$\mathcal{Q}_{so}$$, $$W \times H$$"]
+    MODE -->|"MACC, UTR, DPU"| INIT["$$\mathrm{cumul}_i = 0$$ in ADU<br/>open the 1/f stream: one AR(1) state per channel<br/>allocate the uint16 cube $$W \times H \times n_g n_r$$"]
+
+    INIT --> STEP
+
+    subgraph STEP ["Read step: frame n_ℓ, Δt = t_f"]
+        direction TB
+        subgraph PAR ["Concurrent tasks"]
+            direction LR
+            A1["1/f noise<br/>stream.next(), one task per channel<br/>$$\mathcal{N}_c[t]$$"]
+            A2["pixel charge<br/>DetectorSimulator::simulate<br/>$$R_i\ (\text{first step only}) + I_i(t_f)$$<br/>pixel ranges split over threads"]
+            A3["persistence scheduler<br/>$$P_i[m]$$ over the past exposures $$j$$<br/>other half of the threads"]
+        end
+        SUM["$$\mathrm{frame}_i = \mathrm{charge}_i + P_i[m]$$"]
+        ACC["_accumulate, threaded<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$<br/>$$Y_i[\ell] = \mathcal{Q}\big(M_i(\mathrm{cumul}_i) + \mathcal{N}_{c(i)}\big)$$"]
+        PAR --> SUM --> ACC
+    end
+
+    ACC --> LASTR{"last read<br/>of the group?"}
+    LASTR -->|"no"| STEP
+    LASTR -->|"yes"| LASTG{"last group?"}
+    LASTG -->|"no"| DROP["dropped frames, if $$n_d \ge 1$$<br/>one charge step of $$n_d\,t_f$$, + persistence<br/>skip $$n_d$$ chunks of the 1/f stream<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$, no layer written"]
+    DROP --> STEP
+    LASTG -->|"yes"| REG["store the charge map $$E_i = \eta_i\,\phi_i\,T$$<br/>in the persistence history"]
+
+    REG --> DPUQ{"DPU?"}
+    DPUQ -->|"no: MACC, UTR"| CUBE["uint16 cube<br/>$$W \times H \times n_g n_r$$"]
+    DPUQ -->|"yes"| DPU["per pixel, threaded<br/>cut at the first saturated group: $$n_{\mathrm{good}}$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$<br/>output $$\mathcal{Q}_{so}(\hat F)$$"]
+    DPU --> MAP["uint16 slope map<br/>$$W \times H$$"]
+```
+
+Two invariants hold throughout the loop:
+
+- `cumul` contains **charge only**: R_i, the integrated signal and dark, and the persistence. The read noise and the 1/f noise are added to the layer that is written and never fed back, so read noise does not accumulate along the ramp.
+- Pixels are independent within a step, so the charge pass needs no synchronisation. The only coupling between pixels is the 1/f stream, generated per channel. The only coupling in time, apart from `cumul`, is the persistence history.
+
+---
+
+## 4. Configuration
 
 A `nisp::SCA` is configured with one `PixelConfig`, typically a JSON file.
 
@@ -81,7 +356,7 @@ Example, averaged NISP values (Euclid Collaboration 2025, arXiv:2507.11326), fro
 
 ---
 
-## 4. Readout modes
+## 5. Readout modes
 
 ### Entry points
 
@@ -166,7 +441,7 @@ To convert to a flux: flux [e⁻/s] = slope × gain / ((nr+nd)·t_frame).
 
 ---
 
-## 5. Noise and detector effects
+## 6. Noise and detector effects
 
 | Effect | Where | Model |
 |---|---|---|
@@ -175,7 +450,7 @@ To convert to a flux: flux [e⁻/s] = slope × gain / ((nr+nd)·t_frame).
 | Read noise | `pixsim::read()` | Independent at each read |
 | 1/f noise | `nisp::OneOverFNoise` | Per output channel, independent at each read, continuous in time over a ramp |
 | Persistence | `nisp::persistence` | Charge released by traps filled during previous exposures |
-| Digitisation | `nisp::SCA` | Rounding and clamping to `uint16`, after `offset`/`scale` |
+| Digitisation | `nisp::SCA` | Rounding and clamping to `uint16`; `offset`/`scale` are applied in CDS, FLUX and DPU, not to MACC/UTR layers |
 
 ### 1/f noise
 
@@ -197,7 +472,7 @@ The `persistence::scheduler` stores the charge map of every exposure. During eac
 
 ---
 
-## 6. The `nispSimulator` tool
+## 7. The `nispSimulator` tool
 
 `src/utilities/nispSimulator.cxx` simulates one SCA from a JSON configuration (built when the DSTCore library is available; installed in `bin/`).
 
@@ -221,7 +496,7 @@ Ready-made configurations:
 
 ---
 
-## 7. Validation
+## 8. Validation
 
 `src/test/gTest_nispReadoutModes.cxx` checks every readout mode on a full 2048 × 2048 detector, with MACC(4,16,4), 10 ph/s, gain 1, QE 1, and every other effect off. Each frame then adds S = 10 × 1.45408 = 14.5408 ADU, with Poisson variance S. Means and variances are checked over the 4.2 million pixels within 5σ.
 
@@ -244,7 +519,7 @@ Ready-made configurations:
 
 ---
 
-## 8. Known limitations
+## 9. Known limitations
 
 - With MACC parameters, the UTR mode produces the same output as MACC, and the MACC output always writes `MODE = MACC`.
 - The gain convention inside `Ramp::getSlope()` has only been validated at gain 1.

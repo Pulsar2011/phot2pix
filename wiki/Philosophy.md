@@ -168,7 +168,7 @@ A simulator of noise cannot be tested value by value. phot2pix tests are **stati
 - **One effect at a time:** every other effect is switched off (gain 1, QE 1, no read noise, no kTC…) so that the expected mean and variance are known exactly.
 - **Many samples:** means and variances are measured over thousands of draws or millions of pixels and compared with the expectation within **5σ**, plus a small margin for integer rounding.
 - **Each stage on its own, then the composition:** for example, `integrate()` must contain no read noise; a ramp must show RN² on every read and 2·RN² on every read-to-read difference; a CDS must cancel the reset level.
-- **Full scale:** the NISP readout modes are validated on a full 2048 × 2048 detector against analytic expectations; see [NISP example → Validation](NISP-example#7-validation).
+- **Full scale:** the NISP readout modes are validated on a full 2048 × 2048 detector against analytic expectations; see [NISP example → Validation](NISP-example#8-validation).
 
 Tests use GoogleTest and run with `ctest`. Files written by tests for inspection go to `./build/` and are replaced on every run.
 
