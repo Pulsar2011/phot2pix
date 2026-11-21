@@ -6,6 +6,7 @@
 #    cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=<prefix>
 #    cmake --build build -j$(nproc)
 #    cmake --install build
+#    cmake --build build --target doc   (Doxygen HTML → build/doc/html)
 #
 #  Options:
 #    -DCMAKE_BUILD_TYPE=Debug|Release|RelWithDebInfo
@@ -450,6 +451,49 @@ if(BUILD_TESTING)
         # Register tests with CTest (auto-discovers TEST() macros at build time)
         gtest_discover_tests(${_test_name})
     endforeach()
+endif()
+
+# ─── Documentation: Doxygen (target 'doc', not part of 'all') ────────────────
+#  PH2PIX.Doxyfile remains the reference configuration. A small Doxyfile is
+#  generated in the build tree: it @INCLUDEs the reference one and overrides
+#  only what depends on this build (output dir, generated headers, version,
+#  dot location). Doxygen runs from the source root, so the relative paths of
+#  PH2PIX.Doxyfile (EXCLUDE, HTML_EXTRA_STYLESHEET, ...) keep working.
+find_package(Doxygen OPTIONAL_COMPONENTS dot)
+
+if(DOXYGEN_FOUND)
+    if(DOXYGEN_DOT_FOUND)
+        set(_p2p_doc_have_dot YES)
+        cmake_path(GET DOXYGEN_DOT_EXECUTABLE PARENT_PATH _p2p_doc_dot_path)
+    else()
+        set(_p2p_doc_have_dot NO)
+        set(_p2p_doc_dot_path "")
+    endif()
+
+    set(_p2p_doc_dir      "${CMAKE_CURRENT_BINARY_DIR}/doc")
+    set(_p2p_doc_doxyfile "${CMAKE_CURRENT_BINARY_DIR}/PH2PIX.Doxyfile")
+
+    # file(CONFIGURE) only rewrites the file when its content changes.
+    file(CONFIGURE OUTPUT "${_p2p_doc_doxyfile}" @ONLY CONTENT [=[
+@INCLUDE               = "@CMAKE_CURRENT_SOURCE_DIR@/PH2PIX.Doxyfile"
+PROJECT_NUMBER         = "@PHOT2PIX_VERSION_STRING@"
+INPUT                  = "@CMAKE_CURRENT_SOURCE_DIR@/src" \
+                         "@CMAKE_CURRENT_BINARY_DIR@/generated"
+OUTPUT_DIRECTORY       = "@_p2p_doc_dir@"
+HAVE_DOT               = @_p2p_doc_have_dot@
+DOT_PATH               = "@_p2p_doc_dot_path@"
+]=])
+
+    add_custom_target(doc
+        COMMAND Doxygen::doxygen "${_p2p_doc_doxyfile}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        COMMENT "Generating Doxygen documentation in ${_p2p_doc_dir}/html"
+        VERBATIM
+    )
+
+    message(STATUS "${_G}  Doxygen       :${_Z} ${DOXYGEN_EXECUTABLE} (dot: ${_p2p_doc_have_dot}) — target 'doc'")
+else()
+    message(STATUS "${_Y}  Doxygen       : not found — 'doc' target unavailable${_Z}")
 endif()
 
 # ─── Install: library + headers ───────────────────────────────────────────────
