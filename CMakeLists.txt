@@ -190,8 +190,14 @@ find_package(nlohmann_json 3.10 QUIET)
 if(nlohmann_json_FOUND)
     message(STATUS "${_G}  nlohmann/json :${_Z} found via find_package")
 else()
-    message(STATUS "${_Y}  nlohmann/json : not found — fetching via FetchContent${_Z}")
+    message(STATUS "${_Y}  nlohmann/json : not found — fetching via FetchContent, installed with phot2pix${_Z}")
     include(FetchContent)
+    # phot2pix links nlohmann_json PUBLIC (PixelConfig.h includes <nlohmann/json.hpp>), so
+    # install(EXPORT phot2pixTargets) needs nlohmann_json in an export set. Its own install rules
+    # (export set nlohmann_jsonTargets) are off when it is not the top-level project: switch them
+    # on, the headers and CMake package are installed with phot2pix and phot2pixConfig.cmake
+    # finds them again with find_dependency().
+    set(JSON_Install ON CACHE INTERNAL "Install the fetched nlohmann/json with phot2pix")
     FetchContent_Declare(nlohmann_json
         GIT_REPOSITORY https://github.com/nlohmann/json.git
         GIT_TAG        v3.11.3
