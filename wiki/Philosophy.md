@@ -114,6 +114,7 @@ Two rules:
 | Replace the whole single-read model | `pixelresponse()` (virtual) | A completely different detector technology |
 | Add an effect that couples pixels | `DetectorSimulator::_engine()` | Inter-pixel capacitance, crosstalk, column glow |
 | Add configuration keys | `initialize(cfg)`, calling the base first | NISP: `exposureMode`, `frame_time`, `oneOverF`… |
+| Record the inputs in the output header | `setInputCard()` in `initialize()` (`PixelConfig::card(key)` gives a key's value or map file name), then `writeInputCards()` on the output. The base already records the six pixel parameters (`PIXGAIN`, `PIXDARK`, …) | NISP: readout noise, persistence, reference pixels |
 | Add a readout pattern | An instrument class that sequences the stages | NISP: MACC, UTR, CDS, DPU |
 
 ### Example: a pixel hit by cosmic rays
@@ -168,7 +169,7 @@ A simulator of noise cannot be tested value by value. phot2pix tests are **stati
 - **One effect at a time:** every other effect is switched off (gain 1, QE 1, no read noise, no kTC…) so that the expected mean and variance are known exactly.
 - **Many samples:** means and variances are measured over thousands of draws or millions of pixels and compared with the expectation within **5σ**, plus a small margin for integer rounding.
 - **Each stage on its own, then the composition:** for example, `integrate()` must contain no read noise; a ramp must show RN² on every read and 2·RN² on every read-to-read difference; a CDS must cancel the reset level.
-- **Full scale:** the NISP readout modes are validated on a full 2048 × 2048 detector against analytic expectations; see [NISP example → Validation](NISP-example#8-validation).
+- **Full scale:** the NISP readout modes are validated on the 2040 × 2040 active area of the detector against analytic expectations; see [NISP example → Validation](NISP-example#9-validation).
 
 Tests use GoogleTest and run with `ctest`. Files written by tests for inspection go to `./build/` and are replaced on every run.
 

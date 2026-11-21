@@ -173,7 +173,9 @@ std::shared_ptr<DSL::FITScube> patch = det.simulate(windowFlux, 100.0, 100, 200,
 
 **Thread dispatch** is automatic: `simulate()` partitions the pixel range across `std::thread::hardware_concurrency()` workers when the detector is large enough that parallelism pays off. Each thread calls `_engine()` once — virtual dispatch overhead is O(nThreads), not O(nPixels).  `_engine()` is the second customisation point for detector-level physics which allows for the implementation of crosstalk, charge diffusion, persistence, custom readout modes ...
 
-**Initialisation from config**: `initialize(cfg)` understands the standard keys `gain`, `dark`, `readNoise`, `QE`, `KTCnoise`, `baseline`. Each key can be either a scalar (applied uniformly) or a string path to a FITS file containing a per-pixel map, with an optional `<key>.hdu` sibling specifying the HDU.
+**Initialisation from config**: `initialize(cfg)` understands the standard keys `gain`, `dark`, `readNoise`, `QE`, `KTCnoise`, `baseline`. Each key can be either a scalar (applied uniformly) or a FITS image holding a per-pixel map: `"dark": "dark.fits"` (primary HDU), `"dark": {"file": "dark.fits", "hdu": h}`, or `"dark": "dark.fits", "dark.hdu": h`, where `h` is an HDU index (1 = primary) or an EXTNAME. `loadMap(cfg, key)` and `loadImage(cfg, key)` read any other key in the same forms (e.g. a flux map).
+
+**Geometry**: the matrix is a part of a physical detector (`phot2pix::Geometry`, `Geometry.h`). `detectorSize` (`[width, height]`, default: the matrix size) and `detectorOrigin` (`[x0, y0]`, default `[0, 0]`) place it: matrix pixel (x, y) is detector pixel (x0 + x, y0 + y). A FITS map is either matrix-sized (used as is) or detector-sized (the section `[x0, x0+W) × [y0, y0+H)` is used), so a full-detector calibration map can drive the simulation of any part of the detector. `getOrigin()` and `toMatrix(image)` give the placement and apply the same rule to any image (e.g. a flux map). A detector family derives from `Geometry` (overriding `configure()`, `isReference()` and `clone()`) to add its own layout, and passes it to the constructor: `DetectorSimulator<PixelT>(W, H, DOUBLE_IMG, std::make_shared<MyGeometry>())`. `nisp::SCA` does this with `nisp::Geometry` (2048 × 2048 HAWAII-2RG, 4 reference pixels on each side, `refBorder`).
 
 ### `ScenerySequencer` — (planned)
 
@@ -426,10 +428,12 @@ phot2pix/
 │   ├── phot2pix/                  ← generic library (instrument-agnostic)
 │   │   ├── PixelConfig.h          ← typed key-value config bag
 │   │   ├── PixelSimulator.h/.cxx  ← pixsim base class
+│   │   ├── Geometry.h             ← physical detector, matrix placement, map cropping
 │   │   ├── DetectorSimulator.h    ← DetectorSimulator<PixelT> template
 │   │   └── ScenerySequencer.h     ← (planned) multi-exposure time loop
 │   ├── nisp/                      ← Euclid/NISP instrument example
 │   │   ├── nispPixel.h/.cxx       ← nisp::pixel
+│   │   ├── nispGeometry.h         ← nisp::Geometry (H2RG, reference pixels)
 │   │   └── nispSCA.h/.cxx         ← nisp::SCA + persistence model
 │   └── test/                      ← GoogleTest suite
 ├── googletest/                    ← git submodule

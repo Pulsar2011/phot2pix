@@ -14,10 +14,13 @@
 #include <cctype>
 #include <cmath>
 #include <future>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <valarray>
 
 namespace nisp
@@ -104,6 +107,13 @@ namespace nisp
             return pixelresponse(flux, exposureTime, cfg);
         }
 
+        // Charge released during a step that starts timeDelay after the end of the
+        // exposure that filled the traps and lasts exposureTime. Trap k releases
+        // E·f_k·exp(−t/τ_k) per second, t being the time since that exposure, so over
+        // the step [Δ, Δ + T]:
+        //   ∫ f e^(−t/τ) dt = f·τ·e^(−Δ/τ)·(1 − e^(−T/τ))
+        // Consecutive steps add up to the release over their total duration, and the
+        // whole release (T → ∞ from Δ = 0) is f·τ of the stored charge.
         double model::pixelresponse(const double& flux, const double& exposureTime, const phot2pix::PixelConfig& cfg) const
         {
             const double timeDelay = cfg.has("dT") ? cfg.getAsDouble("dT") : dT;
@@ -111,7 +121,7 @@ namespace nisp
             for (const auto& [idx, f] : _factor)
             {
                 const double tau = _decayTime.at(idx);
-                signal += f * std::exp(-timeDelay / tau) * tau * (std::exp(exposureTime / tau) - 1.0);
+                signal += f * tau * std::exp(-timeDelay / tau) * (1.0 - std::exp(-exposureTime / tau));
             }
             return signal * flux;
         }
@@ -135,6 +145,9 @@ namespace nisp
             // Two supported formats:
             //   array:  [{"f": ..., "t": ...}, ...]
             //   object: {"traps": [...], "dT": <seconds, optional>}
+            // "dT" starts the clock of the pixel models, for a standalone pixelArray. Within
+            // the SCA, the scheduler passes its own clock and applies "dT" as the delay
+            // between two exposures (scheduler::insertCharges).
             double initialDT = 0.0;
             if (persistJson.is_object() && persistJson.contains("dT"))
                 initialDT = persistJson.at("dT").get<double>();
@@ -181,6 +194,22 @@ namespace nisp
 
 // ── scheduler ─────────────────────────────────────────────────────────────────
 #pragma region - scheduler
+        scheduler::scheduler(const phot2pix::PixelConfig& cfg)
+            : m_pixelModel(nullptr), m_fluxHistory(), m_cfg(cfg)
+        {
+            if (!cfg.has("persistence"))
+                return;
+
+            const auto& p = cfg.getJson("persistence");
+            if (p.is_object() && p.contains("dT"))
+            {
+                const auto& d = p.at("dT");
+                if (!d.is_number() || !(d.get<double>() >= 0.0))
+                    throw std::invalid_argument("persistence::scheduler: 'dT' must be a number >= 0 (seconds).");
+                m_delay = d.get<double>();
+            }
+        }
+
         void scheduler::insertCharges(const std::shared_ptr<DSL::FITScube>& flux, const double& t0)
         {
             if (!m_pixelModel)
@@ -197,7 +226,13 @@ namespace nisp
                     "scheduler::insertCharges: flux dimensions do not match model.");
             }
 
-            m_fluxHistory.push_back({t0, flux});
+            // The SCA simulates exposures back to back: the time between the end of this
+            // exposure and the start of the next one (dithers, overheads…) is m_delay,
+            // during which every stored exposure releases charge that nobody reads.
+            for (auto& record : m_fluxHistory)
+                record.t0 += m_delay;
+
+            m_fluxHistory.push_back({t0 + m_delay, flux});
         }
 
         void scheduler::removeCharges(const double& t0)
@@ -257,8 +292,10 @@ namespace nisp
 
             for (auto& record : m_fluxHistory)
             {
+                // Same clock as the full-frame overload: the gap dT is part of the elapsed time.
                 phot2pix::PixelConfig cfg;
-                cfg.set("dT", record.t0 + dT);
+                record.t0 += dT;
+                cfg.set("dT", record.t0);
 
                 // Extract the sub-window from the stored full-frame flux.
                 const auto& fullFlux = *(record.flux->GetData<double>());
@@ -296,6 +333,39 @@ namespace nisp
             return static_cast<uint16_t>(x + 0.5);
         }
 
+        // Short text form of a number, for string header values ("0.05", "1e-05").
+        std::string number(double v)
+        {
+            std::ostringstream ss;
+            ss << std::setprecision(6) << v;
+            return ss.str();
+        }
+
+        // FITS section "[x1:x2,y1:y2]" (1-based, inclusive) of [x0, x0+w) × [y0, y0+h).
+        std::string section(size_t x0, size_t y0, size_t w, size_t h)
+        {
+            return "[" + std::to_string(x0 + 1) + ":" + std::to_string(x0 + w) + "," +
+                         std::to_string(y0 + 1) + ":" + std::to_string(y0 + h) + "]";
+        }
+
+        // Median of v: middle value (odd size) or mean of the two middle values (even
+        // size); NaN if v is empty. v is taken by copy since nth_element reorders it.
+        template <typename T>
+        double median(std::valarray<T> v)
+        {
+            const size_t n = v.size();
+            if (n == 0)
+                return std::numeric_limits<double>::quiet_NaN();
+
+            T* first = std::begin(v);
+            T* mid   = first + n / 2;
+            std::nth_element(first, mid, std::end(v));
+
+            if (n % 2)
+                return static_cast<double>(*mid);
+            return 0.5 * (static_cast<double>(*mid) + static_cast<double>(*std::max_element(first, mid)));
+        }
+
         // Run work(begin, end) over [0, n), split into contiguous chunks on nThreads
         // std::threads (so the compiler can vectorise each loop); a single call when the
         // job is too small to be worth threading.
@@ -315,6 +385,69 @@ namespace nisp
                 workers.emplace_back(work, b, std::min(n, b + chunk));
             for (auto& w : workers)
                 w.join();
+        }
+
+        // Call f with the cube's data, as the std::valarray<T>& of the type the cube is
+        // stored in (8- to 64-bit integers, float, double). False if it is none of them.
+        template <typename F>
+        bool withCubeData(DSL::FITScube& cube, F&& f)
+        {
+            if (auto* d = cube.GetData<uint8_t>())  { f(*d); return true; }
+            if (auto* d = cube.GetData<uint16_t>()) { f(*d); return true; }
+            if (auto* d = cube.GetData<uint32_t>()) { f(*d); return true; }
+            if (auto* d = cube.GetData<uint64_t>()) { f(*d); return true; }
+            if (auto* d = cube.GetData<int8_t>())   { f(*d); return true; }
+            if (auto* d = cube.GetData<int16_t>())  { f(*d); return true; }
+            if (auto* d = cube.GetData<int32_t>())  { f(*d); return true; }
+            if (auto* d = cube.GetData<int64_t>())  { f(*d); return true; }
+            if (auto* d = cube.GetData<float>())    { f(*d); return true; }
+            if (auto* d = cube.GetData<double>())   { f(*d); return true; }
+            return false;
+        }
+
+        // v − ref stored in v's type: as is for floating point; for integer types rounded
+        // to the nearest value (not truncated) and clamped to the type's range. The largest
+        // value of an unsigned type (65535 for uint16) marks a saturated read: left unchanged.
+        template <typename T>
+        T subtractReference(T v, double ref)
+        {
+            if constexpr (std::is_floating_point_v<T>)
+                return static_cast<T>(static_cast<double>(v) - ref);
+            else
+            {
+                constexpr T lo = std::numeric_limits<T>::lowest();
+                constexpr T hi = std::numeric_limits<T>::max();
+
+                if constexpr (std::is_unsigned_v<T>)
+                {
+                    if (v == hi)
+                        return v;
+                }
+
+                const double x = std::round(static_cast<double>(v) - ref);
+                if (!(x > static_cast<double>(lo))) return lo;   // also NaN
+                if (x >= static_cast<double>(hi))   return hi;
+                return static_cast<T>(x);
+            }
+        }
+
+        // On / off switch read from cfg: true / false, or "ON" / "OFF" ("TRUE" / "FALSE"
+        // accepted too), in any case. Throws std::invalid_argument for anything else.
+        bool toSwitch(const phot2pix::PixelConfig& cfg, const std::string& key)
+        {
+            try { return cfg.get<bool>(key); }
+            catch (const std::bad_variant_access&) {}
+
+            std::string s;
+            try { s = cfg.get<std::string>(key); }
+            catch (const std::bad_variant_access&) {}
+
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char ch) { return static_cast<char>(std::toupper(ch)); });
+
+            if (s == "ON"  || s == "TRUE")  return true;
+            if (s == "OFF" || s == "FALSE") return false;
+            throw std::invalid_argument("SCA::initialize: '" + key + "' must be true / false or \"ON\" / \"OFF\".");
         }
     }
 
@@ -408,7 +541,13 @@ namespace nisp
 
     void SCA::initialize(const phot2pix::PixelConfig& cfg)
     {
+        // Also configures the geometry (nisp::Geometry: "detectorSize", "detectorOrigin",
+        // "refBorder") before loading the maps, and throws if the matrix does not fit.
         phot2pix::DetectorSimulator<nisp::pixel>::initialize(cfg);
+
+        // Placement of this matrix on the physical detector ((0, 0) by default).
+        const auto [x0, y0] = getOrigin();
+        m_oneOverFNoise.setGeometry(_geometry());
 
         // DPU flux-estimation parameters, written as GAIN / RN in the output header:
         // explicit "dpu_gain" (e-/ADU) / "dpu_noise" (e-) if given, otherwise the mean
@@ -469,6 +608,10 @@ namespace nisp
                                             "' (expected MACC, UTR, CDS, DPU or FLUX).");
         }
 
+        // Reference pixel correction of the DPU mode (Eq. 3, mode ALL): on by default.
+        if (cfg.has("refPixCorr"))
+            m_refPixCorr = toSwitch(cfg, "refPixCorr");
+
         if(cfg.has("persistence"))
         {
             m_enable_persistence |= true;
@@ -483,6 +626,144 @@ namespace nisp
             m_enable_oneOverF |= true;
             m_oneOverFNoise.initialize(cfg);
         }
+
+        // Fail here rather than at the first exposure if the channel layout does not
+        // match the detector (colPerChannel, nChannels).
+        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
+            m_oneOverFNoise.checkGeometry(getWidth(), getHeight());
+
+        // Reference pixels: the physical pixels within refBorder (4) of the detector edge
+        // (nisp::Geometry). A 2048 × 2048 matrix has 4 reference pixels on each side; a
+        // smaller one has those of the part of the detector it covers (at the default
+        // origin (0, 0): 4 columns on the left and 4 rows at the bottom; a 2040 × 2040
+        // one at [4, 4]: none). They have no photodiode: QE = 0. Their dark current
+        // comes from "dark" (value or map) unless "refDark" (e-/s) is given.
+        if (_geometry().refBorder > 0)
+        {
+            const nisp::Geometry& geometry = _geometry();
+            std::optional<double> refDark;
+            if (cfg.has("refDark"))
+                refDark = cfg.getAsDouble("refDark");
+
+            const size_t W = getWidth(), H = getHeight();
+            for (size_t row = 0; row < H; ++row)
+                for (size_t col = 0; col < W; ++col)
+                    if (geometry.isReference(x0 + col, y0 + row))
+                    {
+                        nisp::pixel& px = m_pixels[row * W + col];
+                        px.setQuantumEfficiency(0.0);
+                        if (refDark)
+                            px.setDarkCurrent(*refDark);   // throws if < 0
+                    }
+        }
+
+        _recordInputs(cfg);
+    }
+
+    void SCA::_recordInputs(const phot2pix::PixelConfig& cfg)
+    {
+        // ── Detector geometry and reference pixels ──
+        const nisp::Geometry& geometry = _geometry();
+        setInputCard({"DETSIZE", section(0, 0, geometry.width, geometry.height), "Physical detector size"});
+        setInputCard({"REFBORD", geometry.refBorder, "[pix] Reference pixels on each side of the detector"});
+        if (cfg.has("refDark"))
+            setInputCard({"REFDARK", cfg.getAsDouble("refDark"), "[e-/s] Dark current of the reference pixels"});
+
+        // ── Readout noise: the components that are on ──
+        for (const char* prefix : {"CHANWID", "OOF", "BIAS", "PED"})
+            removeInputCards(prefix);
+
+        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
+        {
+            const OneOverFNoise& n = m_oneOverFNoise;
+            setInputCard({"CHANWID", n.getColPerChannel(), "[pix] Columns per output channel"});
+
+            if (n.getAmplitude() > 0.0)
+            {
+                setInputCard({"OOFAMP",   n.getAmplitude(), "[e-] 1/f noise of each channel: amplitude"});
+                setInputCard({"OOFSLOPE", n.getSlope(),     "1/f noise of each channel: PSD slope"});
+                setInputCard({"OOFPOLES", n.getNPoles(),    "1/f noise of each channel: AR(1) poles"});
+            }
+
+            if (n.getBiasVoltageNoise() > 0.0)
+            {
+                setInputCard({"BIASAMP",  n.getBiasVoltageNoise(), "[e-] Bias voltage noise (all channels): amplitude"});
+                setInputCard({"BIASSLOP", n.getBiasSlope(),        "Bias voltage noise: PSD slope"});
+                setInputCard({"BIASPOLE", n.getBiasNPoles(),       "Bias voltage noise: AR(1) poles"});
+            }
+
+            if (n.getPedestalSigma() > 0.0 || n.hasPedestalDrift())
+            {
+                setInputCard({"PEDSIGMA", n.getPedestalSigma(), "[e-] Pedestal noise per channel and frame"});
+                setInputCard({"PEDT0",    n.getPedestalT0(),    "[s] Time origin of the pedestal drift"});
+
+                if (!n.getDriftPoly().empty())
+                {
+                    std::string poly;
+                    for (double a : n.getDriftPoly())
+                        poly += (poly.empty() ? "" : ", ") + number(a);
+                    setInputCard({"PEDPOLY", poly, "[e-, e-/s, ...] Pedestal drift: sum a_k t^k"});
+                }
+
+                size_t k = 0;
+                for (const auto& e : n.getDriftExp())
+                    setInputCard({"PEDEXP" + std::to_string(++k),
+                                  "A=" + number(e.amplitude) + " tau=" + number(e.tau),
+                                  "[e-, s] Pedestal drift: A exp(-t/tau)"});
+
+                k = 0;
+                for (const auto& s : n.getDriftSin())
+                    setInputCard({"PEDSIN" + std::to_string(++k),
+                                  "B=" + number(s.amplitude) + " P=" + number(s.period) + " phi=" + number(s.phase),
+                                  "[e-, s, rad] Pedestal drift: B sin(2 pi t/P + phi)"});
+            }
+        }
+
+        // ── Persistence: [{"f", "t"}, …] or {"traps": [...], "dT": s} ──
+        if (cfg.has("persistence"))
+        {
+            removeInputCards("PERTR");
+            removeInputCards("PERDT");
+
+            const auto& p     = cfg.getJson("persistence");
+            const auto& traps = (p.is_object() && p.contains("traps")) ? p.at("traps") : p;
+
+            if (p.is_object() && p.contains("dT") && p.at("dT").is_number())
+                setInputCard({"PERDT", p.at("dT").get<double>(), "[s] Persistence: delay between two exposures"});
+
+            size_t k = 0;
+            if (traps.is_array())
+                for (const auto& trap : traps)
+                    if (trap.is_object())
+                        setInputCard({"PERTR" + std::to_string(++k),
+                                      "f=" + number(trap.value("f", 0.0)) + " tau=" + number(trap.value("t", 0.0)),
+                                      "[1/s, s] Persistence trap: release rate, decay time"});
+        }
+    }
+
+    void SCA::_writeHeader(DSL::FITScube& image, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+    {
+        auto& hdu = image.HDU();
+
+        hdu.ValueForKey("OFFSET",  dpuOffset, "[ADU] DPU offset: DN = value x SFACTOR + OFFSET");
+        hdu.ValueForKey("SFACTOR", dpuScale,  "DPU scale factor: DN = value x SFACTOR + OFFSET");
+        hdu.ValueForKey("GAIN",    dpuGain,   "[e-/ADU] Mean gain used by the DPU");
+        hdu.ValueForKey("RN",      dpuNoise,  "[e-] Mean read noise used by the DPU");
+        hdu.ValueForKey("FRTIME",  frameTime, "[s] NISP HAWAII-2RG frame time");
+        hdu.ValueForKey("PHOT2PIX", std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
+                                    +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
+                                    +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
+                                    +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
+
+        // Where this image sits on the physical detector (NOAO DETSEC convention).
+        try
+        {
+            const auto [x0, y0] = getOrigin();
+            hdu.ValueForKey("DETSEC", section(x0 + c0, y0 + r0, ncols, nrows), "Detector section of this image");
+        }
+        catch (const std::invalid_argument&) {}   // matrix larger than the default detector (initialize() not called)
+
+        writeInputCards(image);
     }
 
     std::shared_ptr<DSL::FITScube> SCA::_toUint16(const std::shared_ptr<DSL::FITScube>& doubleFrame) const
@@ -528,7 +809,10 @@ namespace nisp
             persistenceModelling->insertCharges(chargeImg, 0.0);
         }
 
-        return _toUint16(frame);
+        std::shared_ptr<DSL::FITScube> result = _toUint16(frame);
+        result->HDU().ValueForKey("EXPTIME", exposureTime, "[s] Exposure time, reset to read");
+        _writeHeader(*result, c0, r0, ncols, nrows);
+        return result;
     }
 
     std::shared_ptr<DSL::FITScube> SCA::expose(const std::valarray<double>& fullFlux, const nisp::macc& maccParams)
@@ -693,8 +977,8 @@ namespace nisp
         }
 
         std::shared_ptr<DSL::FITScube> result = out;
-        result->HDU().ValueForKey("INTTIME", static_cast<double>(nG*(nF+nD)-nD)*frameTime, "Integration time in seconds");
-        result->HDU().ValueForKey("EXPTIME", exposureTime, "Exposure time in seconds");
+        result->HDU().ValueForKey("INTTIME", static_cast<double>(nG*(nF+nD)-nD)*frameTime, "[s] Integration time, reset to last read");
+        result->HDU().ValueForKey("EXPTIME", exposureTime, "[s] Exposure time");
         result->HDU().ValueForKey("MODE", std::string("MACC"), "Simulation mode");
         result->HDU().ValueForKey("NG", nG, "Number of groups");
         result->HDU().ValueForKey("NR", nF, "Number of reads/group");
@@ -702,17 +986,7 @@ namespace nisp
         if(m_enable_persistence)
             result->HDU().ValueForKey("PERSIST", std::string("ON"), "Persistence modelling enabled");
 
-        result->HDU().ValueForKey("OFFSET", dpuOffset, "DPU offset in ADU");
-        result->HDU().ValueForKey("SFACTOR", dpuScale, "DPU scale factor");
-        result->HDU().ValueForKey("GAIN", dpuGain, "Mean DPU gain");
-        result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
-
-        result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("PHOT2PIX", std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
-                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar,  "phot2pix version");
-        
+        _writeHeader(*result);
 
         return result;
     }
@@ -773,22 +1047,13 @@ namespace nisp
         // DPU scale / offset applied like the FLUX mode, so negative CDS values (noise on
         // dark pixels) survive when an offset is set, instead of being clipped to 0.
         std::shared_ptr<DSL::FITScube> result = _toUint16(f1);
-        result->HDU().ValueForKey("INTTIME", cdsTime, "Integration time in seconds");   // read 1 → read N
-        result->HDU().ValueForKey("EXPTIME", eff_exposureTime, "Exposure time in seconds");
+        result->HDU().ValueForKey("INTTIME", cdsTime, "[s] Integration time, read 1 to read N");
+        result->HDU().ValueForKey("EXPTIME", eff_exposureTime, "[s] Exposure time, reset to read N");
         result->HDU().ValueForKey("MODE", std::string("CDS"), "Simulation mode");
         if(m_enable_persistence)
             result->HDU().ValueForKey("PERSIST", std::string("ON"), "Persistence modelling enabled");
 
-        result->HDU().ValueForKey("OFFSET", dpuOffset, "DPU offset in ADU");
-        result->HDU().ValueForKey("SFACTOR", dpuScale, "DPU scale factor");
-        result->HDU().ValueForKey("GAIN", dpuGain, "Mean DPU gain");
-        result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
-
-        result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX",  std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
-                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
+        _writeHeader(*result);
 
         f1.reset();
         return result;
@@ -816,26 +1081,158 @@ namespace nisp
         }
 
         std::shared_ptr<DSL::FITScube> result = _toUint16(frame);
-        result->HDU().ValueForKey("INTTIME", effectiveExposureTime, "Integration time in seconds");
-        result->HDU().ValueForKey("EXPTIME", effectiveExposureTime, "Exposure time in seconds");
+        result->HDU().ValueForKey("INTTIME", effectiveExposureTime, "[s] Integration time, reset to read");
+        result->HDU().ValueForKey("EXPTIME", effectiveExposureTime, "[s] Exposure time");
         result->HDU().ValueForKey("MODE", std::string("FLUX"), "Simulation mode");
         if(m_enable_persistence)
             result->HDU().ValueForKey("PERSIST", std::string("ON"), "Persistence modelling enabled");
 
-        result->HDU().ValueForKey("OFFSET", dpuOffset, "DPU offset in ADU");
-        result->HDU().ValueForKey("SFACTOR", dpuScale, "DPU scale factor");
-        result->HDU().ValueForKey("GAIN", dpuGain, "Mean DPU gain");
-        result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
-
-        result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX",  std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
-                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
+        _writeHeader(*result);
 
         frame.reset();
         return result;
     }
+
+    std::valarray<double> SCA::getReferencePixelCorrection(const std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode)
+    {
+        if(!ramp)
+            throw std::invalid_argument("SCA::getReferencePixelCorrection: ramp is null.");
+
+        if(mode == refPixCorrection::NONE)
+            return {};
+
+        if(ramp->Size(1) < 2048 || ramp->Size(2) < 2048)
+        {
+            std::cerr << "SCA::getReferencePixelCorrection: warning: reference pixel correction is not applied to subarrays smaller than 2048x2048." << std::endl;
+            return {};
+        }
+
+        const size_t W        = ramp->Size(1);
+        const size_t nPix     = W * ramp->Size(2);
+        const size_t nReads   = (ramp->GetDimension() >= 3) ? ramp->Size(3) : 1;
+        const size_t nThreads = std::thread::hardware_concurrency();
+
+        // c[(y * 32 + ch) * nReads + k]: the reads of one line and channel are contiguous.
+        // Lines 0-3 and 2044-2047 keep 0 (not corrected).
+        std::valarray<double> c(0.0, 2048 * 32 * nReads);
+
+        const bool known = withCubeData(*ramp, [&](const auto& data)
+        {
+            using T = typename std::decay_t<decltype(data)>::value_type;
+
+            // T^(ch), B^(ch) of every read k, at [k * 32 + ch]: median of the 4 top / bottom
+            // reference lines of the channel, without the left / right reference columns
+            // (channels 0 and 31: 60 columns).
+            std::valarray<double> topRef(0.0, 32 * nReads);
+            std::valarray<double> bottomRef(0.0, 32 * nReads);
+
+            parallelFor(32 * nReads, nThreads, [&](size_t begin, size_t end)
+            {
+                for(size_t j = begin; j < end; ++j)
+                {
+                    const size_t k  = j / 32;
+                    const size_t ch = j % 32;
+                    const size_t L0 = k * nPix;   // first pixel of read k
+
+                    size_t size = 64;
+                    size_t x0   = (ch == 0) ? 4 : ch * 64;
+                    if(ch == 0 || ch == 31)
+                        size -= 4;
+
+                    bottomRef[j] = median(std::valarray<T>(data[std::gslice(L0 + x0,            {size, 4}, {1, W})]));
+                    topRef[j]    = median(std::valarray<T>(data[std::gslice(L0 + x0 + 2044 * W, {size, 4}, {1, W})]));
+                }
+            });
+
+            // For every read k and line y in [4, 2044): L_y, R_y, median of the 4 left / right
+            // reference columns over lines y−4 … y+4, then c_y^(ch) of the 32 channels (Eq. 3).
+            parallelFor(2040 * nReads, nThreads, [&](size_t begin, size_t end)
+            {
+                for(size_t j = begin; j < end; ++j)
+                {
+                    const size_t k  = j / 2040;
+                    const size_t y  = 4 + j % 2040;
+                    const size_t L0 = k * nPix;
+
+                    const double leftRef  = median(std::valarray<T>(data[std::gslice(L0        + (y - 4) * W, {4, 9}, {1, W})]));
+                    const double rightRef = median(std::valarray<T>(data[std::gslice(L0 + 2044 + (y - 4) * W, {4, 9}, {1, W})]));
+
+                    for(size_t ch = 0; ch < 32; ++ch)
+                    {
+                        const double top    = topRef[k * 32 + ch];
+                        const double bottom = bottomRef[k * 32 + ch];
+
+                        // mode is a bitmask: each pair of bits picks its own reference,
+                        // so every combination (TOP|LEFT, BOTTOM|RIGHTnLEFT, …) is handled.
+                        double ref = 0.0;
+
+                        switch(mode & refPixCorrection::TOPnBOTTOM)
+                        {
+                            case refPixCorrection::TOP:        ref += top;                        break;
+                            case refPixCorrection::BOTTOM:     ref += bottom;                     break;
+                            case refPixCorrection::TOPnBOTTOM: ref += (top + bottom) / 2.0;       break;
+                            default:                                                              break;
+                        }
+
+                        switch(mode & refPixCorrection::RIGHTnLEFT)
+                        {
+                            case refPixCorrection::LEFT:       ref += leftRef;                    break;
+                            case refPixCorrection::RIGHT:      ref += rightRef;                   break;
+                            case refPixCorrection::RIGHTnLEFT: ref += (rightRef + leftRef) / 2.0; break;
+                            default:                                                              break;
+                        }
+
+                        c[(y * 32 + ch) * nReads + k] = ref;
+                    }
+                }
+            });
+        });
+
+        if(!known)
+            throw std::invalid_argument("SCA::getReferencePixelCorrection: ramp is not an integer or floating point cube.");
+
+        return c;
+    }
+
+    void SCA::referencePixelsCorrection(std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode)
+    {
+        const std::valarray<double> c = getReferencePixelCorrection(ramp, mode);
+        if(c.size() == 0)
+            return;   // NONE, or smaller than 2048 × 2048
+
+        const size_t W        = ramp->Size(1);
+        const size_t nPix     = W * ramp->Size(2);
+        const size_t nReads   = c.size() / (2048 * 32);
+        const size_t nThreads = std::thread::hardware_concurrency();
+
+        withCubeData(*ramp, [&](auto& data)
+        {
+            using T = typename std::decay_t<decltype(data)>::value_type;
+
+            // One task per read k and line y in [4, 2044); the other lines are not corrected.
+            parallelFor(2040 * nReads, nThreads, [&](size_t begin, size_t end)
+            {
+                for(size_t j = begin; j < end; ++j)
+                {
+                    const size_t k    = j / 2040;
+                    const size_t y    = 4 + j % 2040;
+                    T*           line = &data[k * nPix + y * W];
+
+                    for(size_t ch = 0; ch < 32; ++ch)
+                    {
+                        // Unsigned cubes cannot hold v − c (≈ −baseline with ALL): they get
+                        // v − (c_k − c_0), the change of the correction since the first read.
+                        const double* cy  = &c[(y * 32 + ch) * nReads];
+                        const double  ref = std::is_unsigned_v<T> ? cy[k] - cy[0] : cy[k];
+
+                        for(size_t x = ch * 64; x < ch * 64 + 64; ++x)
+                            line[x] = subtractReference(line[x], ref);
+                    }
+                }
+            });
+        });
+    }
+    
 
     std::shared_ptr<DSL::FITScube> SCA::expose_dpu(const std::valarray<double>& flux, const nisp::macc& maccParams)
     {
@@ -846,10 +1243,19 @@ namespace nisp
             throw std::invalid_argument("SCA::expose_dpu: the DPU slope estimator needs at least 2 groups.");
 
         std::shared_ptr<DSL::FITScube> MACC = expose_macc(flux, maccParams);
+
         const std::valarray<uint16_t>* rampData = MACC->GetData<uint16_t>();
         if(!rampData)
             throw std::runtime_error("SCA::expose_dpu: the MACC ramp is not a uint16 cube.");
 
+        // Reference pixel correction (Eq. 3) of every read, refCorr[(y * 32 + ch) * nG·nR + k].
+        // It is subtracted in double below, while each pixel's reads are copied for the fit:
+        // the uint16 ramp is not modified, nothing wraps, and the saturation test sees the
+        // raw reads. Empty when "refPixCorr" is off, or for a matrix smaller than
+        // 2048 × 2048: no correction.
+        const std::valarray<double> refCorr = m_refPixCorr ? getReferencePixelCorrection(MACC) : std::valarray<double>();
+
+        const size_t W    = MACC->Size(1);
         const size_t nPix = MACC->Size(1) * MACC->Size(2);
 
         std::shared_ptr<DSL::FITScube> result = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint16_t>({MACC->Size(1), MACC->Size(2)}));
@@ -864,7 +1270,7 @@ namespace nisp
 
         // One pixel per iteration, pixels split over the threads. Each thread owns two
         // double buffers reused for all its pixels (no allocation per pixel):
-        //   reads  : the pixel's uint16 reads, converted to double for nisp::Ramp
+        //   reads  : the pixel's uint16 reads minus their reference pixel correction, in double
         //   groups : their group averages, filled by Ramp::coadd
         parallelFor(nPix, getThreadCount(), [&](size_t begin, size_t end)
         {
@@ -873,6 +1279,9 @@ namespace nisp
 
             for(size_t i = begin; i < end; ++i)
             {
+                // This pixel's corrections, one per read: line i / W, channel (i % W) / 64.
+                const double* c = (refCorr.size() > 0) ? &refCorr[((i / W) * 32 + (i % W) / 64) * nG * nR] : nullptr;
+
                 // Copy the reads group by group, up to the first saturated group: a
                 // saturated read makes the rest of the ramp unusable, only the groups
                 // before it are fitted.
@@ -884,7 +1293,7 @@ namespace nisp
                     {
                         const uint16_t v = (*rampData)[(g * nR + r) * nPix + i];
                         saturated |= (v >= 65535);
-                        reads[g * nR + r] = static_cast<double>(v);
+                        reads[g * nR + r] = static_cast<double>(v) - (c ? c[g * nR + r] : 0.0);
                     }
                     if(saturated)
                         break;
@@ -910,25 +1319,21 @@ namespace nisp
             }
         });
 
-        result->HDU().ValueForKey("INTTIME", static_cast<double>(maccParams.nGroups*(maccParams.nFrames+maccParams.nDrop) - maccParams.nDrop) * frameTime, "Integration time in seconds");
-        result->HDU().ValueForKey("EXPTIME", static_cast<double>(maccParams.nGroups*(maccParams.nFrames+maccParams.nDrop)) * frameTime, "Exposure time in seconds");
+        // The slope is the signal per group interval, (nr + nd)·t_f; the integrated signal
+        // it stands for spans the (ng − 1) intervals from the first to the last group
+        // (87.2 s for MACC(4,16,4), 549.6 s for MACC(15,16,11)). INTTIME is that span, so
+        // that slope × (ng − 1) / INTTIME is the signal rate in ADU/s.
+        result->HDU().ValueForKey("INTTIME", static_cast<double>((maccParams.nGroups - 1) * (maccParams.nFrames + maccParams.nDrop)) * frameTime, "[s] Integration time, first to last group");
+        result->HDU().ValueForKey("EXPTIME", static_cast<double>(maccParams.nGroups*(maccParams.nFrames+maccParams.nDrop)) * frameTime, "[s] Exposure time");
         result->HDU().ValueForKey("MODE", std::string("DPU"), "Simulation mode");
         result->HDU().ValueForKey("NG", maccParams.nGroups, "Number of groups");
         result->HDU().ValueForKey("NR", maccParams.nFrames, "Number of reads/group");
         result->HDU().ValueForKey("ND", maccParams.nDrop, "Number of drops/group");
+        result->HDU().ValueForKey("REFCORR", std::string(refCorr.size() > 0 ? "ON" : "OFF"), "Reference pixel correction applied (Eq. 3, ALL)");
         if(m_enable_persistence)
             result->HDU().ValueForKey("PERSIST", std::string("ON"), "Persistence modelling enabled");
 
-        result->HDU().ValueForKey("OFFSET", dpuOffset, "DPU offset in ADU");
-        result->HDU().ValueForKey("SFACTOR", dpuScale, "DPU scale factor");
-        result->HDU().ValueForKey("GAIN", dpuGain, "Mean DPU gain");
-        result->HDU().ValueForKey("RN", dpuNoise, "Mean DPU read noise");
-
-        result->HDU().ValueForKey("FRTIME", frameTime, "NISP HAWAII-2RG frame time in seconds");
-        result->HDU().ValueForKey("POT2PIX",  std::string("v")+std::to_string(PHOT2PIX_VERSION_MAJOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_MINOR)
-                                             +std::string(".")+std::to_string(PHOT2PIX_VERSION_PATCH)
-                                             +std::string("-")+PHOT2PIX_VERSION, DSL::key_type::fChar, "phot2pix version");
+        _writeHeader(*result);
 
         return result;
     }

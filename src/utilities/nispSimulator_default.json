@@ -1,8 +1,7 @@
 {
     "width"        : 2048,
     "height"       : 2048,
-    "x0"           : 0,
-    "y0"           : 0,
+    "detectorOrigin": [0, 0],
 
     "benchmark"    : 10,
 

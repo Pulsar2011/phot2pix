@@ -9,7 +9,11 @@
 #pragma once
 
 #include "PixelSimulator.h"
+#include "Geometry.h"
 
+#include <algorithm>
+#include <memory>
+#include <optional>
 #include <vector>
 #include <span>
 #include <ranges>
@@ -24,6 +28,13 @@
 
 namespace phot2pix
 {
+    /// Write header cards (keyword, value, comment) into the header of a FITS image.
+    inline void writeCards(DSL::FITScube& image, const std::vector<HeaderCard>& cards)
+    {
+        for (const auto& c : cards)
+            std::visit([&image, &c](const auto& v) { image.HDU().ValueForKey(c.key, v, c.comment); }, c.value);
+    }
+
 #pragma region - DetectorSimulator class definition
     template<typename PixelT = pixsim>
     class DetectorSimulator
@@ -233,9 +244,46 @@ namespace phot2pix
         std::vector<PixelT> m_pixels; ///< Flat row-major pixel array
         const int m_pixelType;        ///< FITS storage type for output cube
         size_t m_nThreads;            ///< Thread budget for simulate(); set via setThreadCount()
+        std::vector<HeaderCard> m_inputCards;   ///< Simulation inputs as header cards (see getInputCards())
+
+        /// Physical detector and placement of the matrix on it (see Geometry.h). Replaced by
+        /// initialize(), never modified in place, so copies of a detector may share it.
+        std::shared_ptr<const Geometry> m_geometry;
 
 #pragma endregion
 #pragma region -> member functions
+
+        // Add an input card, or replace the card that has the same keyword.
+        void setInputCard(const HeaderCard& card)
+        {
+            for (auto& c : m_inputCards)
+                if (c.key == card.key) { c = card; return; }
+            m_inputCards.push_back(card);
+        }
+
+        bool hasInputCard(const std::string& key) const
+        {
+            return std::any_of(m_inputCards.begin(), m_inputCards.end(),
+                               [&key](const HeaderCard& c) { return c.key == key; });
+        }
+
+        // Remove the input cards whose keyword starts with prefix (before re-adding a list).
+        void removeInputCards(const std::string& prefix)
+        {
+            std::erase_if(m_inputCards, [&prefix](const HeaderCard& c) { return c.key.rfind(prefix, 0) == 0; });
+        }
+
+        // Card of a per-pixel input: the value or map file cfg gives for `key`; a key that
+        // was never given gets the value the pixels hold (the PixelT default).
+        template<typename Getter>
+        void _recordInput(const PixelConfig& cfg, const std::string& key, const std::string& fitsKey,
+                          const std::string& comment, Getter get)
+        {
+            if (const auto value = cfg.card(key))
+                setInputCard({fitsKey, *value, comment});
+            else if (!hasInputCard(fitsKey) && !m_pixels.empty())
+                setInputCard({fitsKey, static_cast<double>(get(m_pixels.front())), comment});
+        }
 
         // Non-const pixel accessors — derived classes only.
         // Use these during initialisation (defect maps, special pixel regions, etc.).
@@ -527,12 +575,18 @@ namespace phot2pix
     public:
 
 #pragma region - ctor/dtor
-        DetectorSimulator(size_t width, size_t height, const int& dataType = DOUBLE_IMG)
+        // geometry: physical detector the width × height matrix belongs to. A derived
+        // Geometry adds its own layout (reference pixels, …) and configuration keys.
+        // Null → a detector of the matrix size.
+        DetectorSimulator(size_t width, size_t height, const int& dataType = DOUBLE_IMG,
+                          std::shared_ptr<const Geometry> geometry = nullptr)
             : m_width(width), m_height(height), m_pixels(width * height), m_pixelType(dataType),
-              m_nThreads(_computeThreadCount(width * height))
+              m_nThreads(_computeThreadCount(width * height)), m_geometry(std::move(geometry))
         {
             if (width == 0 || height == 0)
                 throw std::invalid_argument("Width and height must be positive integers.");
+            if (!m_geometry)
+                m_geometry = std::make_shared<Geometry>(width, height);
         }
 
         virtual ~DetectorSimulator() = default;
@@ -542,6 +596,30 @@ namespace phot2pix
         size_t getWidth()  const { return m_width; }
         size_t getHeight() const { return m_height; }
         size_t size()      const { return m_pixels.size(); }
+
+        // Physical detector and placement of the matrix on it (see Geometry.h).
+        const Geometry& getGeometry() const { return *m_geometry; }
+
+        // Position (x0, y0) of the matrix on the physical detector: "detectorOrigin" if
+        // given, otherwise (0, 0). Matrix pixel (x, y) is physical pixel (x0 + x, y0 + y).
+        std::pair<size_t, size_t> getOrigin() const { return m_geometry->place(m_width, m_height); }
+
+        // Per-pixel values of the matrix from a 2-D image: a matrix-sized image is used as
+        // is, a detector-sized one is cropped at getOrigin(). Throws std::invalid_argument
+        // for any other size; `what` names the image in the message.
+        std::valarray<double> toMatrix(const DSL::FITScube& image, const std::string& what) const
+        {
+            std::shared_ptr<DSL::FITScube> doubleImage;
+            if (image.GetEqBitPerPixel() != DOUBLE_IMG || image.GetBitPerPixel() != DOUBLE_IMG)
+                doubleImage = image.cast<double>();
+
+            const DSL::FITScube* img = doubleImage ? doubleImage.get() : &image;
+            const std::valarray<double>* data = img->GetData<double>();
+            if (!data)
+                throw std::invalid_argument(what + ": no pixel data.");
+
+            return m_geometry->extract(*data, img->Size(1), img->Size(2), m_width, m_height, what);
+        }
 
         size_t getThreadCount() const { return m_nThreads; }
 
@@ -589,17 +667,28 @@ namespace phot2pix
         }
 
         // Primary pixel-property initialisation from a typed config.
-        // Each known key is interpreted as:
+        // Each known key is read by loadMap():
         //   numeric value  → applied uniformly to all pixels
-        //   string value   → path to a FITS file containing a per-pixel map;
-        //                    an optional "<key>.hdu" sibling specifies the HDU
-        //                    as an integer index or an EXTNAME string (default: 0).
+        //   FITS image     → per-pixel map, "<path>" or {"file": "<path>", "hdu": h}, h an HDU
+        //                    index or an EXTNAME (default: 1, the primary HDU); loadImage()
+        //                    lists every accepted form.
         //
         // Known keys: "gain", "dark", "readNoise", "QE", "KTCnoise", "baseline"
+        // A FITS map is either matrix-sized or detector-sized (see Geometry.h).
+        // The geometry keys ("detectorSize", "detectorOrigin", and those of a derived
+        // Geometry) are read first, so the maps are cropped at the new origin.
         // Derived classes override initialize() to handle additional keys;
         // call DetectorSimulator<PixelT>::initialize(cfg) to apply the standard keys first.
         virtual void initialize(const PixelConfig& cfg)
         {
+            // Configure a copy and commit it only if the matrix fits on the detector.
+            {
+                std::shared_ptr<Geometry> geometry = m_geometry->clone();
+                geometry->configure(cfg);
+                geometry->place(m_width, m_height);   // throws if the matrix does not fit
+                m_geometry = std::move(geometry);
+            }
+
             // Each setter is guarded by if constexpr so that PixelT types that
             // hide pixsim's interface (e.g. via private inheritance) compile cleanly:
             // the call is not emitted if the method is not accessible on PixelT.
@@ -615,10 +704,65 @@ namespace phot2pix
                 _applyMap(cfg, "KTCnoise",  [](PixelT& px, double v) { px.setKTCnoise(v); });
             if constexpr (requires(PixelT& px, double v) { px.setBaseline(v); })
                 _applyMap(cfg, "baseline",  [](PixelT& px, double v) { px.setBaseline(v); });
+
+            // The same inputs as header cards (see getInputCards()).
+            if constexpr (requires(const PixelT& px) { px.getGain(); })
+                _recordInput(cfg, "gain",      "PIXGAIN", "[e-/ADU] Pixel gain",        [](const PixelT& px) { return px.getGain(); });
+            if constexpr (requires(const PixelT& px) { px.getDarkCurrent(); })
+                _recordInput(cfg, "dark",      "PIXDARK", "[e-/s] Pixel dark current",  [](const PixelT& px) { return px.getDarkCurrent(); });
+            if constexpr (requires(const PixelT& px) { px.getReadNoise(); })
+                _recordInput(cfg, "readNoise", "PIXRN",   "[e-] Pixel read noise",      [](const PixelT& px) { return px.getReadNoise(); });
+            if constexpr (requires(const PixelT& px) { px.getQuantumEfficiency(); })
+                _recordInput(cfg, "QE",        "PIXQE",   "Pixel quantum efficiency",   [](const PixelT& px) { return px.getQuantumEfficiency(); });
+            if constexpr (requires(const PixelT& px) { px.getKTCnoise(); })
+                _recordInput(cfg, "KTCnoise",  "PIXKTC",  "[e-] Pixel kTC (reset) noise", [](const PixelT& px) { return px.getKTCnoise(); });
+            if constexpr (requires(const PixelT& px) { px.getBaseline(); })
+                _recordInput(cfg, "baseline",  "PIXBASE", "[ADU] Pixel baseline",       [](const PixelT& px) { return px.getBaseline(); });
         }
 
         // Convenience: load config from a JSON file path.
         virtual void initialize(const std::string& jsonPath) { initialize(PixelConfig(jsonPath)); }
+#pragma endregion
+
+#pragma region - per-pixel inputs from a configuration
+        // The FITS image a configuration key names; nullptr when the key is absent or holds a
+        // number. h is an HDU index (1 = primary) or an EXTNAME:
+        //   "key": "<path>"                         → primary HDU
+        //   "key": "<path>", "key.hdu": h           → HDU h
+        //   "key": {"file": "<path>"}               → primary HDU
+        //   "key": {"file": "<path>", "hdu": h}     → HDU h
+        //   "key.file": "<path>" [, "key.hdu": h]   → flat notation, as above
+        // A string starting with '{' is read as a JSON-encoded object.
+        // Throws std::invalid_argument for a malformed entry or an HDU without an image.
+        std::shared_ptr<DSL::FITScube> loadImage(const PixelConfig& cfg, const std::string& key) const
+        {
+            const std::optional<json> source = _fitsSource(cfg, key);
+            return source ? _openImage(key, *source) : nullptr;
+        }
+
+        // Per-pixel values of a configuration key: a number is applied to every pixel, a FITS
+        // image (see loadImage()) is matrix-sized or detector-sized (see toMatrix()).
+        // Empty when the key is absent.
+        std::valarray<double> loadMap(const PixelConfig& cfg, const std::string& key) const
+        {
+            if (const std::optional<json> source = _fitsSource(cfg, key))
+                return toMatrix(*_openImage(key, *source),
+                                "FITS map for '" + key + "' ('" + source->at("file").get<std::string>() + "')");
+            if (!cfg.has(key))
+                return {};
+            return std::valarray<double>(cfg.getAsDouble(key), m_pixels.size());
+        }
+#pragma endregion
+
+#pragma region - header cards
+        // Simulation inputs recorded by initialize(), as FITS header cards: one per
+        // per-pixel parameter (PIXGAIN, PIXDARK, PIXRN, PIXQE, PIXKTC, PIXBASE), holding
+        // the value it was given or the file name of its map ("dark.fits[1]"), plus the
+        // cards a derived simulator adds with setInputCard(). Write them into an output
+        // with writeInputCards().
+        const std::vector<HeaderCard>& getInputCards() const { return m_inputCards; }
+
+        void writeInputCards(DSL::FITScube& image) const { writeCards(image, m_inputCards); }
 #pragma endregion
 
 #pragma region - named map setters (protected — use initialize() from public API)
@@ -666,113 +810,74 @@ namespace phot2pix
         }
 
     private:
-        // Build a {"file":..., "hdu":...} JSON object from flat cfg siblings, then delegate.
-        std::valarray<double> _loadFitsMap(const std::string& key,
-                                            const std::string& path,
-                                            const PixelConfig& cfg) const
+        // The FITS file and HDU a configuration key names, as {"file": path[, "hdu": h]};
+        // nullopt when the key is absent or holds a number. See loadImage() for the forms.
+        static std::optional<json> _fitsSource(const PixelConfig& cfg, const std::string& key)
         {
-            json j;
-            j["file"] = path;
-            if (cfg.has(key + ".hdu"))
+            // A path, with the HDU, if given, in the "key.hdu" sibling.
+            const auto fromPath = [&cfg, &key](const std::string& path)
             {
-                try   { j["hdu"] = static_cast<int>(cfg.getAsDouble(key + ".hdu")); }
-                catch (const std::invalid_argument&) { j["hdu"] = cfg.get<std::string>(key + ".hdu"); }
+                json source{{"file", path}};
+                if (cfg.has(key + ".hdu"))
+                {
+                    try                                  { source["hdu"] = static_cast<int>(cfg.getAsDouble(key + ".hdu")); }
+                    catch (const std::invalid_argument&) { source["hdu"] = cfg.get<std::string>(key + ".hdu"); }
+                }
+                return source;
+            };
+
+            if (!cfg.has(key))
+            {
+                if (!cfg.has(key + ".file"))
+                    return std::nullopt;
+                return std::make_optional(fromPath(cfg.get<std::string>(key + ".file")));
             }
-            return _loadFitsMapFromJson(key, path, j);
+
+            // The JSON value is checked first: getAsDouble() would not reject an object, since
+            // a json converts to double (and throws json::type_error doing so).
+            json source;
+            try
+            {
+                source = cfg.getJson(key);                        // {"file": ..., "hdu": ...}
+            }
+            catch (const std::invalid_argument&)                  // a path, or a number
+            {
+                std::string s;
+                try                                    { s = cfg.get<std::string>(key); }
+                catch (const std::bad_variant_access&) { return std::nullopt; }
+                if (s.empty() || s.front() != '{')
+                    return std::make_optional(fromPath(s));
+                source = json::parse(s);                          // JSON-encoded object
+            }
+
+            if (source.is_number())
+                return std::nullopt;
+            if (!source.is_object() || !source.contains("file") || !source["file"].is_string())
+                throw std::invalid_argument("'" + key + "': a FITS image is given as {\"file\": \"<path>\", "
+                                            "\"hdu\": <index or EXTNAME>}, not " + source.dump() + ".");
+            return std::make_optional(std::move(source));
         }
 
-        // Load a FITS image from `path`, selecting HDU via the "hdu" field of a JSON object.
-        // If "hdu" is absent, defaults to the primary HDU (index 1).
-        std::valarray<double> _loadFitsMapFromJson(const std::string& key,
-                                                    const std::string& path,
-                                                    const json& j) const
+        // The image of a {"file": path[, "hdu": h]} source; the primary HDU (1) when h is absent.
+        // The image keeps its data once the file is closed.
+        static std::shared_ptr<DSL::FITScube> _openImage(const std::string& key, const json& source)
         {
-            DSL::FITSmanager mgr(path);
-            std::shared_ptr<DSL::FITScube> cube;
-            if (j.contains("hdu"))
-            {
-                if (j["hdu"].is_string())
-                    cube = mgr.GetImage(j["hdu"].get<std::string>());
-                else
-                    cube = mgr.GetImageAtIndex(j["hdu"].get<int>());
-            }
+            const std::string path = source.at("file").get<std::string>();
+            const json        hdu  = source.contains("hdu") ? source.at("hdu") : json(1);
+
+            DSL::FITSmanager mgr(path, true);   // read only
+            std::shared_ptr<DSL::FITScube> image;
+            if (hdu.is_string())
+                image = mgr.GetImage(hdu.get<std::string>());
+            else if (hdu.is_number_integer() && hdu.get<long long>() >= 1)
+                image = mgr.GetImageAtIndex(hdu.get<int>());
             else
-            {
-                cube = mgr.GetImageAtIndex(1);
-            }
+                throw std::invalid_argument("'" + key + "': \"hdu\" is an HDU index (1 = primary) or an EXTNAME, not " +
+                                            hdu.dump() + ".");
 
-            if (cube->Nelements() != m_pixels.size())
-                throw std::invalid_argument("FITS map for '" + key + "': " + std::to_string(cube->Nelements()) + " pixels, detector has " + std::to_string(m_pixels.size()) + ".");
-
-            std::shared_ptr<DSL::FITScube> doubleCube;
-            if(cube->GetEqBitPerPixel() != DOUBLE_IMG || cube->GetBitPerPixel() != DOUBLE_IMG)
-                doubleCube = cube->cast<double>();
-            else
-                doubleCube = cube;
-
-            return *doubleCube->GetData<double>();
-        }
-
-        // Resolve a config key to a per-pixel valarray.  Returns empty if the key
-        // (and its dot-notation siblings) are absent — the caller skips that property.
-        //
-        // Supported forms:
-        //   "param": <number>                          → uniform map
-        //   "param": "<fits_path>"                     → FITS primary HDU
-        //   "param": "<fits_path>", "param.hdu": <h>  → FITS specific HDU (index or EXTNAME)
-        //   "param": {"file":"<path>"}                 → FITS primary HDU (JSON object)
-        //   "param": {"file":"<path>","hdu":<h>}       → FITS specific HDU (JSON object)
-        //   "param.file": "<fits_path>"                → flat notation, primary HDU
-        //   "param.file": "<fits_path>", "param.hdu": <h> → flat notation, specific HDU
-        std::valarray<double> _resolveMap(const PixelConfig& cfg,
-                                           const std::string& key) const
-        {
-            if (cfg.has(key))
-            {
-                // Scalar numeric → uniform map
-                try
-                {
-                    return std::valarray<double>(cfg.getAsDouble(key), m_pixels.size());
-                }
-                catch (const std::invalid_argument&) {}   // not numeric
-
-                // Plain string → FITS path (with optional key.hdu sibling)
-                // Strings starting with '{' are JSON-encoded objects; handled below.
-                try
-                {
-                    const std::string s = cfg.get<std::string>(key);
-                    if (s.empty() || s.front() != '{')
-                        return _loadFitsMap(key, s, cfg);
-                }
-                catch (const std::bad_variant_access&) {}  // not a string
-
-                // JSON object: {"file": "<path>", "hdu": <index_or_name>}
-                // Also handles form2: value stored as a JSON-encoded string.
-                try
-                {
-                    json j;
-                    try                                { j = cfg.getJson(key); }
-                    catch (const std::invalid_argument&)
-                    {
-                        // Value is a string containing JSON — parse it.
-                        j = json::parse(cfg.get<std::string>(key));
-                    }
-                    if (!j.contains("file") || !j["file"].is_string())
-                        throw std::invalid_argument(
-                            "PixelConfig: '" + key + "' object must have a string 'file' field.");
-                    return _loadFitsMapFromJson(key, j["file"].get<std::string>(), j);
-                }
-                catch (const std::invalid_argument& e) { throw; }
-                catch (...) {}
-
-                return {};
-            }
-
-            // Flat dot-notation: key.file [+ key.hdu]
-            if (cfg.has(key + ".file"))
-                return _loadFitsMap(key, cfg.get<std::string>(key + ".file"), cfg);
-
-            return {};
+            if (!image)
+                throw std::invalid_argument("'" + key + "': no image in HDU " + hdu.dump() + " of '" + path + "'.");
+            return image;
         }
 
         template<typename Setter>
@@ -780,7 +885,7 @@ namespace phot2pix
                        const std::string& key,
                        Setter              setter)
         {
-            auto map = _resolveMap(cfg, key);
+            const std::valarray<double> map = loadMap(cfg, key);
             if (map.size() == 0) return;
             for (size_t i = 0; i < m_pixels.size(); ++i)
                 setter(m_pixels[i], map[i]);

@@ -6,6 +6,7 @@
 #define PHOT2PIX_H
 
 #include <phot2pix/PixelConfig.h>
+#include <phot2pix/Geometry.h>
 #include <phot2pix/PixelSimulator.h>
 #include <phot2pix/DetectorSimulator.h>
 #include <phot2pix/ScenerySequencer.h>

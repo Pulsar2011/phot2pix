@@ -338,3 +338,51 @@ TEST(PixelConfig, ToJsonContainsAllKeys)
     EXPECT_DOUBLE_EQ(j["a"].get<double>(), 1.0);
     EXPECT_EQ       (j["b"].get<std::string>(), "x");
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  PixelConfig — card(): header-card value of an input
+// ══════════════════════════════════════════════════════════════════════════════
+
+TEST(PixelConfig, CardOfAbsentKeyIsEmpty)
+{
+    PixelConfig cfg;
+    EXPECT_FALSE(cfg.card("dark").has_value());
+}
+
+TEST(PixelConfig, CardOfANumberIsTheNumber)
+{
+    PixelConfig cfg{{"dark", 0.01}, {"nPoles", 16}};
+    ASSERT_TRUE(cfg.card("dark").has_value());
+    EXPECT_DOUBLE_EQ(std::get<double>(*cfg.card("dark")),   0.01);
+    EXPECT_DOUBLE_EQ(std::get<double>(*cfg.card("nPoles")), 16.0);
+}
+
+TEST(PixelConfig, CardOfAMapIsItsFileNameAndHdu)
+{
+    // Plain path: only the file name is kept.
+    PixelConfig path{{"dark", std::string("/data/calib/dark_map.fits")}};
+    EXPECT_EQ(std::get<std::string>(*path.card("dark")), "dark_map.fits");
+
+    // Path + "key.hdu" (index or EXTNAME).
+    PixelConfig withIndex{{"dark", std::string("/data/dark.fits")}, {"dark.hdu", 2}};
+    EXPECT_EQ(std::get<std::string>(*withIndex.card("dark")), "dark.fits[2]");
+
+    PixelConfig withName{{"gain", std::string("gain.fits")}, {"gain.hdu", std::string("GAIN")}};
+    EXPECT_EQ(std::get<std::string>(*withName.card("gain")), "gain.fits[GAIN]");
+
+    // Object form {"file", "hdu"}.
+    PixelConfig object;
+    object.set("QE", json{{"file", "/maps/qe.fits"}, {"hdu", "QE"}});
+    EXPECT_EQ(std::get<std::string>(*object.card("QE")), "qe.fits[QE]");
+
+    // Flat form "key.file" + "key.hdu".
+    PixelConfig flat{{"readNoise.file", std::string("rn.fits")}, {"readNoise.hdu", 1}};
+    EXPECT_EQ(std::get<std::string>(*flat.card("readNoise")), "rn.fits[1]");
+}
+
+TEST(PixelConfig, CardOfOtherJsonIsItsText)
+{
+    PixelConfig cfg;
+    cfg.set("macc", json::array({4, 16, 4}));
+    EXPECT_EQ(std::get<std::string>(*cfg.card("macc")), "[4,16,4]");
+}

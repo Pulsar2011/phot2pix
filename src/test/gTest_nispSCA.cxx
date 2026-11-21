@@ -50,13 +50,40 @@ static std::valarray<double> makeUniformFlux(size_t w, size_t h, double value)
     return std::valarray<double>(value, w * h);
 }
 
+// The matrix starts at detector pixel (0, 0) by default, inside the 4-pixel reference
+// border (QE = 0). Tests that need every pixel active place it on the active area.
+static nlohmann::json activeOrigin()
+{
+    return nlohmann::json::array({4, 4});
+}
+
+// Write a W × H double map whose pixel (x, y) holds value(x, y) to test_data/<name> and
+// return its path. CFITSIO does not overwrite: a file left by a previous run is removed first.
+template<typename F>
+static std::string writeTestMap(const std::string& name, size_t W, size_t H, F value)
+{
+    const std::filesystem::path dir  = "test_data";
+    const std::filesystem::path file = dir / name;
+
+    std::filesystem::create_directories(dir);
+    std::filesystem::remove(file);
+
+    DSL::FITSimg<double> map({W, H});
+    for (size_t y = 0; y < H; ++y)
+        for (size_t x = 0; x < W; ++x)
+            map.SetPixelValue(value(x, y), y * W + x);
+    map.Write(file.string());
+    return file.string();
+}
+
 // Zero intrinsic pixel noise/response contribution (dark=0, readNoise=0,
-// gain=1, QE=1, KTC=0, baseline=0) so only the effect under test shows up.
+// gain=1, QE=1, KTC=0, baseline=0) so only the effect under test shows up;
+// the matrix is on the active area, so no pixel is a reference pixel.
 static PixelConfig makeQuietPixelCfg()
 {
     return PixelConfig{
         {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 1.0},
-        {"KTCnoise", 0.0}, {"baseline", 0.0}
+        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"detectorOrigin", activeOrigin()}
     };
 }
 
@@ -96,7 +123,8 @@ TEST(SCA, InitializeAppliesBasePixelMaps)
     nisp::SCA sca(4, 4);
     PixelConfig cfg{
         {"gain", 2.5}, {"dark", 0.01}, {"readNoise", 3.0},
-        {"QE", 0.8}, {"KTCnoise", 1.0}, {"baseline", 50.0}
+        {"QE", 0.8}, {"KTCnoise", 1.0}, {"baseline", 50.0},
+        {"detectorOrigin", activeOrigin()}
     };
     sca.initialize(cfg);
 
@@ -185,7 +213,8 @@ TEST(SCA, ExposeMaccLayerMeansGrowLinearlyStatistical)
     nisp::SCA sca(W, H);
     sca.initialize(PixelConfig{
         {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 1.0},
-        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"frame_time", T}
+        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"frame_time", T},
+        {"detectorOrigin", activeOrigin()}
     });
     auto flux = makeUniformFlux(W, H, F);
 
@@ -223,7 +252,8 @@ TEST(SCA, ExposeMaccStatisticalNoiseBudget)
     nisp::SCA sca(1, 1);
     sca.initialize(PixelConfig{
         {"gain", gain}, {"dark", dark}, {"readNoise", readNoise}, {"QE", QE},
-        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"frame_time", T}
+        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"frame_time", T},
+        {"detectorOrigin", activeOrigin()}
     });
     auto fluxArr = makeUniformFlux(1, 1, flux);
 
@@ -500,6 +530,44 @@ TEST(SCA, PersistenceCannotBeDisabledOnceEnabled)
     EXPECT_GT(meanOf(second), meanOf(controlSecond));
 }
 
+TEST(SCA, PersistenceReleaseAndDelayBetweenExposures)
+{
+    // Exposure 1 stores E = 1e5 e- per pixel (flux 1e5 ph/s, QE 1, one 1 s frame).
+    // Exposure 2 is dark and noiseless (gain 1), so its single read is the charge
+    // released during its frame, which starts dT after exposure 1:
+    //   P = E·f·τ·e^(−dT/τ)·(1 − e^(−t_f/τ))
+    // ≈ 99.5 ADU with dT = 0 and ≈ 36.6 ADU with dT = 100 s. (Before the fixes: the
+    // interval [−t_f, 0] gave ≈ 100.5 ADU, and dT was ignored.)
+    const double E = 1e5, f = 1e-3, tau = 100.0, tf = 1.0;
+    const size_t W = 4, H = 4;
+
+    auto secondRead = [&](double delay)
+    {
+        PixelConfig cfg = makeQuietPixelCfg();   // declared first: outlives the SCA
+        cfg.set("frame_time", tf);
+        nlohmann::json p;
+        p["traps"] = nlohmann::json::array({ {{"f", f}, {"t", tau}} });
+        p["dT"]    = delay;
+        cfg.set("persistence", p);
+
+        nisp::SCA sca(W, H);
+        sca.initialize(cfg);
+        sca.expose(makeUniformFlux(W, H, E / tf), nisp::macc{1, 1, 0});
+        auto second = sca.expose(makeUniformFlux(W, H, 0.0), nisp::macc{1, 1, 0});
+
+        const auto& data = *(second->GetData<uint16_t>());
+        double mean = 0.0;
+        for (auto v : data) mean += static_cast<double>(v);
+        return mean / static_cast<double>(data.size());
+    };
+
+    for (double delay : {0.0, 100.0})
+    {
+        const double expected = E * f * tau * std::exp(-delay / tau) * (1.0 - std::exp(-tf / tau));
+        EXPECT_NEAR(secondRead(delay), expected, 0.51) << "dT = " << delay << " s";   // uint16 rounding
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 //  (d) 1/f noise
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -508,24 +576,27 @@ TEST(SCA, OneOverFNoiseAddsVarianceVsDisabled)
 {
     const size_t W = 128, H = 32;
 
+    // baseline 1000 ADU keeps the reads away from 0: with baseline 0, a channel
+    // whose 1/f level happens to be negative would be clamped to 0 by the uint16
+    // conversion and hide its noise.
     PixelConfig cfgOn{
         {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 0.0},
-        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"oneOverF", 15.0}
+        {"KTCnoise", 0.0}, {"baseline", 1000.0}, {"oneOverF", 15.0}
     };
     nisp::SCA scaOn(W, H);
     scaOn.initialize(cfgOn);
 
     PixelConfig cfgOff{
         {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 0.0},
-        {"KTCnoise", 0.0}, {"baseline", 0.0}
+        {"KTCnoise", 0.0}, {"baseline", 1000.0}
     };
     nisp::SCA scaOff(W, H);
     scaOff.initialize(cfgOff);
 
     auto flux = makeUniformFlux(W, H, 0.0);
 
-    // QE=0, dark=0, readNoise=0, KTC=0, baseline=0 -> intrinsic pixelresponse
-    // is exactly 0 everywhere; all frame structure comes from the noise map.
+    // QE=0, dark=0, readNoise=0, KTC=0 -> intrinsic pixelresponse is exactly the
+    // baseline everywhere; all frame structure comes from the noise map.
     auto onResult  = scaOn.expose(flux, nisp::macc{1, 1, 0});
     auto offResult = scaOff.expose(flux, nisp::macc{1, 1, 0});
 
@@ -535,11 +606,11 @@ TEST(SCA, OneOverFNoiseAddsVarianceVsDisabled)
 
 TEST(SCA, OneOverFNoisePerChannelColumnMeanVarianceElevated)
 {
-    const size_t W = 128, H = 32; // 2 channels @ default colPerChannel=64
+    const size_t W = 128, H = 32; // at (0, 0): the 2 whole physical channels 0 and 1
 
     PixelConfig cfg{
         {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 0.0},
-        {"KTCnoise", 0.0}, {"baseline", 0.0}, {"oneOverF", 15.0}
+        {"KTCnoise", 0.0}, {"baseline", 1000.0}, {"oneOverF", 15.0}   // baseline: no clamping at 0
     };
     nisp::SCA sca(W, H);
     sca.initialize(cfg);
@@ -572,8 +643,8 @@ TEST(SCA, OneOverFNoisePerChannelColumnMeanVarianceElevated)
 
 TEST(SCA, OneOverFNoiseHDUAndPersistenceIndependentFlags)
 {
-    // Object form so colPerChannel can be shrunk to fit this tiny detector --
-    // the default (64) would derive nChannels=round(4/64)=0 and throw.
+    // Object form with a non-default colPerChannel (4 divides the 2048-wide
+    // detector: 512 channels); the 4 × 4 matrix is on its active area.
     PixelConfig cfg = makeQuietPixelCfg();
     nlohmann::json oneOverF;
     oneOverF["amplitude"]     = 5.0;
@@ -656,6 +727,137 @@ TEST(SCA, PedestalDriftSurvivesInCds)
     auto result = sca.expose(makeUniformFlux(W, H, 0.0), 10.0);
     for (auto v : *(result->GetData<uint16_t>()))
         ASSERT_EQ(v, 27u);
+}
+
+// ── Detector geometry and reference pixels ───────────────────────────────────
+
+TEST(SCA, ReferencePixelsFollowThePhysicalBorder)
+{
+    // A 2044 × 16 matrix at physical column 2 and row 1016: it keeps 2 reference
+    // columns on each side (matrix columns 0–1 and 2042–2043) and no reference row.
+    // Reference pixels get QE = 0 and, here, refDark.
+    nisp::SCA sca(2044, 16);
+    sca.initialize(PixelConfig{{"QE", 0.9}, {"dark", 0.01}, {"refDark", 0.002},
+                               {"detectorOrigin", nlohmann::json::array({2, 1016})}});
+
+    for (size_t row = 0; row < 16; ++row)
+        for (size_t col = 0; col < 2044; ++col)
+        {
+            const bool ref = col < 2 || col >= 2042;
+            ASSERT_DOUBLE_EQ(sca.at(col, row).getQuantumEfficiency(), ref ? 0.0   : 0.9)  << "column " << col << ", row " << row;
+            ASSERT_DOUBLE_EQ(sca.at(col, row).getDarkCurrent(),       ref ? 0.002 : 0.01) << "column " << col << ", row " << row;
+        }
+}
+
+TEST(SCA, DefaultOriginIsTheDetectorCorner)
+{
+    // Without "detectorOrigin", a 16 × 16 matrix starts at the first detector pixel:
+    // 4 reference columns on the left and 4 reference rows at the bottom.
+    nisp::SCA sca(16, 16);
+    sca.initialize(PixelConfig{{"QE", 0.9}});
+    EXPECT_EQ(sca.getOrigin(), std::make_pair(size_t(0), size_t(0)));
+
+    for (size_t row = 0; row < 16; ++row)
+        for (size_t col = 0; col < 16; ++col)
+            ASSERT_DOUBLE_EQ(sca.at(col, row).getQuantumEfficiency(), (col < 4 || row < 4) ? 0.0 : 0.9)
+                << "column " << col << ", row " << row;
+}
+
+TEST(SCA, RefBorderZeroDisablesReferencePixels)
+{
+    nisp::SCA sca(2048, 4);
+    sca.initialize(PixelConfig{{"QE", 0.9}, {"refBorder", 0}});
+
+    for (size_t i = 0; i < sca.size(); ++i)
+        ASSERT_DOUBLE_EQ(sca.at(i).getQuantumEfficiency(), 0.9);
+}
+
+TEST(SCA, MatrixLargerThanTheDetectorThrows)
+{
+    nisp::SCA wide(2050, 4);
+    EXPECT_THROW(wide.initialize(PixelConfig{{"gain", 1.0}}), std::invalid_argument);
+
+    // ... unless the detector is declared larger.
+    nisp::SCA declared(2050, 4);
+    EXPECT_NO_THROW(declared.initialize(PixelConfig{{"gain", 1.0}, {"detectorSize", nlohmann::json::array({4096, 4096})}}));
+}
+
+TEST(SCA, DetectorSizedMapIsCroppedAndKeepsTheReferencePixels)
+{
+    // QE map of a 64 × 64 detector (refBorder 4). A 16 × 16 matrix at the default origin
+    // takes its corner, whose 4 left columns and 4 bottom rows are reference pixels
+    // (QE = 0); at [24, 24] it takes the section [24, 40) × [24, 40), with no reference pixel.
+    auto qe = [](size_t x, size_t y) { return static_cast<double>(x + 64 * y + 1) / 4096.0; };
+    const std::string path = writeTestMap("sca_qe_64x64.fits", 64, 64, qe);
+
+    nisp::SCA sca(16, 16);
+    sca.initialize(PixelConfig{{"QE", path}, {"detectorSize", nlohmann::json::array({64, 64})}});
+    for (size_t row = 0; row < 16; ++row)
+        for (size_t col = 0; col < 16; ++col)
+            ASSERT_DOUBLE_EQ(sca.at(col, row).getQuantumEfficiency(), (col < 4 || row < 4) ? 0.0 : qe(col, row))
+                << "origin (0, 0), column " << col << ", row " << row;
+
+    sca.initialize(PixelConfig{{"QE", path}, {"detectorOrigin", nlohmann::json::array({24, 24})}});
+    for (size_t row = 0; row < 16; ++row)
+        for (size_t col = 0; col < 16; ++col)
+            ASSERT_DOUBLE_EQ(sca.at(col, row).getQuantumEfficiency(), qe(24 + col, 24 + row))
+                << "origin (24, 24), column " << col << ", row " << row;
+
+    // A map that is neither 16 × 16 nor 64 × 64 is rejected.
+    const std::string wrong = writeTestMap("sca_qe_32x32.fits", 32, 32, qe);
+    EXPECT_THROW(sca.initialize(PixelConfig{{"QE", wrong}}), std::invalid_argument);
+
+    std::filesystem::remove(path);
+    std::filesystem::remove(wrong);
+}
+
+TEST(SCA, OutputHeaderRecordsTheInputs)
+{
+    // A 128 × 8 matrix at the default origin covers the physical columns 1–128 and rows 1–8.
+    PixelConfig cfg{
+        {"gain", 1.92}, {"dark", 0.01}, {"readNoise", 13.0}, {"QE", 0.94},
+        {"KTCnoise", 48.0}, {"baseline", 1000.0}, {"refDark", 0.002}, {"oneOverF", 7.0}
+    };
+    nlohmann::json ped;
+    ped["sigma"]         = 4.0;
+    ped["drift"]["poly"] = nlohmann::json::array({0.0, 0.05});
+    cfg.set("pedestal_drift", ped);
+
+    nisp::SCA sca(128, 8);
+    sca.initialize(cfg);
+    auto result = sca.expose(makeUniformFlux(128, 8, 0.0), nisp::macc{2, 1, 0});
+    const auto& hdu = result->HDU();
+
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PIXGAIN"), 1.92,   1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PIXDARK"), 0.01,   1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PIXRN"),   13.0,   1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PIXQE"),   0.94,   1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PIXKTC"),  48.0,   1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PIXBASE"), 1000.0, 1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("REFDARK"), 0.002,  1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("REFBORD"), 4.0,    1e-9);
+    EXPECT_EQ  (hdu.GetValueForKey("DETSIZE"), "[1:2048,1:2048]");
+    EXPECT_EQ  (hdu.GetValueForKey("DETSEC"),  "[1:128,1:8]");
+
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("OOFAMP"),   7.0, 1e-9);
+    EXPECT_NEAR(hdu.GetDoubleValueForKey("PEDSIGMA"), 4.0, 1e-9);
+    EXPECT_EQ  (hdu.GetValueForKey("PEDPOLY"), "0, 0.05");
+    EXPECT_FALSE(hdu.Exists("BIASAMP"));   // bias voltage noise off
+
+    EXPECT_TRUE(hdu.Exists("PHOT2PIX"));
+}
+
+TEST(SCA, ChannelLayoutIsCheckedAtInitialize)
+{
+    // colPerChannel 100 does not divide the 2048-wide detector.
+    PixelConfig cfg = makeQuietPixelCfg();
+    nlohmann::json oneOverF;
+    oneOverF["amplitude"]     = 5.0;
+    oneOverF["colPerChannel"] = 100;
+    cfg.set("oneOverF", oneOverF);
+
+    nisp::SCA sca(128, 8);
+    EXPECT_THROW(sca.initialize(cfg), std::invalid_argument);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

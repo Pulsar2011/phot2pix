@@ -1,8 +1,7 @@
 {
     "width"        : 2048,
     "height"       : 2048,
-    "x0"           : 0,
-    "y0"           : 0,
+    "detectorOrigin": [0, 0],
 
     "benchmark"    : 0,
 
@@ -12,13 +11,18 @@
     "macc"         : [4, 16, 4],
 
     "frame_time"   : 1.45408,
-    "offset"       : 0.0,
-    "scale"        : 1.0,
+    "offset"       : 1024.0,
+    "scale"        : 3.0,
+    "refPixCorr"   : "ON",
 
-    "gain"         : 1.0,
-    "dark"         : 0.0,
-    "readNoise"    : 0.0,
-    "QE"           : 1.0,
-    "KTCnoise"     : 0.0,
-    "baseline"     : 0.0
+    "gain"         : 1.92,
+    "dark"         : 0.001,
+    "readNoise"    : 13.0,
+    "QE"           : 0.94,
+    "KTCnoise"     : 48.0,
+    "baseline"     : 10000.0,
+
+    "oneOverF"           : { "amplitude": 0, "slope": 0.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "bias_voltage_noise" : { "amplitude": 0.0, "slope": 0.0, "nPoles": 168 },
+    "pedestal_drift"     : { "sigma": 110.0, "t0": 0.0, "drift": { "poly": [] } }
 }

@@ -52,8 +52,8 @@ using namespace phot2pix;
 
 namespace
 {
-    constexpr size_t kW    = 2048;
-    constexpr size_t kH    = 2048;
+    constexpr size_t kW    = 2040;
+    constexpr size_t kH    = 2040;
     constexpr size_t kNPix = kW * kH;
 
     constexpr double kFlux      = 10.0;      // ph/s/pixel
@@ -67,7 +67,8 @@ namespace
 
     const nisp::macc kMacc{kNG, kNR, kND};
 
-    // SCA with every detector effect off, in the given exposureMode.
+    // SCA with every detector effect off, in the given exposureMode. The 2040 × 2040
+    // matrix is the active area of the detector (origin [4, 4]): no reference pixel.
     std::unique_ptr<nisp::SCA> makeSCA(const std::string& mode)
     {
         auto sca = std::make_unique<nisp::SCA>(kW, kH);
@@ -75,7 +76,7 @@ namespace
             {"gain", 1.0}, {"dark", 0.0}, {"readNoise", 0.0}, {"QE", 1.0},
             {"KTCnoise", 0.0}, {"baseline", 0.0},
             {"offset", 0.0}, {"scale", 1.0}, {"frame_time", kFrameTime},
-            {"exposureMode", mode}
+            {"exposureMode", mode}, {"detectorOrigin", nlohmann::json::array({4, 4})}
         });
         return sca;
     }

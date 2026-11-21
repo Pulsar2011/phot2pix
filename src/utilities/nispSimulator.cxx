@@ -23,6 +23,7 @@
 #include <functional>
 #include <numeric>
 #include <valarray>
+#include <variant>
 #include <vector>
 
 using namespace DSL;
@@ -153,20 +154,23 @@ int main(int argc, char **argv)
 
         size_t width  = getCount("width",  2048);
         size_t height = getCount("height", 2048);
-        size_t x0     = getCount("x0",     0);
-        size_t y0     = getCount("y0",     0);
 
         // "benchmark": N → run sca.expose() N times and print timings; absent or 0 → single silent run.
         const size_t nRuns = getCount("benchmark", 0);
-
-        if(dbg >= 1)
-            std::cout << kInfoTag << "detector       : " << width << " x " << height
-                      << " pixels, window origin (x0, y0) = (" << x0 << ", " << y0 << ")" << std::endl;
 
         auto tStep = Clock::now();
         nisp::SCA sca(width, height);
         sca.initialize(cfg);
         const double tSetup = secondsSince(tStep);
+
+        // Position of the matrix on the physical detector ("detectorOrigin", (0, 0) by default),
+        // parsed by the SCA.
+        const auto [x0, y0] = sca.getOrigin();
+
+        if(dbg >= 1)
+            std::cout << kInfoTag << "detector       : " << width << " x " << height
+                      << " pixels at detectorOrigin (x0, y0) = (" << x0 << ", " << y0 << ")"
+                      << (cfg.has("detectorOrigin") ? "" : " (default)") << std::endl;
 
         if(dbg >= 1)
         {
@@ -185,47 +189,41 @@ int main(int argc, char **argv)
         {
             for(const char* key : {"gain", "dark", "readNoise", "QE", "KTCnoise", "baseline"})
                 std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
-            for(const char* key : {"frame_time", "fr_time", "offset", "dpu_offset", "scale", "dpu_scale", "oneOverF", "bias_voltage_noise", "pedestal_drift", "persistence"})
+            for(const char* key : {"frame_time", "fr_time", "offset", "dpu_offset", "scale", "dpu_scale", "oneOverF", "bias_voltage_noise", "pedestal_drift", "persistence",
+                                     "detectorSize", "detectorOrigin", "refBorder", "refDark"})
                 if(cfg.has(key))
                     std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
             std::cout << kDebugTag << "SCA setup      : " << tSetup << " s" << std::endl;
         }
 
-        // Flux (photons/s/pixel):
-        //   absent   → 0 everywhere (dark exposure)
-        //   number   → uniform flux
-        //   string   → FITS file, primary image cropped to [x0, x0+width) × [y0, y0+height)
+        // Flux (photons/s/pixel), read by the SCA as a per-pixel parameter (see
+        // DetectorSimulator::loadImage() for every form):
+        //   absent                                    → 0 everywhere (dark exposure)
+        //   number                                    → uniform flux
+        //   "<path>" or {"file": "<path>", "hdu": h}  → FITS image in HDU h, an index or an EXTNAME
+        //                                               (default: 1, the primary HDU): matrix-sized (used
+        //                                               as is) or detector-sized (cropped to
+        //                                               [x0, x0+width) × [y0, y0+height)), as the per-pixel maps
         tStep = Clock::now();
         std::valarray<double> fluxArray(0.0, width*height);
         std::string fluxSource = "none → dark exposure (flux = 0)";
-        if(cfg.has("flux"))
+        std::pair<size_t, size_t> fluxCorner{0, 0};   // corner of the flux image section used
+        if(const std::shared_ptr<DSL::FITScube> inputFlux = sca.loadImage(cfg, "flux"))
         {
-            try
-            {
-                fluxArray  = cfg.getAsDouble("flux");
-                fluxSource = "uniform " + show("flux") + " ph/s/pixel";
-            }
-            catch(const std::invalid_argument&)
-            {
-                const std::string fluxFile = cfg.get<std::string>("flux");
-                fluxSource = "FITS file '" + fluxFile + "', cropped to the detector window";
-                FITSmanager mgr(fluxFile, true);
+            const std::string fluxName = std::get<std::string>(*cfg.card("flux"));   // "file.fits[hdu]"
+            fluxArray = sca.toMatrix(*inputFlux, "Flux image '" + fluxName + "'");
 
-                std::shared_ptr<DSL::FITScube> inputFlux = mgr.GetPrimary();
-                if(!inputFlux)
-                    throw std::runtime_error("Cannot read the primary image of flux file '" + fluxFile + "'.");
-
-                inputFlux->Resize({x0, width}, {y0, height});   // in place: {corner, size}
-                if(inputFlux->Nelements() != width*height)
-                    throw std::invalid_argument("Flux image '" + fluxFile + "' gives " + std::to_string(inputFlux->Nelements()) +
-                                                " pixels after cropping, expected " + std::to_string(width*height) + ".");
-
-                // GetData<double>() returns nullptr unless the stored type is double.
-                if(inputFlux->GetBitPerPixel() != DOUBLE_IMG || inputFlux->GetEqBitPerPixel() != DOUBLE_IMG)
-                    inputFlux = inputFlux->cast<double>();
-
-                fluxArray = *(inputFlux->GetData<double>());
-            }
+            const bool matrixSized = inputFlux->Size(1) == width && inputFlux->Size(2) == height;
+            if(!matrixSized)
+                fluxCorner = {x0, y0};
+            fluxSource = "FITS image '" + fluxName + "' (" + std::to_string(inputFlux->Size(1)) + " x " +
+                         std::to_string(inputFlux->Size(2)) +
+                         (matrixSized ? ", matrix-sized)" : ", detector-sized, cropped at the matrix origin)");
+        }
+        else if(cfg.has("flux"))
+        {
+            fluxArray  = sca.loadMap(cfg, "flux");
+            fluxSource = "uniform " + show("flux") + " ph/s/pixel";
         }
         const double tFlux = secondsSince(tStep);
 
@@ -275,6 +273,21 @@ int main(int argc, char **argv)
 
             if(dbg >= 2 && nExpose > 1)
                 std::cout << kDebugTag << "sca.expose run " << i + 1 << "/" << nExpose << ": " << tExpose.back() << " s" << std::endl;
+        }
+
+        // Input flux in the header, next to the detector inputs written by the SCA.
+        {
+            const phot2pix::CardValue flux = cfg.card("flux").value_or(phot2pix::CardValue(0.0));
+            std::vector<phot2pix::HeaderCard> cards{{"FLUX", flux, "[ph/s/pix] Input flux (value or file)"}};
+            if(std::holds_alternative<std::string>(flux))
+            {
+                const auto [fx0, fy0] = fluxCorner;
+                cards.push_back({"FLUXSEC",
+                                 "[" + std::to_string(fx0 + 1) + ":" + std::to_string(fx0 + width) + "," +
+                                       std::to_string(fy0 + 1) + ":" + std::to_string(fy0 + height) + "]",
+                                 "Section of the flux image used"});
+            }
+            phot2pix::writeCards(*result, cards);
         }
 
         const size_t nLayers = std::max<size_t>(1, result->Size(3));

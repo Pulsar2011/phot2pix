@@ -12,6 +12,8 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <filesystem>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -24,6 +26,21 @@
 namespace phot2pix
 {
     using json = nlohmann::json;
+
+    /// Value of a FITS header card: a number, a count, or a string.
+    using CardValue = std::variant<double, size_t, std::string>;
+
+    /// One FITS header card describing a simulation input: keyword (at most 8
+    /// characters), value, and a comment that starts with the unit in square
+    /// brackets, following the FITS convention ("[e-/ADU] Pixel gain").
+    /// PixelConfig::card() builds the value of an input as the configuration gave
+    /// it; DetectorSimulator records and writes the cards of its inputs.
+    struct HeaderCard
+    {
+        std::string key;
+        CardValue   value;
+        std::string comment;
+    };
 
     /**
      * @class PixelConfig
@@ -166,8 +183,85 @@ namespace phot2pix
             return j;
         }
 
+        /// Header-card value describing the input `key` as the configuration gave it,
+        /// in the forms DetectorSimulator::initialize() accepts for a per-pixel parameter:
+        ///   "key": number                        → the number
+        ///   "key": "path" [+ "key.hdu": h]       → "file.fits" or "file.fits[h]"
+        ///   "key": {"file": "path", "hdu": h}    → "file.fits[h]"
+        ///   "key.file": "path" [+ "key.hdu": h]  → "file.fits[h]"
+        ///   any other JSON value                 → its compact JSON text
+        /// Only the file name is kept, not its directory: a FITS string value holds at
+        /// most 68 characters. Returns nullopt when the key is absent.
+        std::optional<CardValue> card(const std::string& key) const
+        {
+            const auto sibling = [this, &key]() -> json
+            {
+                const auto it = m_params.find(key + ".hdu");
+                return (it == m_params.end()) ? json() : _toJson(it->second);
+            };
+
+            if (const auto it = m_params.find(key); it != m_params.end())
+            {
+                const Value& v = it->second;
+
+                if (std::holds_alternative<std::string>(v))
+                {
+                    const std::string& s = std::get<std::string>(v);
+                    if (!s.empty() && s.front() == '{')   // JSON-encoded object
+                    {
+                        try { return _fileCard(json::parse(s), s); }
+                        catch (const json::exception&) { return s; }
+                    }
+                    return _fileName(s) + _hduSuffix(sibling());
+                }
+
+                if (std::holds_alternative<json>(v))
+                {
+                    const json& j = std::get<json>(v);
+                    if (j.is_number())
+                        return j.get<double>();
+                    return _fileCard(j, j.dump());
+                }
+
+                return getAsDouble(key);   // any numeric type
+            }
+
+            if (const auto it = m_params.find(key + ".file"); it != m_params.end() && std::holds_alternative<std::string>(it->second))
+                return _fileName(std::get<std::string>(it->second)) + _hduSuffix(sibling());
+
+            return std::nullopt;
+        }
+
     private:
         std::unordered_map<std::string, Value> m_params;
+
+        static json _toJson(const Value& v)
+        {
+            return std::visit([](const auto& x) { return json(x); }, v);
+        }
+
+        static std::string _fileName(const std::string& path)
+        {
+            return std::filesystem::path(path).filename().string();
+        }
+
+        // "[h]" for an HDU given as an index or an EXTNAME, "" when absent.
+        static std::string _hduSuffix(const json& hdu)
+        {
+            if (hdu.is_number())
+                return "[" + std::to_string(hdu.get<long long>()) + "]";
+            if (hdu.is_string())
+                return "[" + hdu.get<std::string>() + "]";
+            return "";
+        }
+
+        // {"file": path, "hdu": h} → "file.fits[h]"; anything else → fallback.
+        static std::string _fileCard(const json& j, const std::string& fallback)
+        {
+            if (j.is_object() && j.contains("file") && j["file"].is_string())
+                return _fileName(j["file"].get<std::string>()) + _hduSuffix(j.contains("hdu") ? j["hdu"] : json());
+            return fallback;
+        }
 
         void _fromJson(const json& j)
         {

@@ -38,10 +38,11 @@ static std::shared_ptr<DSL::FITScube> makeFluxImage(size_t w, size_t h, double v
     return img;
 }
 
-// Expected persistence signal for a single trap component.
+// Expected persistence signal for a single trap component: the charge released over
+// the step [dT, dT + T] by a charge `flux` stored at t = 0, at the rate f·e^(−t/τ).
 static double expectedSignal(double f, double tau, double dT, double T, double flux)
 {
-    return f * std::exp(-dT / tau) * tau * (std::exp(T / tau) - 1.0) * flux;
+    return f * tau * std::exp(-dT / tau) * (1.0 - std::exp(-T / tau)) * flux;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -149,6 +150,37 @@ TEST(PersistenceModel, TwoTrapResponse)
     const double exp = expectedSignal(f1, tau1, dT, T, flux)
                      + expectedSignal(f2, tau2, dT, T, flux);
     EXPECT_NEAR(m.pixelresponse(flux, T), exp, 1e-9 * std::abs(exp));
+}
+
+TEST(PersistenceModel, ConsecutiveStepsAddUpToOneStep)
+{
+    // The release over [Δ, Δ + T] is the sum of the releases over [Δ, Δ + T/2] and
+    // [Δ + T/2, Δ + T]: splitting a step does not change the charge released.
+    const double f = 0.01, tau = 100.0, flux = 1000.0, delta = 20.0, T = 30.0;
+
+    model m;
+    m.insertParameter(f, tau);
+
+    auto release = [&m, flux](double start, double length)
+    {
+        PixelConfig cfg;
+        cfg.set("dT", start);
+        return m.pixelresponse(flux, length, cfg);
+    };
+
+    const double whole = release(delta, T);
+    EXPECT_NEAR(whole, release(delta, T / 2) + release(delta + T / 2, T / 2), 1e-9 * whole);
+}
+
+TEST(PersistenceModel, TotalReleaseIsFTau)
+{
+    // Over all the time after the exposure, a trap releases f·τ of the stored charge.
+    model m;
+    m.insertParameter(1e-3, 80.0);
+
+    PixelConfig cfg;
+    cfg.set("dT", 0.0);
+    EXPECT_NEAR(m.pixelresponse(1.0, 1e6, cfg), 1e-3 * 80.0, 1e-12);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -404,4 +436,53 @@ TEST(PersistenceScheduler, RemoveCharges)
     const double sRef  = (*rRef ->GetData<double>())[0];
     EXPECT_NEAR(sFull, sRef, 1e-9 * sRef)
         << "After removal, remaining signal should match single-entry reference";
+}
+
+// Persistence configuration in object form, with a delay between exposures.
+static PixelConfig makeDelayedTrapConfig(double f, double tau, double delay)
+{
+    PixelConfig cfg;
+    nlohmann::json p;
+    p["traps"] = nlohmann::json::array({ {{"f", f}, {"t", tau}} });
+    p["dT"]    = delay;
+    cfg.set("persistence", p);
+    return cfg;
+}
+
+TEST(PersistenceScheduler, DelayBetweenExposuresAgesEveryStoredExposure)
+{
+    // "dT": 30 → the next exposure starts 30 s after the end of each stored one.
+    const double f = 0.01, tau = 100.0, flux = 1000.0, T = 10.0, delay = 30.0;
+    const size_t W = 4, H = 4;
+
+    PixelConfig cfg = makeDelayedTrapConfig(f, tau, delay);
+    scheduler sched(cfg);
+    EXPECT_DOUBLE_EQ(sched.getDelay(), delay);
+
+    sched.insertCharges(makeFluxImage(W, H, flux), 0.0);
+    EXPECT_NEAR(sched.getHistory()[0].t0, delay, 1e-9);
+
+    // The first step of the next exposure starts `delay` after the stored one.
+    std::shared_ptr<DSL::FITScube> r = sched.computePersistenceSignal(0.0, T);
+    ASSERT_NE(r, nullptr);
+    const double exp = expectedSignal(f, tau, delay, T, flux);
+    EXPECT_NEAR((*r->GetData<double>())[0], exp, 1e-9 * exp);
+
+    // A second exposure is stored: both exposures age by the delay before the next one.
+    sched.insertCharges(makeFluxImage(W, H, flux), 0.0);
+    EXPECT_NEAR(sched.getHistory()[0].t0, delay + T + delay, 1e-9);
+    EXPECT_NEAR(sched.getHistory()[1].t0, delay,             1e-9);
+}
+
+TEST(PersistenceScheduler, NoDelayByDefault)
+{
+    PixelConfig cfg = makeTrapConfig(0.01, 100.0);   // array form: no "dT"
+    scheduler sched(cfg);                            // keeps a reference to cfg
+    EXPECT_DOUBLE_EQ(sched.getDelay(), 0.0);
+}
+
+TEST(PersistenceScheduler, NegativeDelayThrows)
+{
+    PixelConfig cfg = makeDelayedTrapConfig(0.01, 100.0, -1.0);
+    EXPECT_THROW(scheduler{cfg}, std::invalid_argument);
 }

@@ -1,24 +1,27 @@
 {
     "width"        : 2048,
     "height"       : 2048,
-    "x0"           : 0,
-    "y0"           : 0,
+    "detectorOrigin": [0, 0],
 
-    "benchmark"    : 0,
+    "benchmark"    : 100,
 
     "flux"         : 10.0,
 
     "exposureMode" : "UTR",
-    "macc"         : [4, 16, 4],
+    "macc"         : [4, 4, 4],
 
     "frame_time"   : 1.45408,
     "offset"       : 0.0,
     "scale"        : 1.0,
 
-    "gain"         : 1.0,
-    "dark"         : 0.0,
-    "readNoise"    : 0.0,
-    "QE"           : 1.0,
-    "KTCnoise"     : 0.0,
-    "baseline"     : 0.0
+    "gain"         : 1.92,
+    "dark"         : 0.01,
+    "readNoise"    : 13.0,
+    "QE"           : 0.94,
+    "KTCnoise"     : 48.0,
+    "baseline"     : 10000.0,
+
+    "oneOverF"           : { "amplitude": 35.0, "slope": 0.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "bias_voltage_noise" : { "amplitude": 10.0, "slope": 0.0, "nPoles": 16 },
+    "pedestal_drift"     : { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [] } }
 }

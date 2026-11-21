@@ -23,8 +23,9 @@ using namespace phot2pix;
 //
 // NOTE on tolerances used throughout this file: OneOverFNoise::generate()
 // builds each channel as a sum of AR(1) poles with corner frequencies
-// log-spaced down to f_min = 1/(2*channelLength) — i.e. the slowest pole's
-// correlation time is comparable to the *entire* observed series. This is
+// log-spaced down to f_min = 1/(2*L), L = 2048*64 samples per channel and per
+// physical frame — i.e. the slowest pole's correlation time is comparable to
+// (or longer than) the *entire* observed series. This is
 // the defining feature of 1/f-type noise, but it also means a single finite
 // realization converges much more slowly (and with much fatter statistical
 // tails) than i.i.d. Gaussian noise of the kind used in gTest_pixels.cxx.
@@ -111,6 +112,16 @@ static void expectRmsWithinBand(double rmsValue, double amplitude, double factor
 {
     EXPECT_GT(rmsValue, amplitude / factor);
     EXPECT_LT(rmsValue, amplitude * factor);
+}
+
+// The matrix starts at detector pixel (0, 0) by default. Tests that check where the
+// noise lands on the detector (partial channels, row read times) place their W × H
+// matrix at the centre of the 2048 × 2048 detector explicitly.
+static void placeAtCentre(OneOverFNoise& n, size_t W, size_t H)
+{
+    nisp::Geometry g;
+    g.origin = std::make_pair((g.width - W) / 2, (g.height - H) / 2);
+    n.setGeometry(g);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -247,55 +258,113 @@ TEST(OneOverFNoise, ReferencePixelLayoutWidthPlus8)
     EXPECT_EQ(out.size(), 2040u * 10u);
 }
 
-TEST(OneOverFNoise, ExplicitChannelCountWithRemainder)
+TEST(OneOverFNoise, AnyMatrixSizeUpToTheDetectorIsValid)
 {
-    // nCh=5, colPerChannel=64: nominal_total=320, matches neither width(101)
-    // nor width+8(109) -> fallback layout: col_w=20, rem=1 (channel 0 gets 21).
-    OneOverFNoise n(5.0, 1.0, /*nChannels=*/5, /*colPerChannel=*/64, 16);
-    const auto out = n.generate(101, 8);
-    EXPECT_EQ(out.size(), 101u * 8u);
-
-    const auto ch0 = extractChannelSeries(out, 101, 8, 0,  21);
-    const auto ch1 = extractChannelSeries(out, 101, 8, 21, 20);
-
-    // Independent per-channel RNG draws -> not element-wise identical over
-    // their common length.
-    const size_t n0 = std::min(ch0.size(), ch1.size());
-    bool anyDifferent = false;
-    for (size_t i = 0; i < n0; ++i)
-        if (ch0[i] != ch1[i]) { anyDifferent = true; break; }
-    EXPECT_TRUE(anyDifferent);
+    // The layout comes from the 2048-wide detector, not from the matrix: a
+    // 1-column, a 2044-wide or a 100-wide matrix is just a part of it.
+    OneOverFNoise n(5.0, 1.0, 0, 64, 16);
+    for (size_t w : {1u, 100u, 2044u, 2048u})
+    {
+        std::valarray<double> out;
+        EXPECT_NO_THROW(out = n.generate(w, 4)) << "width " << w;
+        EXPECT_EQ(out.size(), w * 4u);
+    }
 }
 
-TEST(OneOverFNoise, ZeroDerivedChannelsThrows)
+TEST(OneOverFNoise, MatrixLargerThanDetectorThrows)
 {
-    // nCh = round(1/64) = 0.
     OneOverFNoise n(5.0, 1.0, 0, 64, 16);
-    EXPECT_THROW(n.generate(1, 10), std::invalid_argument);
+    EXPECT_THROW(n.generate(2049, 10), std::invalid_argument);
+    EXPECT_THROW(n.generate(64, 4096),  std::invalid_argument);
+}
+
+TEST(OneOverFNoise, ChannelLayoutMustMatchTheDetector)
+{
+    // colPerChannel must divide the detector width (2048), and an explicit
+    // nChannels must equal width / colPerChannel.
+    EXPECT_THROW(OneOverFNoise(5.0, 1.0, 0, 100, 16).generate(64, 4), std::invalid_argument);
+    EXPECT_THROW(OneOverFNoise(5.0, 1.0, 5, 64,  16).generate(64, 4), std::invalid_argument);
+    EXPECT_NO_THROW(OneOverFNoise(5.0, 1.0, 32, 64, 16).generate(64, 4));
 }
 
 TEST(OneOverFNoise, DisabledGenerateNeverBuildsLayoutOrThrows)
 {
-    // Disabled (amplitude==0): the isEnabled() early-return happens before
-    // _buildLayout() is ever called, so a width that WOULD throw if enabled
-    // (see ZeroDerivedChannelsThrows) must not throw here.
+    // Disabled (amplitude==0): the isEnabled() early-return happens before the
+    // matrix is placed, so a matrix that WOULD throw if enabled (see
+    // MatrixLargerThanDetectorThrows) must not throw here.
     OneOverFNoise n; // disabled
     std::valarray<double> out;
-    EXPECT_NO_THROW(out = n.generate(1, 10));
-    ASSERT_EQ(out.size(), 10u);
+    EXPECT_NO_THROW(out = n.generate(4096, 10));
+    ASSERT_EQ(out.size(), 40960u);
     for (size_t i = 0; i < out.size(); ++i)
         EXPECT_DOUBLE_EQ(out[i], 0.0);
+}
+
+TEST(OneOverFNoise, GeometryPlacesTheMatrix)
+{
+    nisp::Geometry g;   // 2048 × 2048, reference border 4, matrix at (0, 0)
+    EXPECT_EQ(g.place(2048, 2048), std::make_pair(size_t(0), size_t(0)));
+    EXPECT_EQ(g.place(2040, 2040), std::make_pair(size_t(0), size_t(0)));
+    EXPECT_EQ(g.place(2044, 256),  std::make_pair(size_t(0), size_t(0)));
+    EXPECT_THROW(g.place(2050, 10), std::invalid_argument);
+    EXPECT_THROW(g.place(10, 2049), std::invalid_argument);
+
+    EXPECT_TRUE (g.isReference(0, 1000));
+    EXPECT_TRUE (g.isReference(3, 1000));
+    EXPECT_FALSE(g.isReference(4, 1000));
+    EXPECT_FALSE(g.isReference(2043, 1000));
+    EXPECT_TRUE (g.isReference(2044, 1000));
+    EXPECT_TRUE (g.isReference(1000, 2047));
+
+    PixelConfig cfg;
+    cfg.set("detectorSize",   nlohmann::json::array({128, 64}));
+    cfg.set("detectorOrigin", nlohmann::json::array({64, 0}));
+    cfg.set("refBorder",      2);
+    g.configure(cfg);
+    EXPECT_EQ(g.width,  128u);
+    EXPECT_EQ(g.height, 64u);
+    EXPECT_EQ(g.refBorder, 2u);
+    EXPECT_EQ(g.place(64, 64), std::make_pair(size_t(64), size_t(0)));
+    EXPECT_THROW(g.place(65, 64), std::invalid_argument);   // does not fit at that origin
+
+    PixelConfig badBorder;
+    badBorder.set("refBorder", 100);
+    EXPECT_THROW(g.configure(badBorder), std::invalid_argument);
+    EXPECT_EQ(g.refBorder, 2u);   // unchanged after the error
+}
+
+TEST(OneOverFNoise, PartialChannelsLineUpWithThePhysicalChannels)
+{
+    // A centred 100-wide matrix starts at physical column 974: its columns 0–49
+    // are the end of channel 15 (pixel-clock offsets 14–63) and its columns 50–99
+    // the start of channel 16 (offsets 0–49). With bias voltage noise only, the
+    // same offset carries the same value: column k of channel 15 (offset 14 + k)
+    // matches column 64 + k of channel 16.
+    OneOverFNoise n;
+    PixelConfig cfg;
+    cfg.set("bias_voltage_noise", 10.0);
+    n.initialize(cfg);
+
+    const size_t W = 100, H = 8;
+    placeAtCentre(n, W, H);
+    const auto out = n.generate(W, H);
+    for (size_t y = 0; y < H; ++y)
+        for (size_t k = 0; k < 36; ++k)
+            ASSERT_DOUBLE_EQ(out[y * W + k], out[y * W + 64 + k]) << "row " << y << ", column " << k;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Noise statistics
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// A 128-wide matrix at the default origin (0, 0) covers exactly the physical
+// channels 0 and 1, so its columns 0–63 are one whole channel.
+
 TEST(OneOverFNoise, GeneratedNoiseRMSWithinBroadBandOfAmplitude)
 {
-    OneOverFNoise n(10.0, 1.0, 0, 64, 16); // single channel (width==colPerChannel)
-    const auto out = n.generate(64, 800);  // channel length = 800*64 = 51200
-    const auto series = extractChannelSeries(out, 64, 800, 0, 64);
+    OneOverFNoise n(10.0, 1.0, 0, 64, 16);
+    const auto out = n.generate(128, 800);   // channel samples = 800*64 = 51200
+    const auto series = extractChannelSeries(out, 128, 800, 0, 64);
 
     expectRmsWithinBand(rms(series), 10.0);
 }
@@ -303,8 +372,8 @@ TEST(OneOverFNoise, GeneratedNoiseRMSWithinBroadBandOfAmplitude)
 TEST(OneOverFNoise, PositiveLag1AutocorrelationConfirmsColoredNoise)
 {
     OneOverFNoise n(10.0, 1.0, 0, 64, 16);
-    const auto out = n.generate(64, 800);
-    const auto series = extractChannelSeries(out, 64, 800, 0, 64);
+    const auto out = n.generate(128, 800);
+    const auto series = extractChannelSeries(out, 128, 800, 0, 64);
 
     // Loose threshold, well above the white-noise null (~1/sqrt(N)).
     EXPECT_GT(lag1Autocorr(series), 0.02);
@@ -312,7 +381,7 @@ TEST(OneOverFNoise, PositiveLag1AutocorrelationConfirmsColoredNoise)
 
 TEST(OneOverFNoise, IndependentChannelsUncorrelated)
 {
-    OneOverFNoise n(10.0, 1.0, 0, 64, 16); // width=128 -> 2 channels
+    OneOverFNoise n(10.0, 1.0, 0, 64, 16); // width=128 -> 2 whole channels
     const auto out = n.generate(128, 800);
 
     const auto ch0 = extractChannelSeries(out, 128, 800, 0,  64);
@@ -333,11 +402,11 @@ TEST(OneOverFNoise, ScaleWithAmplitudeIsMonotonic)
     OneOverFNoise lo(5.0,  1.0, 0, 64, 16);
     OneOverFNoise hi(20.0, 1.0, 0, 64, 16);
 
-    const auto outLo = lo.generate(64, 500);
-    const auto outHi = hi.generate(64, 500);
+    const auto outLo = lo.generate(128, 500);
+    const auto outHi = hi.generate(128, 500);
 
-    const double rmsLo = rms(extractChannelSeries(outLo, 64, 500, 0, 64));
-    const double rmsHi = rms(extractChannelSeries(outHi, 64, 500, 0, 64));
+    const double rmsLo = rms(extractChannelSeries(outLo, 128, 500, 0, 64));
+    const double rmsHi = rms(extractChannelSeries(outHi, 128, 500, 0, 64));
 
     expectRmsWithinBand(rmsLo, 5.0);
     expectRmsWithinBand(rmsHi, 20.0);
@@ -367,8 +436,8 @@ TEST(OneOverFNoise, DisabledWindowSkipsBoundsCheck)
 TEST(OneOverFNoise, WindowedOutputWithinBroadBandOfAmplitude)
 {
     OneOverFNoise n(10.0, 1.0, 0, 64, 16);
-    // Detector is 64x500; window covers it entirely (c0=r0=0, ncols=64, nrows=500).
-    const auto out = n.generate(64, 500, 0, 0, 64, 500);
+    // Matrix is 128x500; the window is its first whole channel (c0=r0=0, ncols=64, nrows=500).
+    const auto out = n.generate(128, 500, 0, 0, 64, 500);
     const auto series = extractChannelSeries(out, 64, 500, 0, 64);
 
     expectRmsWithinBand(rms(series), 10.0);
@@ -376,8 +445,8 @@ TEST(OneOverFNoise, WindowedOutputWithinBroadBandOfAmplitude)
 
 TEST(OneOverFNoise, WindowNotAlignedToChannelZeroStillWorks)
 {
-    OneOverFNoise n(10.0, 1.0, 0, 64, 16); // width=128 -> 2 channels
-    // Detector is 128x500; window selects channel 1 only (cols [64,128)).
+    OneOverFNoise n(10.0, 1.0, 0, 64, 16); // width=128 -> 2 whole channels
+    // Matrix is 128x500; window selects its second channel only (cols [64,128)).
     const auto out = n.generate(128, 500, /*c0=*/64, /*r0=*/0, /*ncols=*/64, /*nrows=*/500);
     const auto series = extractChannelSeries(out, 64, 500, 0, 64);
 
@@ -475,15 +544,16 @@ TEST(OneOverFNoise, BiasVoltageNoiseIsCommonToAllChannels)
 
 TEST(OneOverFNoise, BiasVoltageNoiseFollowsPixelClockInReferenceLayout)
 {
-    // 2040-wide frame: channel 0 lost its 4 reference columns, which were read first,
-    // so its column s is pixel-clock sample s + 4. Channel 1 starts at column 60 and
-    // channel 31 at column 1980, both at sample 0.
+    // 2040-wide frame at x0 = 4 (the active area): channel 0 lost its 4 reference
+    // columns, which were read first, so its column s is pixel-clock sample s + 4.
+    // Channel 1 starts at column 60 and channel 31 at column 1980, both at sample 0.
     OneOverFNoise n;
     PixelConfig cfg;
     cfg.set("bias_voltage_noise", 10.0);
     n.initialize(cfg);
 
     const size_t W = 2040, H = 4;
+    placeAtCentre(n, W, H);
     const auto out = n.generate(W, H);
 
     for (size_t y = 0; y < H; ++y)
@@ -619,8 +689,9 @@ TEST(OneOverFNoise, PedestalNoiseIsOneOffsetPerChannelPerFrame)
 
 TEST(OneOverFNoise, PedestalDriftEvaluatedAtEachRowReadTime)
 {
-    // f(t) = 2 t, t0 = 1 s, frame time 1 s, H = 4: row y of the frame read from
-    // tStart = 3 s is read at 3 + (y + 0.5)/4 s, so its offset is 2·(1 + 3 + (y + 0.5)/4).
+    // f(t) = 2 t, t0 = 1 s, frame time 1 s. A centred 4-row matrix covers the
+    // physical rows 1022–1025 of the 2048-row detector: its row y of the frame
+    // read from tStart = 3 s is read at 3 + (1022 + y + 0.5)/2048 s.
     nlohmann::json ped;
     ped["t0"]            = 1.0;
     ped["drift"]["poly"] = nlohmann::json::array({0.0, 2.0});
@@ -632,10 +703,11 @@ TEST(OneOverFNoise, PedestalDriftEvaluatedAtEachRowReadTime)
     n.initialize(cfg);
 
     const size_t W = 128, H = 4;
+    placeAtCentre(n, W, H);
     const auto out = n.generate(W, H, 3.0);
     for (size_t y = 0; y < H; ++y)
     {
-        const double expected = 2.0 * (1.0 + 3.0 + (static_cast<double>(y) + 0.5) / 4.0);
+        const double expected = 2.0 * (1.0 + 3.0 + (1022.0 + static_cast<double>(y) + 0.5) / 2048.0);
         for (size_t x = 0; x < W; ++x)
             ASSERT_NEAR(out[y * W + x], expected, 1e-12) << "row " << y << ", column " << x;
     }
@@ -643,8 +715,8 @@ TEST(OneOverFNoise, PedestalDriftEvaluatedAtEachRowReadTime)
 
 TEST(OneOverFNoise, WindowedPedestalDriftUsesDetectorRows)
 {
-    // f(t) = t, frame time 1 s. A window on rows 2–3 of an 8-row detector: those
-    // rows are read at 2.5/8 s and 3.5/8 s into the frame.
+    // f(t) = t, frame time 1 s. A centred 8-row matrix covers the physical rows
+    // 1020–1027; a window on its rows 2–3 is read at (1022.5/2048) s and (1023.5/2048) s.
     nlohmann::json ped;
     ped["drift"]["poly"] = nlohmann::json::array({0.0, 1.0});
 
@@ -654,15 +726,17 @@ TEST(OneOverFNoise, WindowedPedestalDriftUsesDetectorRows)
     cfg.set("pedestal_drift", ped);
     n.initialize(cfg);
 
+    placeAtCentre(n, 128, 8);
     const auto out = n.generate(128, 8, /*c0=*/64, /*r0=*/2, /*ncols=*/32, /*nrows=*/2, /*tStart=*/0.0);
     for (size_t r = 0; r < 2; ++r)
         for (size_t c = 0; c < 32; ++c)
-            ASSERT_NEAR(out[r * 32 + c], (2.0 + static_cast<double>(r) + 0.5) / 8.0, 1e-12);
+            ASSERT_NEAR(out[r * 32 + c], (1022.0 + static_cast<double>(r) + 0.5) / 2048.0, 1e-12);
 }
 
 TEST(OneOverFNoise, StreamCountsFramesForPedestalDrift)
 {
-    // f(t) = t, frame time 2 s, H = 1: frame k of the stream is read at (k + 0.5)·2 s.
+    // f(t) = t, frame time 2 s. A centred 1-row matrix is physical row 1023:
+    // in frame k of the stream it is read at (k + 1023.5/2048)·2 s.
     nlohmann::json ped;
     ped["drift"]["poly"] = nlohmann::json::array({0.0, 1.0});
 
@@ -672,11 +746,57 @@ TEST(OneOverFNoise, StreamCountsFramesForPedestalDrift)
     cfg.set("pedestal_drift", ped);
     n.initialize(cfg);
 
+    placeAtCentre(n, 64, 1);
     auto stream = n.beginStream(64, 1);
     for (size_t k = 0; k < 5; ++k)
     {
         const auto out = stream.next();
         for (size_t x = 0; x < 64; ++x)
-            ASSERT_NEAR(out[x], (static_cast<double>(k) + 0.5) * 2.0, 1e-12) << "frame " << k;
+            ASSERT_NEAR(out[x], (static_cast<double>(k) + 1023.5 / 2048.0) * 2.0, 1e-12) << "frame " << k;
+    }
+}
+
+TEST(OneOverFNoise, SlopeIsTheSpectralIndex)
+{
+    // Lag-1 autocorrelation of the stationary series: Σ Var_k ρ_k / Σ Var_k.
+    //   slope 1 (pink): the same variance for every pole → ≈ 0.83 with 16 poles over
+    //                   a 2048 × 64 frame (it was ≈ 0.99 when slope 1 gave 1/f²);
+    //   slope 0 (variance ∝ f_k, nearly white) → ≈ 0.2.
+    // One full channel (W = 128 is two whole channels at x0 = 0), 51 200 samples.
+    auto lag1 = [](double slope)
+    {
+        OneOverFNoise n(10.0, slope, 0, 64, 16);
+        const auto out = n.generate(128, 800);
+        return lag1Autocorr(extractChannelSeries(out, 128, 800, 0, 64));
+    };
+
+    const double pink  = lag1(1.0);
+    const double white = lag1(0.0);
+    EXPECT_GT(pink,  0.6);
+    EXPECT_LT(pink,  0.93);
+    EXPECT_LT(white, 0.4);
+}
+
+TEST(OneOverFNoise, SmallMatrixStreamRunsOverPartialChannels)
+{
+    // Every component on, on a centred 100 × 16 matrix (two partial channels, rows
+    // skipped between frames): the stream must produce full-size frames with noise in them.
+    nlohmann::json bias;
+    bias["amplitude"] = 5.0;
+    PixelConfig cfg;
+    cfg.set("oneOverF", 10.0);
+    cfg.set("bias_voltage_noise", bias);
+    cfg.set("pedestal_drift", 2.0);
+
+    OneOverFNoise n;
+    n.initialize(cfg);
+
+    placeAtCentre(n, 100, 16);
+    auto stream = n.beginStream(100, 16);
+    for (size_t k = 0; k < 3; ++k)
+    {
+        const auto out = stream.next();
+        ASSERT_EQ(out.size(), 100u * 16u);
+        EXPECT_GT(rms(std::vector<double>(std::begin(out), std::end(out))), 1.0) << "frame " << k;
     }
 }

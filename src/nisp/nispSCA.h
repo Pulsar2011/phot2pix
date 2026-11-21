@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <algorithm>
+#include <string>
 
 #include <phot2pix/phot2pix.h>
 
@@ -63,8 +64,8 @@ namespace nisp
                 double dT = 0.0; ///< Elapsed time since last exposure (seconds), used as fallback when model is used outside of a scheduler context (e.g. standalone pixelArray).
 
             private:
-                parameter _factor;    ///< index → trap fraction
-                parameter _decayTime; ///< index → trap decay time (seconds)
+                parameter _factor;    ///< index → release rate f_k per stored electron (1/s); f_k·τ_k is the fraction released in total
+                parameter _decayTime; ///< index → trap decay time τ_k (seconds)
 
             public:
                 model() : phot2pix::pixsim(0.0, 0.0, 1.0, 1.0, 0.0, 0.0) {}
@@ -138,11 +139,17 @@ namespace nisp
                 std::vector<ExposureRecord>  m_fluxHistory;
                 const phot2pix::PixelConfig& m_cfg;
                 size_t                       m_threadCount{0}; ///< 0 = use pixelArray default
+                double                       m_delay{0.0};     ///< "dT": time between the end of an exposure and the start of the next (s)
 
             public:
-                explicit scheduler(const phot2pix::PixelConfig& cfg)
-                    : m_pixelModel(nullptr), m_fluxHistory(), m_cfg(cfg) {}
+                // Reads the delay between exposures from the "persistence" object form,
+                // {"traps": [...], "dT": seconds} (0 when absent). Throws
+                // std::invalid_argument if "dT" is not a number >= 0.
+                explicit scheduler(const phot2pix::PixelConfig& cfg);
                 virtual ~scheduler() = default;
+
+                // Delay between two exposures ("dT"), seconds.
+                double getDelay() const { return m_delay; }
 
                 // Limit the thread budget used by the internal pixelArray.
                 // Mirrors DetectorSimulator::setThreadCount(); pass 0 to restore the default.
@@ -155,6 +162,8 @@ namespace nisp
 
                 // Store a new exposure. t0 is the elapsed time since this exposure
                 // (0 if it just finished, positive if there was a gap before insertion).
+                // The next exposure starts getDelay() later: every stored exposure,
+                // this one included, ages by that delay.
                 void insertCharges(const std::shared_ptr<DSL::FITScube>& flux, const double& t0);
 
                 // Remove the entry whose current elapsed time matches t0.
@@ -188,10 +197,32 @@ namespace nisp
         double frameTime = 1.45408; ///< NISP HAWAII-2RG frame time (seconds)
         bool   m_enable_persistence = false;
         bool   m_enable_oneOverF = true;
+        bool   m_refPixCorr = true;       ///< DPU reference pixel correction ("refPixCorr": true/false or "ON"/"OFF"; on by default)
         nisp::mode m_mode = nisp::mode::MACC;
 
         std::shared_ptr<persistence::scheduler> persistenceModelling;
         nisp::OneOverFNoise m_oneOverFNoise;
+
+        // Physical detector and placement of this matrix on it ("detectorSize",
+        // "detectorOrigin", "refBorder"), held by the base class. The constructors install
+        // a nisp::Geometry and initialize() replaces it with a configured clone(), so the
+        // dynamic type is always nisp::Geometry.
+        const nisp::Geometry& _geometry() const
+            { return static_cast<const nisp::Geometry&>(getGeometry()); }
+
+        // ── Output header ────────────────────────────────────────────────────
+        // Record the NISP inputs as header cards (setInputCard(), see
+        // DetectorSimulator::getInputCards(); the pixel model is recorded by the base):
+        // detector geometry (DETSIZE, REFBORD), reference pixels (REFDARK), readout
+        // noise (CHANWID, OOF*, BIAS*, PED*) and persistence (PERDT, PERTRn).
+        // Called at the end of initialize().
+        void _recordInputs(const phot2pix::PixelConfig& cfg);
+
+        // Write the keywords common to every output: DPU parameters (OFFSET, SFACTOR,
+        // GAIN, RN), FRTIME, version, DETSEC (the detector section of the image section
+        // [c0, c0+ncols) × [r0, r0+nrows) of the matrix), then every input card.
+        void _writeHeader(DSL::FITScube& image, size_t c0, size_t r0, size_t ncols, size_t nrows) const;
+        void _writeHeader(DSL::FITScube& image) const { _writeHeader(image, 0, 0, getWidth(), getHeight()); }
 
         // Apply DPU scale/offset and saturate to uint16.
         // Output dimensions are read from doubleFrame->Size(1/2).
@@ -317,12 +348,54 @@ namespace nisp
                            const nisp::macc& maccParams);
 
     public:
+
+        enum refPixCorrection
+        {
+            NONE=0,
+            TOP=0x1,
+            BOTTOM=0x2,
+            LEFT=0x4,
+            RIGHT=0x8,
+            RIGHTnLEFT=LEFT|RIGHT,
+            TOPnBOTTOM=TOP|BOTTOM,
+            ALL=TOP|BOTTOM|LEFT|RIGHT,
+        };
+
+        // Reference pixel correction, Eq. 3 of arXiv:2507.11326 (from Kubik et al. 2014),
+        // for line y in [4, 2044) of output channel ch (64 columns):
+        //   c_y^(ch) = ½ (T^(ch) + B^(ch)) + ½ (L_y + R_y)
+        // T, B: median of the 4 top / bottom reference lines of the channel (without the
+        // left / right reference columns); L_y, R_y: median of the 4 left / right reference
+        // columns over lines y−4 … y+4. mode picks the terms (bitmask: TOP, BOTTOM or
+        // TOPnBOTTOM, plus LEFT, RIGHT or RIGHTnLEFT; ALL = Eq. 3).
+        //
+        // Returns c of every read k of the cube (any integer or floating point type), in its
+        // units: c[(y * 32 + ch) * nReads + k], the reads of one line and channel being
+        // contiguous. Lines 0-3 and 2044-2047 hold 0 (not corrected). Empty if mode is NONE
+        // or the image is smaller than 2048 × 2048.
+        static std::valarray<double> getReferencePixelCorrection(const std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode = refPixCorrection::ALL);
+
+        // Applies getReferencePixelCorrection() to the cube in place, e.g. to a MACC ramp from
+        // expose(). Floating point and signed cubes: v − c (Eq. 3), rounded and clamped for
+        // integer types. Unsigned cubes cannot hold the negative values Eq. 3 gives on raw
+        // reads (c ≈ 2 × baseline with ALL): they get v − (c_k − c_0), c_0 being the correction
+        // of the first read. Differences between reads, and so slopes, are those of Eq. 3; the
+        // level stays the raw one (a single-read unsigned image is therefore left unchanged).
+        // Saturated reads of unsigned cubes (the type's largest value) are left unchanged.
+        static void referencePixelsCorrection(std::shared_ptr<DSL::FITScube>& image, const refPixCorrection& mode = refPixCorrection::ALL);
+
         // ── Selectively re-exported base API ─────────────────────────────────
         using phot2pix::DetectorSimulator<nisp::pixel>::getWidth;
         using phot2pix::DetectorSimulator<nisp::pixel>::getHeight;
         using phot2pix::DetectorSimulator<nisp::pixel>::size;
         using phot2pix::DetectorSimulator<nisp::pixel>::fill;
         using phot2pix::DetectorSimulator<nisp::pixel>::initialize; // exposes string overload
+        using phot2pix::DetectorSimulator<nisp::pixel>::getInputCards; // inputs written in the output header
+        using phot2pix::DetectorSimulator<nisp::pixel>::getGeometry;   // physical detector (a nisp::Geometry)
+        using phot2pix::DetectorSimulator<nisp::pixel>::getOrigin;     // (x0, y0) of this matrix on the detector
+        using phot2pix::DetectorSimulator<nisp::pixel>::toMatrix;      // matrix- or detector-sized image → matrix values
+        using phot2pix::DetectorSimulator<nisp::pixel>::loadImage;     // FITS image named by a config key ({"file", "hdu"}, …)
+        using phot2pix::DetectorSimulator<nisp::pixel>::loadMap;       // config key (number or FITS image) → matrix values
 
         // Const-only pixel read access; non-const write access is intentionally hidden.
         const nisp::pixel& at(size_t i) const
@@ -333,8 +406,10 @@ namespace nisp
         // ── Constructors ─────────────────────────────────────────────────────
         // DOUBLE_IMG: simulate() produces electron counts in double precision;
         // expose() applies DPU scale/offset and converts to uint16 ADU.
-        SCA()                   : phot2pix::DetectorSimulator<nisp::pixel>(2048, 2048, DOUBLE_IMG) {}
-        SCA(size_t w, size_t h) : phot2pix::DetectorSimulator<nisp::pixel>(w, h, DOUBLE_IMG) {}
+        // The matrix is placed on a 2048 × 2048 HAWAII-2RG with 4 reference pixels on each
+        // side (nisp::Geometry), at detector pixel (0, 0) unless "detectorOrigin" is given.
+        SCA()                   : phot2pix::DetectorSimulator<nisp::pixel>(2048, 2048, DOUBLE_IMG, std::make_shared<nisp::Geometry>()) {}
+        SCA(size_t w, size_t h) : phot2pix::DetectorSimulator<nisp::pixel>(w, h, DOUBLE_IMG, std::make_shared<nisp::Geometry>()) {}
         virtual ~SCA() = default;
 
         // ── Configuration ─────────────────────────────────────────────────────

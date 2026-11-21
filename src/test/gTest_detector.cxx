@@ -880,7 +880,7 @@ TEST(DetectorConfig, FromFitsFile_form4)
     });
 
     const auto& cdet = det;  // bind to const to force call to const accessors
-    
+
     for (size_t i = 0; i < det.size(); ++i)
     {
         EXPECT_DOUBLE_EQ(cdet.at(i).getGain(),              static_cast<double>(i+1));
@@ -890,6 +890,106 @@ TEST(DetectorConfig, FromFitsFile_form4)
     }
 
     std::filesystem::remove_all(url+"/test_gain.fits");
+}
+
+namespace
+{
+    // Two-HDU FITS file of 4x4 images: HDU 1 (primary) holds 10, 11, …; HDU 2, EXTNAME "SECOND", holds 1, 2, …
+    std::string writeTwoHduFile(const std::string& path)
+    {
+        DSL::FITSimg<double> primary({4,4});
+        DSL::FITSimg<double> second({4,4});
+        for(size_t r=0; r<primary.Size(); ++r)
+        {
+            primary.SetPixelValue(static_cast<double>(r+10), r);
+            second .SetPixelValue(static_cast<double>(r+1),  r);
+        }
+        second.SetName("SECOND");
+
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path());
+        primary.Write(path, true);
+
+        DSL::FITSmanager file(path, false);
+        file.AppendImage(second);
+        file.Close();
+        return path;
+    }
+}
+
+// The form a JSON configuration file gives: a JSON object {"file", "hdu"} (stored as a json
+// value, not a JSON-encoded string), the HDU an index, an EXTNAME, or left out (primary HDU).
+TEST(DetectorConfig, FromFitsFile_jsonObject)
+{
+    const std::string path = writeTwoHduFile("test_data/test_two_hdu.fits");
+
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig(json{
+        {"gain",      {{"file", path}, {"hdu", 2}}},
+        {"baseline",  {{"file", path}, {"hdu", "SECOND"}}},
+        {"dark",      {{"file", path}}},
+        {"readNoise", 3.0}
+    }));
+
+    const auto& cdet = det;  // bind to const to force call to const accessors
+
+    for (size_t i = 0; i < det.size(); ++i)
+    {
+        EXPECT_DOUBLE_EQ(cdet.at(i).getGain(),        static_cast<double>(i+1));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getBaseline(),    static_cast<double>(i+1));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getDarkCurrent(), static_cast<double>(i+10));
+        EXPECT_DOUBLE_EQ(cdet.at(i).getReadNoise(),   3.0);
+    }
+
+    std::filesystem::remove(path);
+}
+
+// loadImage() / loadMap() on a key initialize() does not know, as a tool reads its input flux.
+TEST(DetectorConfig, LoadImageAndMap)
+{
+    const std::string path = writeTwoHduFile("test_data/test_two_hdu_load.fits");
+    const DetectorSimulator<> det(4, 4);
+
+    // Absent: no image, empty map.
+    EXPECT_FALSE(det.loadImage(PixelConfig{}, "flux"));
+    EXPECT_EQ(det.loadMap(PixelConfig{}, "flux").size(), 0u);
+
+    // Number: no image, uniform map.
+    const PixelConfig uniform{{"flux", 2.5}};
+    EXPECT_FALSE(det.loadImage(uniform, "flux"));
+    const std::valarray<double> flat = det.loadMap(uniform, "flux");
+    ASSERT_EQ(flat.size(), det.size());
+    EXPECT_DOUBLE_EQ(flat.min(), 2.5);
+    EXPECT_DOUBLE_EQ(flat.max(), 2.5);
+
+    // Every FITS form, with the HDU each one selects.
+    const std::vector<std::pair<PixelConfig, double>> forms{
+        {PixelConfig(json{{"flux", {{"file", path}, {"hdu", 2}}}}),        1.0},
+        {PixelConfig(json{{"flux", {{"file", path}, {"hdu", "SECOND"}}}}), 1.0},
+        {PixelConfig(json{{"flux", {{"file", path}}}}),                    10.0},
+        {PixelConfig(json{{"flux", path}}),                                10.0},
+        {PixelConfig(json{{"flux", path}, {"flux.hdu", 2}}),               1.0},
+        {PixelConfig(json{{"flux.file", path}, {"flux.hdu", "SECOND"}}),   1.0},
+    };
+    for (const auto& [cfg, first] : forms)
+    {
+        const std::shared_ptr<DSL::FITScube> image = det.loadImage(cfg, "flux");
+        ASSERT_TRUE(image) << cfg.toJson().dump();
+        EXPECT_EQ(image->Size(1), 4u);
+        EXPECT_EQ(image->Size(2), 4u);
+
+        const std::valarray<double> map = det.loadMap(cfg, "flux");
+        ASSERT_EQ(map.size(), det.size()) << cfg.toJson().dump();
+        for (size_t i = 0; i < map.size(); ++i)
+            EXPECT_DOUBLE_EQ(map[i], first + static_cast<double>(i)) << cfg.toJson().dump();
+    }
+
+    // Malformed entries.
+    EXPECT_THROW(det.loadImage(PixelConfig(json{{"flux", {{"hdu", 2}}}}), "flux"),                    std::invalid_argument);
+    EXPECT_THROW(det.loadImage(PixelConfig(json{{"flux", {{"file", path}, {"hdu", 0}}}}), "flux"),    std::invalid_argument);
+    EXPECT_THROW(det.loadImage(PixelConfig(json{{"flux", {{"file", path}, {"hdu", 2.5}}}}), "flux"),  std::invalid_argument);
+    EXPECT_THROW(det.loadImage(PixelConfig(json{{"flux", json::array({1, 2})}}), "flux"),             std::invalid_argument);
+
+    std::filesystem::remove(path);
 }
 
 TEST(DetectorConfig, CustomConfigOverride)
@@ -923,4 +1023,185 @@ TEST(DetectorConfig, CustomConfigOverride)
     const auto& cdet = det;
     for (size_t i = 0; i < det.size(); ++i)
         EXPECT_DOUBLE_EQ(cdet.at(i).getGain(), 1.5);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Geometry — physical detector, origin of the matrix, detector-sized maps
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Write a W × H double map whose pixel (x, y) holds value(x, y) to test_data/<name> and
+// return its path. CFITSIO does not overwrite: a file left by a previous run is removed first.
+template<typename F>
+static std::string writeGeometryMap(const std::string& name, size_t W, size_t H, F value)
+{
+    const std::filesystem::path dir  = "test_data";
+    const std::filesystem::path file = dir / name;
+
+    std::filesystem::create_directories(dir);
+    std::filesystem::remove(file);
+
+    DSL::FITSimg<double> map({W, H});
+    for (size_t y = 0; y < H; ++y)
+        for (size_t x = 0; x < W; ++x)
+            map.SetPixelValue(value(x, y), y * W + x);
+    map.Write(file.string());
+    return file.string();
+}
+
+TEST(DetectorGeometry, DefaultGeometryIsTheMatrix)
+{
+    DetectorSimulator<> det(8, 4);
+    EXPECT_EQ(det.getGeometry().width,  8u);
+    EXPECT_EQ(det.getGeometry().height, 4u);
+    EXPECT_EQ(det.getOrigin(), std::make_pair(size_t(0), size_t(0)));
+    EXPECT_FALSE(det.getGeometry().isReference(0, 0));
+
+    det.initialize(PixelConfig{{"gain", 1.0}});   // no geometry key: unchanged
+    EXPECT_EQ(det.getGeometry().width,  8u);
+    EXPECT_EQ(det.getGeometry().height, 4u);
+    EXPECT_EQ(det.getOrigin(), std::make_pair(size_t(0), size_t(0)));
+}
+
+TEST(DetectorGeometry, ExtractTakesTheMatrixSection)
+{
+    // 4 × 3 detector whose pixel (x, y) holds x + 4 y; 2 × 2 matrix at (1, 1).
+    Geometry g(4, 3);
+    g.origin = std::make_pair(size_t(1), size_t(1));
+
+    std::valarray<double> detectorMap(12);
+    for (size_t i = 0; i < detectorMap.size(); ++i)
+        detectorMap[i] = static_cast<double>(i);
+
+    const auto section = g.extract(detectorMap, 4, 3, 2, 2, "map");
+    ASSERT_EQ(section.size(), 4u);
+    EXPECT_DOUBLE_EQ(section[0], 5.0);    // (1, 1)
+    EXPECT_DOUBLE_EQ(section[1], 6.0);    // (2, 1)
+    EXPECT_DOUBLE_EQ(section[2], 9.0);    // (1, 2)
+    EXPECT_DOUBLE_EQ(section[3], 10.0);   // (2, 2)
+
+    const std::valarray<double> matrixMap(7.0, 4);
+    const auto asIs = g.extract(matrixMap, 2, 2, 2, 2, "map");   // matrix-sized: used as is
+    ASSERT_EQ(asIs.size(), 4u);
+    EXPECT_DOUBLE_EQ(asIs[3], 7.0);
+
+    EXPECT_THROW(g.extract(std::valarray<double>(0.0, 9), 3, 3, 2, 2, "map"), std::invalid_argument);   // neither size
+    EXPECT_THROW(g.extract(detectorMap, 3, 4, 2, 2, "map"), std::invalid_argument);   // 12 values, wrong shape
+    EXPECT_THROW(g.extract(detectorMap, 4, 2, 2, 2, "map"), std::invalid_argument);   // size and shape disagree
+}
+
+TEST(DetectorGeometry, DetectorSizedMapIsCroppedAtTheOrigin)
+{
+    // 8 × 8 gain map of an 8 × 8 detector: matrix pixel (x, y) takes map pixel (x0 + x, y0 + y).
+    auto value = [](size_t x, size_t y) { return 1.0 + static_cast<double>(x + 8 * y); };
+    const std::string path = writeGeometryMap("geometry_gain_8x8.fits", 8, 8, value);
+
+    DetectorSimulator<> det(4, 4);
+    const auto& cdet = det;   // const accessors
+
+    det.initialize(PixelConfig{{"gain", path}, {"detectorSize", nlohmann::json::array({8, 8})}});
+    for (size_t row = 0; row < 4; ++row)
+        for (size_t col = 0; col < 4; ++col)
+            ASSERT_DOUBLE_EQ(cdet.at(col, row).getGain(), value(col, row)) << "origin (0, 0), column " << col << ", row " << row;
+
+    det.initialize(PixelConfig{{"gain", path}, {"detectorOrigin", nlohmann::json::array({2, 3})}});
+    EXPECT_EQ(det.getOrigin(), std::make_pair(size_t(2), size_t(3)));
+    for (size_t row = 0; row < 4; ++row)
+        for (size_t col = 0; col < 4; ++col)
+            ASSERT_DOUBLE_EQ(cdet.at(col, row).getGain(), value(2 + col, 3 + row)) << "origin (2, 3), column " << col << ", row " << row;
+
+    std::filesystem::remove(path);
+}
+
+TEST(DetectorGeometry, MatrixSizedMapIsUsedAsIs)
+{
+    // A 4 × 4 map on a 4 × 4 matrix is in matrix coordinates, wherever the matrix is.
+    auto value = [](size_t x, size_t y) { return 1.0 + static_cast<double>(x + 4 * y); };
+    const std::string path = writeGeometryMap("geometry_gain_4x4.fits", 4, 4, value);
+
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{{"gain", path}, {"detectorSize", nlohmann::json::array({8, 8})},
+                               {"detectorOrigin", nlohmann::json::array({4, 4})}});
+
+    const auto& cdet = det;
+    for (size_t row = 0; row < 4; ++row)
+        for (size_t col = 0; col < 4; ++col)
+            ASSERT_DOUBLE_EQ(cdet.at(col, row).getGain(), value(col, row)) << "column " << col << ", row " << row;
+
+    std::filesystem::remove(path);
+}
+
+TEST(DetectorGeometry, MapOfAnotherSizeThrows)
+{
+    const std::string path = writeGeometryMap("geometry_gain_5x5.fits", 5, 5, [](size_t, size_t) { return 1.0; });
+
+    DetectorSimulator<> det(4, 4);
+    EXPECT_THROW(det.initialize(PixelConfig{{"gain", path}, {"detectorSize", nlohmann::json::array({8, 8})}}),
+                 std::invalid_argument);
+
+    std::filesystem::remove(path);
+}
+
+TEST(DetectorGeometry, MatrixThatDoesNotFitThrowsAndKeepsTheGeometry)
+{
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{{"detectorSize",   nlohmann::json::array({8, 8})},
+                               {"detectorOrigin", nlohmann::json::array({2, 2})}});
+
+    EXPECT_THROW(det.initialize(PixelConfig{{"detectorOrigin", nlohmann::json::array({6, 0})}}), std::invalid_argument);
+    EXPECT_EQ(det.getOrigin(), std::make_pair(size_t(2), size_t(2)));   // unchanged
+
+    EXPECT_THROW(det.initialize(PixelConfig{{"detectorSize", nlohmann::json::array({3, 8})}}), std::invalid_argument);
+    EXPECT_EQ(det.getGeometry().width, 8u);                              // unchanged
+
+    EXPECT_THROW(det.initialize(PixelConfig{{"detectorOrigin", nlohmann::json::array({-1, 0})}}), std::invalid_argument);
+    EXPECT_THROW(det.initialize(PixelConfig{{"detectorSize",   nlohmann::json::array({8})}}),     std::invalid_argument);
+}
+
+TEST(DetectorGeometry, DerivedGeometryIsConfiguredAndKept)
+{
+    // A detector family adds its own layout: here one reference column on the left of
+    // an 8 × 8 detector, switched off by a "refColumn" key.
+    class TestGeometry : public Geometry
+    {
+    public:
+        bool refColumn = true;
+
+        TestGeometry() : Geometry(8, 8) {}
+
+        std::shared_ptr<Geometry> clone() const override { return std::make_shared<TestGeometry>(*this); }
+
+        void configure(const PixelConfig& cfg) override
+        {
+            Geometry::configure(cfg);
+            if (cfg.has("refColumn"))
+                refColumn = cfg.getAsDouble("refColumn") != 0.0;
+        }
+
+        bool isReference(size_t px, size_t) const override { return refColumn && px == 0; }
+    };
+
+    DetectorSimulator<> det(4, 4, DOUBLE_IMG, std::make_shared<TestGeometry>());
+    EXPECT_EQ(det.getGeometry().width, 8u);   // the geometry's own detector, not the matrix size
+    EXPECT_TRUE(det.getGeometry().isReference(0, 3));
+
+    det.initialize(PixelConfig{{"refColumn", 0.0}, {"detectorOrigin", nlohmann::json::array({4, 4})}});
+
+    const auto* g = dynamic_cast<const TestGeometry*>(&det.getGeometry());
+    ASSERT_NE(g, nullptr);                    // clone() kept the derived type
+    EXPECT_FALSE(g->refColumn);               // the derived configure() was called...
+    EXPECT_FALSE(det.getGeometry().isReference(0, 3));
+    EXPECT_EQ(det.getOrigin(), std::make_pair(size_t(4), size_t(4)));   // ... and the base keys read
+}
+
+TEST(DetectorGeometry, CopiesKeepTheirOwnGeometry)
+{
+    DetectorSimulator<> det(4, 4);
+    det.initialize(PixelConfig{{"detectorSize",   nlohmann::json::array({8, 8})},
+                               {"detectorOrigin", nlohmann::json::array({2, 2})}});
+
+    const DetectorSimulator<> copy = det;
+    det.initialize(PixelConfig{{"detectorOrigin", nlohmann::json::array({4, 4})}});
+
+    EXPECT_EQ(det.getOrigin(),  std::make_pair(size_t(4), size_t(4)));
+    EXPECT_EQ(copy.getOrigin(), std::make_pair(size_t(2), size_t(2)));
 }
