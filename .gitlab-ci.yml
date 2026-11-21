@@ -78,8 +78,8 @@ build:
     - job: deps
       artifacts: true
   script:
-  - git fetch --tags --force || true
   - export DeepSkyROOT=$(pwd)/deepskyproject   # absolu
+  - git fetch --tags --force || true
   - cd phot2pix && git submodule update --init --recursive || true
   - cmake -B build -DCMAKE_THREAD_LIBS_INIT="-lpthread" -DCMAKE_USE_PTHREADS_INIT=2 && cmake --build build -j 2
   artifacts:
