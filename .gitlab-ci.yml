@@ -143,11 +143,12 @@ create-pages:
     - mkdir public
     - npm install mathjax@2
     # Configure again: the build job had no Doxygen, so its build tree has no doc target (nothing is recompiled)
-    - cmake --build --target doc
+    - cmake -B build && cmake --build build -j 64 --target doc
     - mv build/doc/html/* ./public
     - mv node_modules/mathjax ./public/mathjax
+    - ls public
   pages:
-    expire_in: 1 week
+    expire_in: 24 hrs
 
 
 sast:
