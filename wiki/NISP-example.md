@@ -25,8 +25,10 @@
 | `../phot2pix/Geometry.h` | `phot2pix::Geometry`: the physical detector, the placement of the simulated matrix on it, and the mapping of detector-sized images onto the matrix |
 | `../phot2pix/PixelSimulator.h/.cxx` | `phot2pix::pixsim`: the three stages of a pixel (reset, integration, read) |
 | `../phot2pix/DetectorSimulator.h` | `phot2pix::DetectorSimulator<PixelT>`: the pixel array, its geometry, per-pixel FITS maps, threaded simulation, and the input header cards |
+| `../phot2pix/ScenerySequencer.h/.cxx` | `phot2pix::ScenerySequencer`: a sequence of exposures on one detector ([Sequences of exposures](ScenerySequencer)) |
 | `nispPixel.h/.cxx` | `nisp::pixel`: the H2RG pixel. `nisp::Ramp`: the DPU slope estimator (group co-adding, Kubik slope, Fowler, CDS) |
-| `nispSCA.h/.cxx` | `nisp::SCA`: the detector, its readout modes, the reference pixel correction and its output header. `nisp::macc`: MACC parameters. `nisp::persistence`: the persistence model (`model`, `pixelArray`, `scheduler`) |
+| `nispSCA.h/.cxx` | `nisp::SCA`: the detector, its readout modes, the reference pixel correction and its output header. `nisp::macc`: MACC parameters. `nisp::readout`: the parameters of one exposure. `nisp::persistence`: the persistence model (`model`, `pixelArray`, `scheduler`) |
+| `nispScenerySequencer.h/.cxx` | `nisp::ScenerySequencer`: a sequence of NISP exposures, each with its own MACC parameters or exposure time and readout mode ([details](ScenerySequencer#3-the-nisp-override)) |
 | `nispGeometry.h` | `nisp::Geometry`: the H2RG layout (2048 × 2048, reference border), derived from `phot2pix::Geometry` |
 | `nispOneOverFNoise.h/.cxx` | `nisp::OneOverFNoise`: readout noise of the output channels (1/f noise per channel, bias voltage noise common to all channels, pedestal drift) and its continuous `Stream` over a ramp |
 | `../utilities/nispSimulator.cxx` | Command-line tool driven by a JSON file |
@@ -480,7 +482,7 @@ These keys are read by the tool, not by the library; a program using `nisp::SCA`
 | Key | Unit | Default | Meaning |
 |---|---|---|---|
 | `width`, `height` | pix | 2048, 2048 | Size W × H of the simulated matrix, placed on the physical detector by `detectorOrigin` ([§4.3](#43-physical-detector-and-reference-pixels)). Smaller matrices are faster and keep the physics of the part of the detector they cover |
-| `flux` | ph s⁻¹ pix⁻¹ | 0 (dark exposure) | Photons reaching each pixel, before QE. A number: uniform flux. A FITS image, in the forms of a per-pixel map ([§4.4](#44-pixel-model)): `"flux": "sky.fits"` (primary HDU), `"flux": {"file": "sky.fits", "hdu": 2}` or `{"file": "sky.fits", "hdu": "DET22.ZOD"}` (HDU index, 1 = primary, or EXTNAME), or `"flux": "sky.fits", "flux.hdu": 2`. The image is either W × H or detector-sized (then cropped at `detectorOrigin`; `FLUXSEC` in the header gives the section) |
+| `flux` | ph s⁻¹ pix⁻¹ | 0 (dark exposure) | Photons reaching each pixel, before QE. A number: uniform flux. A FITS image, in the forms of a per-pixel map ([§4.4](#44-pixel-model)): `"flux": "sky.fits"` (primary HDU), `"flux": {"file": "sky.fits", "hdu": 2}` or `{"file": "sky.fits", "hdu": "DET22.ZOD"}` (HDU index, 1 = primary, or EXTNAME), or `"flux": "sky.fits", "flux.hdu": 2`. The image is either W × H or detector-sized (then cropped at `detectorOrigin`; `FLUXSEC` in the header gives the section). An array: a sequence of exposures, each with its own flux, timing and output ([Sequences of exposures](ScenerySequencer#1-a-sequence-in-the-configuration)) |
 | `macc` | — | — | Readout pattern `[ng, nr, nd]` ([§4.5](#45-readout-modes-and-timing)), or the three keys `ng`, `nr`, `nd` (not both) |
 | `exposureTime` | s | — | Duration instead of a pattern: a UTR ramp of ⌊T/t_f⌋ reads in MACC, UTR and DPU; the time between reset and read in CDS and FLUX. Wins over `macc` if both are given (with a warning) |
 | `benchmark` | — | 0 | Run the exposure N times and print timing statistics |
@@ -843,7 +845,7 @@ nispSimulator -o exposure.fits -d 1 my_config.json
 
 | Option | Effect |
 |---|---|
-| `-o <file>` | Output FITS file. Without it, the simulation runs but nothing is written (a warning is printed) |
+| `-o <file>` | Output FITS file. Without it, the simulation runs but nothing is written (a warning is printed). With a sequence (`"flux"` array): the directory the outputs are written to ([details](ScenerySequencer#5-nispsimulator-with-a-sequence)) |
 | `-d <level>` | 0: warnings only; 1: run summary (matrix and its origin, mode, flux); 2: parameters, flux statistics, timings; 3+: full configuration dump |
 
 The tool reads `width`, `height`, `flux`, `macc` or `exposureTime`, and `benchmark` ([§4.2](#42-matrix-flux-and-readout-pattern-nispsimulator)), passes the whole configuration to `SCA::initialize()`, reads a flux image with `SCA::loadImage()` (the file and HDU, as for a per-pixel map) and maps it onto the matrix with `SCA::toMatrix()` (matrix-sized, or detector-sized cropped at `detectorOrigin`), and adds `FLUX` and `FLUXSEC` to the output header.

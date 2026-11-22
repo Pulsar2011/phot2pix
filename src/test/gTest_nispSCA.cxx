@@ -9,7 +9,8 @@
 // Crescendo test suite for nisp::SCA: (a) construction/initialize basics,
 // (b) a single small-detector MACC exposure with statistical noise-budget
 // checks, (c) persistence, (d) 1/f noise, (e) all three combined as a smoke
-// test, (f) a full 2048x2048 exposure timed for a CPU-cost sanity check.
+// test, (f) a full 2048x2048 exposure timed for a CPU-cost sanity check,
+// (g) per-exposure parameters (nisp::readout, expose(flux, readout)).
 //
 // Most tests use the default MACC mode. The readout modes (selected with
 // "exposureMode") are validated on a full detector in gTest_nispReadoutModes.cxx;
@@ -963,4 +964,71 @@ TEST(SCA, FullDetectorMaccExposureCorrectSize)
     EXPECT_EQ(result->Size(1), 2048u);
     EXPECT_EQ(result->Size(2), 2048u);
     EXPECT_EQ(result->GetEqBitPerPixel(), USHORT_IMG);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  (g) Exposure parameters: readout::fromConfig() and expose(flux, readout)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+TEST(SCA, ReadoutFromConfigReadsOneTimingAndTheMode)
+{
+    const nisp::readout t = nisp::readout::fromConfig(PixelConfig{{"exposureTime", 10.0}});
+    EXPECT_FALSE(t.maccParams);
+    EXPECT_FALSE(t.exposureMode);
+    EXPECT_DOUBLE_EQ(t.exposureTime, 10.0);
+
+    const nisp::readout m = nisp::readout::fromConfig(PixelConfig{
+        {"macc", nlohmann::json::array({3, 2, 1})}, {"exposureMode", std::string("cds")}});
+    ASSERT_TRUE(m.maccParams);
+    EXPECT_EQ(m.maccParams->nGroups, 3u);
+    EXPECT_EQ(m.maccParams->nFrames, 2u);
+    EXPECT_EQ(m.maccParams->nDrop,   1u);
+    ASSERT_TRUE(m.exposureMode);
+    EXPECT_EQ(*m.exposureMode, nisp::mode::CDS);   // case-insensitive
+
+    const nisp::readout k = nisp::readout::fromConfig(PixelConfig{{"ng", 4}, {"nr", 16}, {"nd", 4}});
+    ASSERT_TRUE(k.maccParams);
+    EXPECT_EQ(k.maccParams->nGroups, 4u);
+
+    const std::vector<PixelConfig> bad{
+        PixelConfig{},                                                                    // no timing
+        PixelConfig{{"exposureTime", 10.0}, {"macc", nlohmann::json::array({3, 2, 1})}},  // two timings
+        PixelConfig{{"exposureTime", 0.0}},
+        PixelConfig{{"exposureTime", -1.0}},
+        PixelConfig{{"exposureTime", std::string("10")}},
+        PixelConfig{{"exposureTime", 10.0}, {"exposureMode", std::string("FOO")}},
+        PixelConfig{{"exposureTime", 10.0}, {"exposureMode", 3.0}},
+    };
+    for (const PixelConfig& cfg : bad)
+        EXPECT_THROW(nisp::readout::fromConfig(cfg), std::invalid_argument) << cfg.toJson().dump();
+}
+
+TEST(SCA, ExposeWithReadoutUsesItsModeForThatExposureOnly)
+{
+    nisp::SCA sca(16, 16);
+    sca.initialize(makeQuietPixelCfg());   // MACC mode, frame time 1.45408 s
+    const auto flux = makeUniformFlux(16, 16, 10.0);
+
+    // Same shapes as the expose() overloads it calls.
+    const auto ramp = sca.expose(flux, nisp::readout{std::nullopt, nisp::macc{3, 2, 1}, 0.0});
+    ASSERT_NE(ramp, nullptr);
+    EXPECT_EQ(ramp->HDU().GetValueForKey("MODE"), "MACC");
+    EXPECT_EQ(ramp->Size(3), 6u);   // every read is a layer: nGroups × nFrames
+
+    const auto single = sca.expose(flux, nisp::readout{nisp::mode::FLUX, std::nullopt, 10.0});
+    ASSERT_NE(single, nullptr);
+    EXPECT_EQ(single->HDU().GetValueForKey("MODE"), "FLUX");
+
+    // The SCA is back in MACC mode, also after an exposure that throws (CDS needs >= 2 frames).
+    auto expectMacc = [&sca, &flux]()
+    {
+        const auto next = sca.expose(flux, nisp::macc{2, 1, 0});
+        ASSERT_NE(next, nullptr);
+        EXPECT_EQ(next->HDU().GetValueForKey("MODE"), "MACC");
+        EXPECT_EQ(next->Size(3), 2u);
+    };
+    expectMacc();
+
+    EXPECT_THROW(sca.expose(flux, nisp::readout{nisp::mode::CDS, std::nullopt, 0.5}), std::invalid_argument);
+    expectMacc();
 }

@@ -177,9 +177,24 @@ std::shared_ptr<DSL::FITScube> patch = det.simulate(windowFlux, 100.0, 100, 200,
 
 **Geometry**: the matrix is a part of a physical detector (`phot2pix::Geometry`, `Geometry.h`). `detectorSize` (`[width, height]`, default: the matrix size) and `detectorOrigin` (`[x0, y0]`, default `[0, 0]`) place it: matrix pixel (x, y) is detector pixel (x0 + x, y0 + y). A FITS map is either matrix-sized (used as is) or detector-sized (the section `[x0, x0+W) × [y0, y0+H)` is used), so a full-detector calibration map can drive the simulation of any part of the detector. `getOrigin()` and `toMatrix(image)` give the placement and apply the same rule to any image (e.g. a flux map). A detector family derives from `Geometry` (overriding `configure()`, `isReference()` and `clone()`) to add its own layout, and passes it to the constructor: `DetectorSimulator<PixelT>(W, H, DOUBLE_IMG, std::make_shared<MyGeometry>())`. `nisp::SCA` does this with `nisp::Geometry` (2048 × 2048 HAWAII-2RG, 4 reference pixels on each side, `refBorder`).
 
-### `ScenerySequencer` — (planned)
+### `ScenerySequencer` — sequence of exposures
 
-`ScenerySequencer` will own the time loop for multi-exposure sequences, handling static scenes, variable sources, and moving objects with windowed re-simulation for efficiency. It is currently a placeholder pending the sky/scene object model design.
+`ScenerySequencer` reads a sequence of exposures from a `"flux"` array and simulates them in order on one detector:
+
+```json
+"flux": [ {"file": "scene1.fits", "hdu": "DET13.SCI", "exposureTime": 100.0, "output": "exp1.fits"},
+          {"file": "scene2.fits", "exposureTime": 50.0} ]
+```
+
+`file` is the flux image (matrix- or detector-sized, see Geometry), `hdu` an HDU index (1 = primary, the default) or an EXTNAME; `"flux": <ph/s/pixel>` gives a uniform flux instead of `file` (e.g. `0` for a dark); `exposureTime` the exposure time in seconds. An exposure with an `output` is written to that file as soon as it is simulated, with the cards `FLUX`, `SEQIDX` and `SEQNUM`; one without `output` is simulated but not saved (it still counts for persistence). `setOutputDirectory(dir)` puts the relative outputs into `dir` (created if missing); `nispSimulator` uses its `-o` option as that directory. Every entry is checked by `initialize(cfg)` before the first exposure.
+
+```cpp
+phot2pix::ScenerySequencer seq;
+seq.initialize(cfg);
+seq.run(det);            // det: a DetectorSimulator<PixelT>, simulate(flux, exposureTime) per exposure
+```
+
+A detector family derives from it to accept its own keys (`_checkExposure()`) and adds a `run()` for its detector. `nisp::ScenerySequencer` accepts `"macc": [ng, nr, nd]` (or `ng`, `nr`, `nd`) instead of `exposureTime`, and an `exposureMode` per exposure; its `run(sca)` calls `SCA::expose()`. Sky generation, variable sources and moving objects (windowed re-simulation) are planned.
 
 ---
 
@@ -416,6 +431,8 @@ Test sources live in `src/test/`:
 | `gTest_pixels.cxx` | `pixsim` response, setters, copy semantics |
 | `gTest_detector.cxx` | `DetectorSimulator` geometry, initialisation, simulate |
 | `gTest_persistence.cxx` | `nisp::persistence` model and scheduler |
+| `gTest_scenerySequencer.cxx` | `ScenerySequencer`: the `flux` array, run and outputs |
+| `gTest_nispScenerySequencer.cxx` | `nisp::ScenerySequencer`: MACC / exposureMode per exposure |
 
 ---
 
@@ -430,11 +447,12 @@ phot2pix/
 │   │   ├── PixelSimulator.h/.cxx  ← pixsim base class
 │   │   ├── Geometry.h             ← physical detector, matrix placement, map cropping
 │   │   ├── DetectorSimulator.h    ← DetectorSimulator<PixelT> template
-│   │   └── ScenerySequencer.h     ← (planned) multi-exposure time loop
+│   │   └── ScenerySequencer.h/.cxx ← sequence of exposures ("flux" array)
 │   ├── nisp/                      ← Euclid/NISP instrument example
 │   │   ├── nispPixel.h/.cxx       ← nisp::pixel
 │   │   ├── nispGeometry.h         ← nisp::Geometry (H2RG, reference pixels)
-│   │   └── nispSCA.h/.cxx         ← nisp::SCA + persistence model
+│   │   ├── nispSCA.h/.cxx         ← nisp::SCA + persistence model
+│   │   └── nispScenerySequencer.h/.cxx ← nisp::ScenerySequencer (MACC, exposureMode per exposure)
 │   └── test/                      ← GoogleTest suite
 ├── googletest/                    ← git submodule
 └── cmake/

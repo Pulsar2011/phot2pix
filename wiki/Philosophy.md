@@ -14,7 +14,7 @@ A detector simulation mixes very different things: the physics of one pixel, the
 | **Pixel** | `pixsim` and subclasses | The physics of **one** pixel: reset, charge collection, read | Neighbouring pixels, time sequences, readout patterns |
 | **Detector** | `DetectorSimulator<PixelT>` | The pixel array, per-pixel maps, multi-threading, FITS output, effects that couple pixels | Readout patterns |
 | **Instrument** | e.g. `nisp::SCA` | The readout modes, electronics noise, onboard processing, output headers | — |
-| **Scene** *(planned)* | `ScenerySequencer` | The time loop over exposures, variable and moving sources | — |
+| **Scene** | `ScenerySequencer` | The sequence of exposures (`"flux"` array, see [Sequences of exposures](ScenerySequencer)); later the sky, variable and moving sources | — |
 
 The core (`src/phot2pix/`) contains the first three layers and is **instrument-agnostic**. An instrument lives in its own directory, as `src/nisp/` does, and builds on the core by inheritance.
 
@@ -116,6 +116,7 @@ Two rules:
 | Add configuration keys | `initialize(cfg)`, calling the base first | NISP: `exposureMode`, `frame_time`, `oneOverF`… |
 | Record the inputs in the output header | `setInputCard()` in `initialize()` (`PixelConfig::card(key)` gives a key's value or map file name), then `writeInputCards()` on the output. The base already records the six pixel parameters (`PIXGAIN`, `PIXDARK`, …) | NISP: readout noise, persistence, reference pixels |
 | Add a readout pattern | An instrument class that sequences the stages | NISP: MACC, UTR, CDS, DPU |
+| Simulate a sequence of exposures on your instrument | A `ScenerySequencer` subclass: `_checkExposure()` for the keys of one exposure, and a `run()` that calls your detector's exposure function ([details](ScenerySequencer#4-building-your-own-sequencer)) | NISP: `macc` and `exposureMode` per exposure, `run(SCA&)` |
 
 ### Example: a pixel hit by cosmic rays
 

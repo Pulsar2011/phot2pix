@@ -23,6 +23,7 @@ An instrument is added by **inheriting** from the core and **composing** its bui
 
 - **[Philosophy](Philosophy)**: how phot2pix is organised and why: the four layers, the *reset → integrate → read* pixel model, units, configuration, how to extend the library, and how it is tested.
 - **[NISP example](NISP-example)**: the Euclid/NISP H2RG simulator in detail: architecture and pipeline, model equations, a configuration reference giving the physical meaning and unit of every parameter, readout modes (MACC, UTR, CDS, FLUX, DPU), readout noise, reference pixels and their correction, persistence, the output header, the `nispSimulator` command-line tool and its validation.
+- **[Sequences of exposures](ScenerySequencer)**: `ScenerySequencer`, a series of exposures on one detector (persistence carries over), how to derive it for an instrument, with the NISP override as the example, and the scene generators still to be written.
 
 For build instructions and dependencies, see the `README.md` at the root of the repository.
 

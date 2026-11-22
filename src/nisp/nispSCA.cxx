@@ -88,6 +88,64 @@ namespace nisp
     }
 #pragma endregion
 
+// ── Readout mode and exposure parameters ──────────────────────────────────────
+#pragma region - readout
+    mode modeFromString(const std::string& name)
+    {
+        std::string key = name;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+        if      (key == "MACC") return mode::MACC;
+        else if (key == "UTR")  return mode::UTR;
+        else if (key == "CDS")  return mode::CDS;
+        else if (key == "DPU")  return mode::DPU;
+        else if (key == "FLUX") return mode::FLUX;
+
+        throw std::invalid_argument("unknown exposureMode '" + name + "' (expected MACC, UTR, CDS, DPU or FLUX).");
+    }
+
+    readout readout::fromConfig(const phot2pix::PixelConfig& cfg)
+    {
+        const bool hasTime = cfg.has("exposureTime");
+        const bool hasMacc = macc::inConfig(cfg);
+
+        if (hasTime && hasMacc)
+            throw std::invalid_argument("readout::fromConfig: give either 'exposureTime' or the MACC parameters "
+                                        "('macc'=[ng,nr,nd] or 'ng','nr','nd'), not both.");
+        if (!hasTime && !hasMacc)
+            throw std::invalid_argument("readout::fromConfig: no 'exposureTime' or MACC parameters "
+                                        "('macc'=[ng,nr,nd] or 'ng','nr','nd').");
+
+        readout r;
+
+        if (cfg.has("exposureMode"))
+        {
+            std::string name;
+            try                                    { name = cfg.get<std::string>("exposureMode"); }
+            catch (const std::bad_variant_access&) { throw std::invalid_argument("readout::fromConfig: 'exposureMode' must be "
+                                                                                 "MACC, UTR, CDS, DPU or FLUX."); }
+            r.exposureMode = modeFromString(name);
+        }
+
+        if (hasMacc)
+            r.maccParams = macc::fromConfig(cfg);
+        else
+        {
+            // getAsDouble() throws std::invalid_argument for a string and json::type_error for
+            // a JSON array or object.
+            double t = -1.0;
+            try                          { t = cfg.getAsDouble("exposureTime"); }
+            catch (const std::exception&) {}
+            if (!(t > 0.0))
+                throw std::invalid_argument("readout::fromConfig: 'exposureTime' must be a number of seconds > 0.");
+            r.exposureTime = t;
+        }
+
+        return r;
+    }
+#pragma endregion
+
     namespace persistence
     {
 
@@ -593,19 +651,8 @@ namespace nisp
 
         if (cfg.has("exposureMode"))
         {
-            const std::string modeName = cfg.get<std::string>("exposureMode");
-            std::string key = modeName;
-            std::transform(key.begin(), key.end(), key.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-
-            if      (key == "MACC") m_mode = nisp::mode::MACC;
-            else if (key == "UTR")  m_mode = nisp::mode::UTR;
-            else if (key == "CDS")  m_mode = nisp::mode::CDS;
-            else if (key == "DPU")  m_mode = nisp::mode::DPU;
-            else if (key == "FLUX") m_mode = nisp::mode::FLUX;
-            else
-                throw std::invalid_argument("SCA::initialize: unknown exposureMode '" + modeName +
-                                            "' (expected MACC, UTR, CDS, DPU or FLUX).");
+            try                                     { m_mode = modeFromString(cfg.get<std::string>("exposureMode")); }
+            catch (const std::invalid_argument& err) { throw std::invalid_argument(std::string("SCA::initialize: ") + err.what()); }
         }
 
         // Reference pixel correction of the DPU mode (Eq. 3, mode ALL): on by default.
@@ -854,11 +901,33 @@ namespace nisp
 
             case mode::CDS:
                 return expose_cds(fullFlux, exposureTime);
-            
+
             default:
                 return expose_flux(fullFlux, exposureTime);
                 break;
         }
+    }
+
+    std::shared_ptr<DSL::FITScube> SCA::expose(const std::valarray<double>& fullFlux, const nisp::readout& r)
+    {
+        // The mode of r is for this exposure only.
+        const nisp::mode scaMode = m_mode;
+        if (r.exposureMode)
+            m_mode = *r.exposureMode;
+
+        std::shared_ptr<DSL::FITScube> result;
+        try
+        {
+            result = r.maccParams ? expose(fullFlux, *r.maccParams) : expose(fullFlux, r.exposureTime);
+        }
+        catch (...)
+        {
+            m_mode = scaMode;
+            throw;
+        }
+
+        m_mode = scaMode;
+        return result;
     }
 
     std::shared_ptr<DSL::FITScube> SCA::expose_macc(const std::valarray<double>& fullFlux, const nisp::macc& maccParams)

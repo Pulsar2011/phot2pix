@@ -16,6 +16,7 @@
 #include <map>
 #include <memory>
 #include <algorithm>
+#include <optional>
 #include <string>
 
 #include <phot2pix/phot2pix.h>
@@ -49,6 +50,24 @@ namespace nisp
         /// Throws std::invalid_argument if absent, if both forms are given, or if a
         /// value is not a non-negative integer (ng and nr must be >= 1).
         static macc fromConfig(const phot2pix::PixelConfig& cfg);
+    };
+
+    /// Readout mode named by an "exposureMode" value, case-insensitive: "MACC", "UTR", "CDS",
+    /// "DPU" or "FLUX". Throws std::invalid_argument for any other name.
+    mode modeFromString(const std::string& name);
+
+    /// Parameters of one exposure (see SCA::expose(fullFlux, readout)): its timing, given either
+    /// as an exposure time or as MACC parameters, and the readout mode it uses, if not the SCA's.
+    struct readout
+    {
+        std::optional<nisp::mode> exposureMode;        ///< "exposureMode"; empty → the SCA's mode
+        std::optional<macc>       maccParams;          ///< "macc"=[ng,nr,nd] or "ng","nr","nd"
+        double                    exposureTime = 0.0;  ///< "exposureTime" (s), used when maccParams is empty
+
+        /// Read from cfg: exactly one timing, "exposureTime" (s, > 0) or MACC parameters (see
+        /// macc::fromConfig()), and an optional "exposureMode" (see modeFromString()).
+        /// Throws std::invalid_argument if both timings or neither are given, or a value is invalid.
+        static readout fromConfig(const phot2pix::PixelConfig& cfg);
     };
 
 // ── Persistence model ─────────────────────────────────────────────────────────
@@ -434,6 +453,13 @@ namespace nisp
         std::shared_ptr<DSL::FITScube> expose(
             const std::valarray<double>& fullFlux,
             const double& exposureTime);
+
+        // Exposure with its own parameters (see readout::fromConfig()): expose(fullFlux, macc)
+        // or expose(fullFlux, exposureTime), in the readout mode of r if it gives one. That mode
+        // is used for this exposure only: the SCA's mode is restored afterwards.
+        std::shared_ptr<DSL::FITScube> expose(
+            const std::valarray<double>& fullFlux,
+            const nisp::readout& r);
     };
 
 #pragma endregion

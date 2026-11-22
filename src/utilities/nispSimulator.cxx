@@ -7,6 +7,7 @@
 //
 
 #include <nisp/nispSCA.h>
+#include <nisp/nispScenerySequencer.h>
 #include <phot2pix/phot2pix.h>
 #include <DSTCore/OptionManager.h>
 
@@ -129,13 +130,17 @@ int main(int argc, char **argv)
             default: DSL::verbose = DSL::verboseLevel::VERBOSE_ALL;    break;
         }
 
-        // Warn early, before a possibly long simulation.
         const std::string outputFile = fOPT.GetOutput();
-        if(outputFile.empty())
-            std::cerr << kWarnTag << "No output file given (-o/--output): the simulated exposure will NOT be written." << std::endl;
-
         const std::string cfgFile = fOPT.GetFiles()[0];
         phot2pix::PixelConfig cfg(cfgFile);
+
+        // A "flux" array is a sequence of exposures, each with its own timing and "output"
+        // (see phot2pix::ScenerySequencer); otherwise a single exposure written to -o.
+        const bool sequence = phot2pix::ScenerySequencer::inConfig(cfg);
+
+        // Warn early, before a possibly long simulation.
+        if(!sequence && outputFile.empty())
+            std::cerr << kWarnTag << "No output file given (-o/--output): the simulated exposure will NOT be written." << std::endl;
 
         // JSON view of the configuration, used only for printing values.
         const phot2pix::json cfgJson = cfg.toJson();
@@ -194,6 +199,60 @@ int main(int argc, char **argv)
                 if(cfg.has(key))
                     std::cout << kDebugTag << std::left << std::setw(15) << key << ": " << show(key) << std::endl;
             std::cout << kDebugTag << "SCA setup      : " << tSetup << " s" << std::endl;
+        }
+
+        // ── Sequence of exposures ("flux" array) ─────────────────────────────
+        if(sequence)
+        {
+            if(cfg.has("exposureTime") || nisp::macc::inConfig(cfg))
+                std::cerr << kWarnTag << "\"flux\" is an array: the top-level exposureTime / MACC parameters are ignored, "
+                                         "each exposure gives its own." << std::endl;
+            if(nRuns > 0)
+                std::cerr << kWarnTag << "\"benchmark\" is ignored for a sequence of exposures." << std::endl;
+
+            nisp::ScenerySequencer sequencer;
+            sequencer.initialize(cfg);   // checks every exposure before the first one is simulated
+
+            // -o is the directory of the outputs: each exposure's "output" is written into it.
+            if(!outputFile.empty())
+                sequencer.setOutputDirectory(outputFile);
+
+            const auto& exposures = sequencer.getExposures();
+            if(std::none_of(exposures.begin(), exposures.end(), [](const auto& e) { return !e.output.empty(); }))
+                std::cerr << kWarnTag << "No exposure of the \"flux\" array has an \"output\": nothing will be written." << std::endl;
+
+            if(dbg >= 1)
+            {
+                std::cout << kInfoTag << "sequence       : " << exposures.size() << " exposure(s)" << std::endl
+                          << kInfoTag << "output dir     : " << (outputFile.empty() ? std::string("current directory") : outputFile) << std::endl;
+                for(const auto& e : exposures)
+                {
+                    const nisp::readout r = nisp::readout::fromConfig(e.cfg);
+                    const std::string timing = r.maccParams
+                        ? "MACC(" + std::to_string(r.maccParams->nGroups) + "," + std::to_string(r.maccParams->nFrames) +
+                          "," + std::to_string(r.maccParams->nDrop) + ")"
+                        : "exposureTime = " + std::to_string(r.exposureTime) + " s";
+                    const std::string mode = e.cfg.has("exposureMode") ? e.cfg.get<std::string>("exposureMode")
+                                                                       : show("exposureMode");
+                    const phot2pix::CardValue fluxCard = *e.cfg.card("flux");   // "file.fits[hdu]" or a uniform value
+                    const std::string fluxText = std::holds_alternative<std::string>(fluxCard)
+                        ? std::get<std::string>(fluxCard)
+                        : "uniform " + std::to_string(e.cfg.getAsDouble("flux")) + " ph/s/pixel";
+                    std::cout << kInfoTag << "  " << e.index + 1 << "/" << exposures.size()
+                              << "  flux " << fluxText
+                              << ", mode " << mode << ", " << timing
+                              << " → " << (e.output.empty() ? std::string("not saved") : sequencer.outputPath(e)) << std::endl;
+                }
+                std::cout << kInfoTag << "simulating..." << std::endl;
+            }
+
+            tStep = Clock::now();
+            sequencer.run(sca);
+
+            if(dbg >= 1)
+                std::cout << kInfoTag << "sequence       : " << secondsSince(tStep) << " s" << std::endl
+                          << kInfoTag << "total          : " << secondsSince(tStart) << " s" << std::endl;
+            return EXIT_SUCCESS;
         }
 
         // Flux (photons/s/pixel), read by the SCA as a per-pixel parameter (see
