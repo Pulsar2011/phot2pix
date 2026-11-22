@@ -17,7 +17,11 @@
 #include <vector>
 #include <span>
 #include <ranges>
-#include <mdspan>
+#include <version>      // __cpp_lib_mdspan: defined when the standard library has std::mdspan
+#if defined(__cpp_lib_mdspan)
+#include <mdspan>       // C++23; libstdc++ provides it from GCC 15 on (see StridedView below)
+#endif
+#include <type_traits>
 #include <array>
 #include <stdexcept>
 #include <string>
@@ -34,6 +38,80 @@ namespace phot2pix
         for (const auto& c : cards)
             std::visit([&image, &c](const auto& v) { image.HDU().ValueForKey(c.key, v, c.comment); }, c.value);
     }
+
+#pragma region - StridedView: std::mdspan, or a fallback without <mdspan>
+    // View of Rank dimensions on a flat array, with a stride per dimension: the columns and
+    // windows of the pixel array (DetectorSimulator::Col(), window()). Built by makeStridedView().
+    // This StridedView as been designed by CLAUDE OPUS 5.5 in order to make the code compatible with C++23 and C++20. It is a fallback for the standard libraries without <mdspan> (libstdc++ before GCC 15, used by clang on Linux as well): the part of std::mdspan<T, std::dextents<size_t, Rank>, std::layout_stride> listed below, under the same names. Code that keeps to these members compiles with either.
+#if defined(__cpp_lib_mdspan)
+    template<typename T, size_t Rank>
+    using StridedView = std::mdspan<T, std::dextents<size_t, Rank>, std::layout_stride>;
+
+    template<typename T, size_t Rank>
+    StridedView<T, Rank> makeStridedView(T* data, const std::array<size_t, Rank>& extents,
+                                         const std::array<size_t, Rank>& strides)
+    {
+        using ext_t = std::dextents<size_t, Rank>;
+        return StridedView<T, Rank>(data, std::layout_stride::mapping<ext_t>(ext_t(extents), strides));
+    }
+#else
+    // Fallback for the standard libraries without <mdspan> (libstdc++ before GCC 15, used by
+    // clang on Linux as well): the part of std::mdspan<T, std::dextents<size_t, Rank>,
+    // std::layout_stride> listed below, under the same names. Code that keeps to these members
+    // compiles with either.
+    template<typename T, size_t Rank>
+    class StridedView
+    {
+    public:
+        using element_type     = T;
+        using value_type       = std::remove_cv_t<T>;
+        using index_type       = size_t;
+        using size_type        = size_t;
+        using data_handle_type = T*;
+        using reference        = T&;
+
+        StridedView(T* data, const std::array<size_t, Rank>& extents, const std::array<size_t, Rank>& strides)
+            : m_data(data), m_extents(extents), m_strides(strides) {}
+
+        static constexpr size_t rank() noexcept { return Rank; }
+        size_t extent(size_t r) const noexcept { return m_extents[r]; }
+        size_t stride(size_t r) const noexcept { return m_strides[r]; }
+        T*     data_handle()    const noexcept { return m_data; }
+
+        size_t size() const noexcept
+        {
+            size_t n = 1;
+            for (size_t e : m_extents) n *= e;
+            return n;
+        }
+        bool empty() const noexcept { return size() == 0; }
+
+        // view[i] (rank 1), view[row, col] (rank 2): one index per dimension, no bounds check.
+        template<typename... I>
+            requires (sizeof...(I) == Rank && (std::is_convertible_v<I, size_t> && ...))
+        T& operator[](I... indices) const
+        {
+            const std::array<size_t, Rank> idx{ static_cast<size_t>(indices)... };
+            size_t offset = 0;
+            for (size_t r = 0; r < Rank; ++r)
+                offset += idx[r] * m_strides[r];
+            return m_data[offset];
+        }
+
+    private:
+        T*                       m_data;
+        std::array<size_t, Rank> m_extents;
+        std::array<size_t, Rank> m_strides;
+    };
+
+    template<typename T, size_t Rank>
+    StridedView<T, Rank> makeStridedView(T* data, const std::array<size_t, Rank>& extents,
+                                         const std::array<size_t, Rank>& strides)
+    {
+        return StridedView<T, Rank>(data, extents, strides);
+    }
+#endif
+#pragma endregion
 
 #pragma region - DetectorSimulator class definition
     template<typename PixelT = pixsim>
@@ -295,24 +373,15 @@ namespace phot2pix
             return { m_pixels.data() + row * m_width, m_width };
         }
 
-        auto Col(size_t col)
+        StridedView<PixelT, 1> Col(size_t col)
         {
-            using ext_t = std::dextents<size_t, 1>;
-            std::array<size_t, 1> strides = { m_width };
-            return std::mdspan<PixelT, ext_t, std::layout_stride>(
-                m_pixels.data() + col,
-                std::layout_stride::mapping<ext_t>{ ext_t{m_height}, strides }
-            );
+            return makeStridedView<PixelT, 1>(m_pixels.data() + col, { m_height }, { m_width });
         }
 
-        auto window(size_t c0, size_t r0, size_t ncols, size_t nrows)
+        StridedView<PixelT, 2> window(size_t c0, size_t r0, size_t ncols, size_t nrows)
         {
-            using ext_t = std::dextents<size_t, 2>;
-            std::array<size_t, 2> strides = { m_width, 1 };
-            return std::mdspan<PixelT, ext_t, std::layout_stride>(
-                m_pixels.data() + r0 * m_width + c0,
-                std::layout_stride::mapping<ext_t>{ ext_t{nrows, ncols}, strides }
-            );
+            return makeStridedView<PixelT, 2>(m_pixels.data() + r0 * m_width + c0,
+                                              { nrows, ncols }, { m_width, 1 });
         }
 
         // ── Virtual physics hooks ────────────────────────────────────────────
@@ -642,20 +711,15 @@ namespace phot2pix
             return { m_pixels.data() + row * m_width, m_width };
         }
 
-        auto Col(size_t col) const
+        StridedView<const PixelT, 1> Col(size_t col) const
         {
-            using ext_t = std::dextents<size_t, 1>;
-            std::array<size_t, 1> strides = { m_width };
-            return std::mdspan<const PixelT, ext_t, std::layout_stride>(m_pixels.data() + col,
-                                                                        std::layout_stride::mapping<ext_t>{ ext_t{m_height}, strides });
+            return makeStridedView<const PixelT, 1>(m_pixels.data() + col, { m_height }, { m_width });
         }
 
-        auto window(size_t c0, size_t r0, size_t ncols, size_t nrows) const
+        StridedView<const PixelT, 2> window(size_t c0, size_t r0, size_t ncols, size_t nrows) const
         {
-            using ext_t = std::dextents<size_t, 2>;
-            std::array<size_t, 2> strides = { m_width, 1 };
-            return std::mdspan<const PixelT, ext_t, std::layout_stride>(m_pixels.data() + r0 * m_width + c0,
-                                                                        std::layout_stride::mapping<ext_t>{ ext_t{nrows, ncols}, strides });
+            return makeStridedView<const PixelT, 2>(m_pixels.data() + r0 * m_width + c0,
+                                                    { nrows, ncols }, { m_width, 1 });
         }
 #pragma endregion
 
