@@ -6,6 +6,8 @@
 //
 // DetectorSimulator.h
 //
+/// @file DetectorSimulator.h
+/// @brief phot2pix::DetectorSimulator, the pixel array: geometry, per-pixel maps, threaded simulation.
 #pragma once
 
 #include "PixelSimulator.h"
@@ -32,7 +34,9 @@
 
 namespace phot2pix
 {
-    /// Write header cards (keyword, value, comment) into the header of a FITS image.
+    /// @brief Write header cards (keyword, value, comment) into the header of a FITS image.
+    /// @param image Image whose header receives the cards.
+    /// @param cards Cards to write.
     inline void writeCards(DSL::FITScube& image, const std::vector<HeaderCard>& cards)
     {
         for (const auto& c : cards)
@@ -44,9 +48,14 @@ namespace phot2pix
     // windows of the pixel array (DetectorSimulator::Col(), window()). Built by makeStridedView().
     // This StridedView as been designed by CLAUDE OPUS 5.5 in order to make the code compatible with C++23 and C++20. It is a fallback for the standard libraries without <mdspan> (libstdc++ before GCC 15, used by clang on Linux as well): the part of std::mdspan<T, std::dextents<size_t, Rank>, std::layout_stride> listed below, under the same names. Code that keeps to these members compiles with either.
 #if defined(__cpp_lib_mdspan)
+    /// @brief View of Rank dimensions on a flat array, with a stride per dimension (std::mdspan).
     template<typename T, size_t Rank>
     using StridedView = std::mdspan<T, std::dextents<size_t, Rank>, std::layout_stride>;
 
+    /// @brief Build a StridedView.
+    /// @param data    First element of the view.
+    /// @param extents Number of elements along each dimension.
+    /// @param strides Distance between two elements along each dimension.
     template<typename T, size_t Rank>
     StridedView<T, Rank> makeStridedView(T* data, const std::array<size_t, Rank>& extents,
                                          const std::array<size_t, Rank>& strides)
@@ -55,38 +64,46 @@ namespace phot2pix
         return StridedView<T, Rank>(data, std::layout_stride::mapping<ext_t>(ext_t(extents), strides));
     }
 #else
-    // Fallback for the standard libraries without <mdspan> (libstdc++ before GCC 15, used by
-    // clang on Linux as well): the part of std::mdspan<T, std::dextents<size_t, Rank>,
-    // std::layout_stride> listed below, under the same names. Code that keeps to these members
-    // compiles with either.
+    /// @brief View of Rank dimensions on a flat array, with a stride per dimension (fallback).
+    /// @details Fallback for the standard libraries without &lt;mdspan&gt; (libstdc++ before GCC 15, used by
+    /// clang on Linux as well): the part of std::mdspan<T, std::dextents<size_t, Rank>,
+    /// std::layout_stride> listed below, under the same names. Code that keeps to these members
+    /// compiles with either.
     template<typename T, size_t Rank>
     class StridedView
     {
     public:
-        using element_type     = T;
-        using value_type       = std::remove_cv_t<T>;
-        using index_type       = size_t;
-        using size_type        = size_t;
-        using data_handle_type = T*;
-        using reference        = T&;
+        using element_type     = T;                      ///< Element type
+        using value_type       = std::remove_cv_t<T>;    ///< Element type without const / volatile
+        using index_type       = size_t;                 ///< Index type
+        using size_type        = size_t;                 ///< Size type
+        using data_handle_type = T*;                     ///< Pointer to the elements
+        using reference        = T&;                     ///< Reference to an element
 
+        /// @brief View on data (see makeStridedView()).
         StridedView(T* data, const std::array<size_t, Rank>& extents, const std::array<size_t, Rank>& strides)
             : m_data(data), m_extents(extents), m_strides(strides) {}
 
+        /// @brief Number of dimensions.
         static constexpr size_t rank() noexcept { return Rank; }
+        /// @brief Number of elements along dimension r.
         size_t extent(size_t r) const noexcept { return m_extents[r]; }
+        /// @brief Distance between two elements along dimension r.
         size_t stride(size_t r) const noexcept { return m_strides[r]; }
+        /// @brief First element of the view.
         T*     data_handle()    const noexcept { return m_data; }
 
+        /// @brief Number of elements of the view.
         size_t size() const noexcept
         {
             size_t n = 1;
             for (size_t e : m_extents) n *= e;
             return n;
         }
+        /// @brief True if the view has no element.
         bool empty() const noexcept { return size() == 0; }
 
-        // view[i] (rank 1), view[row, col] (rank 2): one index per dimension, no bounds check.
+        /// @brief view[i] (rank 1), view[row, col] (rank 2): one index per dimension, no bounds check.
         template<typename... I>
             requires (sizeof...(I) == Rank && (std::is_convertible_v<I, size_t> && ...))
         T& operator[](I... indices) const
@@ -99,11 +116,15 @@ namespace phot2pix
         }
 
     private:
-        T*                       m_data;
-        std::array<size_t, Rank> m_extents;
-        std::array<size_t, Rank> m_strides;
+        T*                       m_data;      ///< First element
+        std::array<size_t, Rank> m_extents;   ///< Elements along each dimension
+        std::array<size_t, Rank> m_strides;   ///< Distance between two elements along each dimension
     };
 
+    /// @brief Build a StridedView.
+    /// @param data    First element of the view.
+    /// @param extents Number of elements along each dimension.
+    /// @param strides Distance between two elements along each dimension.
     template<typename T, size_t Rank>
     StridedView<T, Rank> makeStridedView(T* data, const std::array<size_t, Rank>& extents,
                                          const std::array<size_t, Rank>& strides)
@@ -114,34 +135,37 @@ namespace phot2pix
 #pragma endregion
 
 #pragma region - DetectorSimulator class definition
+    /**
+     * @class DetectorSimulator
+     * @brief Detector: an array of pixels, its geometry, its per-pixel maps and its simulation.
+     * @details Flat row-major pixel array with 2D access.
+     *          Non-const pixel accessors are protected so only derived classes can
+     *          modify individual pixels. Public API exposes const (read) access and
+     *          batch configuration methods (gain map, dark map, ...) that operate on
+     *          the whole detector coherently.
+     *
+     *          Parallelism is handled internally by simulate() via std::thread.
+     *          Derived classes customise physics by overriding _engine(), not simulate().
+     * @tparam PixelT Pixel model, derived from pixsim.
+     */
     template<typename PixelT = pixsim>
     class DetectorSimulator
     {
-        /*
-        @class DetectorSimulator
-        @brief Default detector simulator class to simulate the detector response to photons.
-        @details Flat row-major pixel array with 2D access.
-                 Non-const pixel accessors are protected so only derived classes can
-                 modify individual pixels. Public API exposes const (read) access and
-                 batch configuration methods (gain map, dark map, ...) that operate on
-                 the whole detector coherently.
-
-                 Parallelism is handled internally by simulate() via std::thread.
-                 Derived classes customise physics by overriding _engine(), not simulate().
-        */
-
         static_assert(std::is_base_of_v<pixsim, PixelT>, "PixelT must derive from pixsim");
 
 #pragma region - private
 // ── Private: thread dispatch ───────────────────────────────────────────────
     private:
 
+        /// @brief The whole pixel array.
         auto view()       { return std::span<PixelT>      (m_pixels.data(), m_pixels.size()); }
+        /// @brief The whole pixel array, read only.
         auto view() const { return std::span<const PixelT>(m_pixels.data(), m_pixels.size()); }
 
-        // Dispatch pixelresponse with cfg, falling back to the 2-arg form if PixelT
-        // does not expose the 3-arg overload (e.g. because a derived class overrides
-        // only the 2-arg form, hiding the base-class 3-arg via C++ name hiding).
+        /// @brief pixelresponse() with cfg, or without it if PixelT has no such overload.
+        /// @details Falls back to the 2-arg form when PixelT does not expose the 3-arg overload
+        ///          (e.g. because a derived class overrides only the 2-arg form, hiding the
+        ///          base-class 3-arg via C++ name hiding).
         template<typename P>
         static double _dispatchPixelResponse(const P& px, double flux, double dt, const PixelConfig& cfg)
         {
@@ -151,21 +175,23 @@ namespace phot2pix
                 return px.pixelresponse(flux, dt);
         }
 
+        /// @brief Check that a map has one value per pixel.
+        /// @throws std::invalid_argument otherwise, naming the map.
         void _checkMapSize(size_t sz, const char* name) const
         {
             if (sz != m_pixels.size())
                 throw std::invalid_argument(std::string(name) + " size does not match detector size.");
         }
 
-        // Returns the number of threads to use for n pixels.
-        // Below 100 * nCores the thread-spawn overhead exceeds the gain.
+        /// @brief Number of threads to use for n pixels.
+        /// @details Below 100 * nCores the thread-spawn overhead exceeds the gain: 1.
         size_t _computeThreadCount(size_t n) const
         {
             const size_t maxT = std::thread::hardware_concurrency();
             return (n > 100 * maxT) ? std::min(maxT, n) : 1;
         }
 
-        // Full-detector dispatch: partition flat pixel index range across threads.
+        /// @brief Full-detector dispatch: partition the flat pixel index range across threads.
         void _dispatch_cpu(const std::valarray<double>& flux,
                            double                        dt,
                            std::valarray<double>&         frame,
@@ -190,7 +216,7 @@ namespace phot2pix
             for (auto& th : workers) th.join();
         }
 
-        // Windowed dispatch: partition window rows across threads.
+        /// @brief Windowed dispatch: partition the window rows across threads.
         void _dispatch_cpu_window(const std::valarray<double>& flux,
                                    double                        dt,
                                    size_t c0, size_t r0,
@@ -216,7 +242,7 @@ namespace phot2pix
             for (auto& th : workers) th.join();
         }
 
-        // cfg-aware dispatch variants — capture cfg by const-ref in the thread lambda.
+        /// @brief Full-detector dispatch with cfg, captured by const-ref in the thread lambda.
         void _dispatch_cpu_cfg(const std::valarray<double>& flux,
                                double                        dt,
                                std::valarray<double>&         frame,
@@ -242,6 +268,7 @@ namespace phot2pix
             for (auto& th : workers) th.join();
         }
 
+        /// @brief Windowed dispatch with cfg, captured by const-ref in the thread lambda.
         void _dispatch_cpu_window_cfg(const std::valarray<double>& flux,
                                        double                        dt,
                                        size_t c0, size_t r0,
@@ -268,8 +295,13 @@ namespace phot2pix
             for (auto& th : workers) th.join();
         }
 
-        // Shared frame-to-FITScube conversion, factored out to avoid duplication
-        // between the standard and cfg-aware simulate() overloads.
+        /// @brief FITS image of a simulated frame, in the pixel type of the detector.
+        /// @details Factored out to avoid duplication between the standard and cfg-aware
+        ///          simulate() overloads.
+        /// @param frame  Values, row-major: width × height of them (the window size for a window).
+        /// @param width  Image columns.
+        /// @param height Image rows.
+        /// @throws std::invalid_argument if the pixel type is not a FITS type.
         std::shared_ptr<DSL::FITScube> _convertFrame(const std::valarray<double>& frame,
                                                       size_t width, size_t height) const
         {
@@ -317,8 +349,8 @@ namespace phot2pix
 #pragma region - protected
     protected:
 #pragma region -> members
-        const size_t        m_width;
-        const size_t        m_height;
+        const size_t        m_width;  ///< Matrix columns
+        const size_t        m_height; ///< Matrix rows
         std::vector<PixelT> m_pixels; ///< Flat row-major pixel array
         const int m_pixelType;        ///< FITS storage type for output cube
         size_t m_nThreads;            ///< Thread budget for simulate(); set via setThreadCount()
@@ -331,7 +363,7 @@ namespace phot2pix
 #pragma endregion
 #pragma region -> member functions
 
-        // Add an input card, or replace the card that has the same keyword.
+        /// @brief Add an input card, or replace the card that has the same keyword.
         void setInputCard(const HeaderCard& card)
         {
             for (auto& c : m_inputCards)
@@ -339,20 +371,27 @@ namespace phot2pix
             m_inputCards.push_back(card);
         }
 
+        /// @brief True if there is an input card with this keyword.
         bool hasInputCard(const std::string& key) const
         {
             return std::any_of(m_inputCards.begin(), m_inputCards.end(),
                                [&key](const HeaderCard& c) { return c.key == key; });
         }
 
-        // Remove the input cards whose keyword starts with prefix (before re-adding a list).
+        /// @brief Remove the input cards whose keyword starts with prefix (before re-adding a list).
         void removeInputCards(const std::string& prefix)
         {
             std::erase_if(m_inputCards, [&prefix](const HeaderCard& c) { return c.key.rfind(prefix, 0) == 0; });
         }
 
-        // Card of a per-pixel input: the value or map file cfg gives for `key`; a key that
-        // was never given gets the value the pixels hold (the PixelT default).
+        /// @brief Record the card of a per-pixel input.
+        /// @details The value or map file cfg gives for `key`; a key that was never given gets
+        ///          the value the pixels hold (the PixelT default).
+        /// @param cfg     Configuration.
+        /// @param key     Configuration key.
+        /// @param fitsKey Keyword of the card.
+        /// @param comment Comment of the card.
+        /// @param get     Reads the parameter of a pixel.
         template<typename Getter>
         void _recordInput(const PixelConfig& cfg, const std::string& key, const std::string& fitsKey,
                           const std::string& comment, Getter get)
@@ -365,19 +404,25 @@ namespace phot2pix
 
         // Non-const pixel accessors — derived classes only.
         // Use these during initialisation (defect maps, special pixel regions, etc.).
+
+        /// @brief Pixel of flat index index (row-major). No bounds check.
         PixelT& at(size_t index)           { return view()[index]; }
+        /// @brief Pixel at column col and row row. No bounds check.
         PixelT& at(size_t col, size_t row) { return view()[col + row * m_width]; }
 
+        /// @brief Pixels of one row.
         std::span<PixelT> Row(size_t row)
         {
             return { m_pixels.data() + row * m_width, m_width };
         }
 
+        /// @brief Pixels of one column.
         StridedView<PixelT, 1> Col(size_t col)
         {
             return makeStridedView<PixelT, 1>(m_pixels.data() + col, { m_height }, { m_width });
         }
 
+        /// @brief Pixels of a window, indexed [row, col] from its corner (c0, r0).
         StridedView<PixelT, 2> window(size_t c0, size_t r0, size_t ncols, size_t nrows)
         {
             return makeStridedView<PixelT, 2>(m_pixels.data() + r0 * m_width + c0,
@@ -396,7 +441,12 @@ namespace phot2pix
         // Each thread calls _engine() exactly once with its assigned range,
         // so virtual dispatch overhead is O(nThreads), not O(nPixels).
 
-        // Full-detector hook: thread owns pixels [begin, end).
+        /// @brief Full-detector hook: the thread owns pixels [begin, end).
+        /// @param flux  Photons/s of every pixel of the matrix, row-major.
+        /// @param dt    Integration time (s).
+        /// @param begin First pixel.
+        /// @param end   Pixel after the last one.
+        /// @param frame Output, one value per pixel of the matrix.
         virtual void _engine(const std::valarray<double>& flux,
                               double                        dt,
                               size_t                        begin,
@@ -407,9 +457,15 @@ namespace phot2pix
                 frame[i] = m_pixels[i].pixelresponse(flux[i], dt);
         }
 
-        // Windowed hook: thread owns window rows [row_begin, row_end).
-        // flux and frame are window-sized (ncols * nrows elements, row-major).
-        // c0, r0 are the detector coordinates of the window top-left corner.
+        /// @brief Windowed hook: the thread owns the window rows [row_begin, row_end).
+        /// @param flux      Photons/s of the window pixels (ncols * nrows elements, row-major).
+        /// @param dt        Integration time (s).
+        /// @param c0        Matrix column of the first window pixel.
+        /// @param r0        Matrix row of the first window pixel.
+        /// @param row_begin First window row.
+        /// @param row_end   Window row after the last one.
+        /// @param ncols     Window columns.
+        /// @param frame     Output, window-sized like flux.
         virtual void _engine(const std::valarray<double>& flux,
                               double                        dt,
                               size_t                        c0,
@@ -431,6 +487,14 @@ namespace phot2pix
         // cfg-aware engine hooks — pass PixelConfig to pixelresponse() for runtime
         // parameters (e.g. persistence dT).  Derived classes that need per-engine
         // cfg logic can override these; the defaults delegate per-pixel dispatch.
+
+        /// @brief Full-detector hook with runtime parameters.
+        /// @param flux  Photons/s of every pixel of the matrix, row-major.
+        /// @param dt    Integration time (s).
+        /// @param begin First pixel.
+        /// @param end   Pixel after the last one.
+        /// @param frame Output, one value per pixel of the matrix.
+        /// @param cfg   Runtime parameters.
         virtual void _engine(const std::valarray<double>& flux,
                               double                        dt,
                               size_t                        begin,
@@ -442,6 +506,16 @@ namespace phot2pix
                 frame[i] = _dispatchPixelResponse(m_pixels[i], flux[i], dt, cfg);
         }
 
+        /// @brief Windowed hook with runtime parameters.
+        /// @param flux      Photons/s of the window pixels (ncols * nrows elements, row-major).
+        /// @param dt        Integration time (s).
+        /// @param c0        Matrix column of the first window pixel.
+        /// @param r0        Matrix row of the first window pixel.
+        /// @param row_begin First window row.
+        /// @param row_end   Window row after the last one.
+        /// @param ncols     Window columns.
+        /// @param frame     Output, window-sized like flux.
+        /// @param cfg       Runtime parameters.
         virtual void _engine(const std::valarray<double>& flux,
                               double                        dt,
                               size_t                        c0,
@@ -466,9 +540,9 @@ namespace phot2pix
         // Format convertion functions for outputting the detector response to FITS files.
         // They are marked as virtual so that derived classes can override them to implement custom clipping or scaling.
 
-        //@brief Convert a valarray of doubles to a valarray of int8_t, with clipping to the range of int8_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of int8_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of int8_t, with clipping to the range of int8_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of int8_t containing the converted values.
         virtual std::valarray<int8_t> convert2int8(const std::valarray<double>& arr) const
         {
             std::valarray<int8_t> out((int8_t) 0, arr.size());
@@ -486,9 +560,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of uint8_t, with clipping to the range of uint8_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of uint8_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of uint8_t, with clipping to the range of uint8_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of uint8_t containing the converted values.
         virtual std::valarray<uint8_t> convert2uint8(const std::valarray<double>& arr) const
         {
             std::valarray<uint8_t> out((uint8_t) 0, arr.size());
@@ -506,9 +580,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of int16_t, with clipping to the range of int16_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of int16_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of int16_t, with clipping to the range of int16_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of int16_t containing the converted values.
         virtual std::valarray<int16_t> convert2int16(const std::valarray<double>& arr) const
         {
             std::valarray<int16_t> out((int16_t) 0, arr.size());
@@ -526,9 +600,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of uint16_t, with clipping to the range of uint16_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of uint16_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of uint16_t, with clipping to the range of uint16_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of uint16_t containing the converted values.
         virtual std::valarray<uint16_t> convert2uint16(const std::valarray<double>& arr) const
         {
             std::valarray<uint16_t> out((uint16_t) 0, arr.size());
@@ -546,9 +620,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of int32_t, with clipping to the range of int32_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of int32_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of int32_t, with clipping to the range of int32_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of int32_t containing the converted values.
         virtual std::valarray<int32_t> convert2int32(const std::valarray<double>& arr) const
         {
             std::valarray<int32_t> out((int32_t) 0, arr.size());
@@ -566,9 +640,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of uint32_t, with clipping to the range of uint32_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of uint32_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of uint32_t, with clipping to the range of uint32_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of uint32_t containing the converted values.
         virtual std::valarray<uint32_t> convert2uint32(const std::valarray<double>& arr) const
         {
             std::valarray<uint32_t> out((uint32_t) 0, arr.size());
@@ -586,9 +660,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of int64_t, with clipping to the range of int64_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of int64_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of int64_t, with clipping to the range of int64_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of int64_t containing the converted values.
         virtual std::valarray<int64_t> convert2int64(const std::valarray<double>& arr) const
         {
             std::valarray<int64_t> out((int64_t) 0, arr.size());
@@ -606,9 +680,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of uint64_t, with clipping to the range of uint64_t.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of uint64_t containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of uint64_t, with clipping to the range of uint64_t.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of uint64_t containing the converted values.
         virtual std::valarray<uint64_t> convert2uint64(const std::valarray<double>& arr) const
         {
             std::valarray<uint64_t> out((uint64_t) 0, arr.size());
@@ -626,9 +700,9 @@ namespace phot2pix
             return out;
         }
 
-        //@brief Convert a valarray of doubles to a valarray of float, with clipping to the range of float.
-        //@param arr The input valarray of doubles to convert.
-        //@return A valarray of float containing the converted values.
+        /// @brief Convert a valarray of doubles to a valarray of float, without clipping.
+        /// @param arr The input valarray of doubles to convert.
+        /// @return A valarray of float containing the converted values.
         virtual std::valarray<float> convert2float(const std::valarray<double>& arr) const
         {
             std::valarray<float> out(0.0f, arr.size());
@@ -644,9 +718,14 @@ namespace phot2pix
     public:
 
 #pragma region - ctor/dtor
-        // geometry: physical detector the width × height matrix belongs to. A derived
-        // Geometry adds its own layout (reference pixels, …) and configuration keys.
-        // Null → a detector of the matrix size.
+        /// @brief Matrix of width × height default pixels.
+        /// @param width    Matrix columns, > 0.
+        /// @param height   Matrix rows, > 0.
+        /// @param dataType FITS pixel type of the images simulate() returns (DOUBLE_IMG, USHORT_IMG, …).
+        /// @param geometry Physical detector the matrix belongs to. A derived Geometry adds its own
+        ///                 layout (reference pixels, …) and configuration keys. Null → a detector of
+        ///                 the matrix size.
+        /// @throws std::invalid_argument if width or height is 0.
         DetectorSimulator(size_t width, size_t height, const int& dataType = DOUBLE_IMG,
                           std::shared_ptr<const Geometry> geometry = nullptr)
             : m_width(width), m_height(height), m_pixels(width * height), m_pixelType(dataType),
@@ -658,24 +737,32 @@ namespace phot2pix
                 m_geometry = std::make_shared<Geometry>(width, height);
         }
 
+        /// @brief Destructor.
         virtual ~DetectorSimulator() = default;
 #pragma endregion
 
 #pragma region - geometry
+        /// @brief Matrix columns.
         size_t getWidth()  const { return m_width; }
+        /// @brief Matrix rows.
         size_t getHeight() const { return m_height; }
+        /// @brief Number of pixels.
         size_t size()      const { return m_pixels.size(); }
 
-        // Physical detector and placement of the matrix on it (see Geometry.h).
+        /// @brief Physical detector and placement of the matrix on it (see Geometry.h).
         const Geometry& getGeometry() const { return *m_geometry; }
 
-        // Position (x0, y0) of the matrix on the physical detector: "detectorOrigin" if
-        // given, otherwise (0, 0). Matrix pixel (x, y) is physical pixel (x0 + x, y0 + y).
+        /// @brief Position (x0, y0) of the matrix on the physical detector.
+        /// @details "detectorOrigin" if given, otherwise (0, 0). Matrix pixel (x, y) is physical
+        ///          pixel (x0 + x, y0 + y).
         std::pair<size_t, size_t> getOrigin() const { return m_geometry->place(m_width, m_height); }
 
-        // Per-pixel values of the matrix from a 2-D image: a matrix-sized image is used as
-        // is, a detector-sized one is cropped at getOrigin(). Throws std::invalid_argument
-        // for any other size; `what` names the image in the message.
+        /// @brief Per-pixel values of the matrix from a 2-D image.
+        /// @details A matrix-sized image is used as is, a detector-sized one is cropped at getOrigin().
+        /// @param image Image.
+        /// @param what  Name of the image in the error messages.
+        /// @return One value per pixel, row-major.
+        /// @throws std::invalid_argument for any other size, or an image without data.
         std::valarray<double> toMatrix(const DSL::FITScube& image, const std::string& what) const
         {
             std::shared_ptr<DSL::FITScube> doubleImage;
@@ -690,10 +777,12 @@ namespace phot2pix
             return m_geometry->extract(*data, img->Size(1), img->Size(2), m_width, m_height, what);
         }
 
+        /// @brief Thread budget used by simulate().
         size_t getThreadCount() const { return m_nThreads; }
 
-        // Set the thread budget used by simulate(). Capped at hardware_concurrency();
-        // pass 0 to restore the default heuristic.
+        /// @brief Set the thread budget used by simulate().
+        /// @param n Number of threads; 0, or more than hardware_concurrency(), restores the default
+        ///          heuristic.
         void setThreadCount(size_t n)
         {
             const size_t hw = std::thread::hardware_concurrency();
@@ -703,19 +792,24 @@ namespace phot2pix
 #pragma endregion
 
 #pragma region - read-only pixel access
+        /// @brief Pixel of flat index index (row-major), read only. No bounds check.
         const PixelT& at(size_t index)           const { return view()[index]; }
+        /// @brief Pixel at column col and row row, read only. No bounds check.
         const PixelT& at(size_t col, size_t row) const { return view()[col + row * m_width]; }
 
+        /// @brief Pixels of one row, read only.
         std::span<const PixelT> Row(size_t row) const
         {
             return { m_pixels.data() + row * m_width, m_width };
         }
 
+        /// @brief Pixels of one column, read only.
         StridedView<const PixelT, 1> Col(size_t col) const
         {
             return makeStridedView<const PixelT, 1>(m_pixels.data() + col, { m_height }, { m_width });
         }
 
+        /// @brief Pixels of a window, read only, indexed [row, col] from its corner (c0, r0).
         StridedView<const PixelT, 2> window(size_t c0, size_t r0, size_t ncols, size_t nrows) const
         {
             return makeStridedView<const PixelT, 2>(m_pixels.data() + r0 * m_width + c0,
@@ -724,25 +818,28 @@ namespace phot2pix
 #pragma endregion
 
 #pragma region - initialisation (public)
-        // Initialise every pixel from a single prototype.
+        /// @brief Initialise every pixel from a single prototype.
         void fill(const PixelT& proto)
         {
             std::fill(m_pixels.begin(), m_pixels.end(), proto);
         }
 
-        // Primary pixel-property initialisation from a typed config.
-        // Each known key is read by loadMap():
-        //   numeric value  → applied uniformly to all pixels
-        //   FITS image     → per-pixel map, "<path>" or {"file": "<path>", "hdu": h}, h an HDU
-        //                    index or an EXTNAME (default: 1, the primary HDU); loadImage()
-        //                    lists every accepted form.
-        //
-        // Known keys: "gain", "dark", "readNoise", "QE", "KTCnoise", "baseline"
-        // A FITS map is either matrix-sized or detector-sized (see Geometry.h).
-        // The geometry keys ("detectorSize", "detectorOrigin", and those of a derived
-        // Geometry) are read first, so the maps are cropped at the new origin.
-        // Derived classes override initialize() to handle additional keys;
-        // call DetectorSimulator<PixelT>::initialize(cfg) to apply the standard keys first.
+        /// @brief Set the geometry and the pixel parameters from a configuration.
+        /// @details Known keys: "gain", "dark", "readNoise", "QE", "KTCnoise", "baseline", each read
+        ///          by loadMap():
+        ///          - a number is applied uniformly to all pixels;
+        ///          - a FITS image is a per-pixel map, "<path>" or {"file": "<path>", "hdu": h}, h an
+        ///            HDU index or an EXTNAME (default: 1, the primary HDU); loadImage() lists every
+        ///            accepted form. A map is either matrix-sized or detector-sized (see Geometry.h).
+        ///
+        ///          The geometry keys ("detectorSize", "detectorOrigin", and those of a derived
+        ///          Geometry) are read first, so the maps are cropped at the new origin. The inputs
+        ///          are recorded as header cards (see getInputCards()).
+        ///          Derived classes override initialize() to handle additional keys; call
+        ///          DetectorSimulator<PixelT>::initialize(cfg) to apply the standard keys first.
+        /// @param cfg Configuration; absent keys leave the current value unchanged.
+        /// @throws std::invalid_argument if a value or a map is not valid, or if the matrix does not
+        ///         fit on the detector.
         virtual void initialize(const PixelConfig& cfg)
         {
             // Configure a copy and commit it only if the matrix fits on the detector.
@@ -784,29 +881,38 @@ namespace phot2pix
                 _recordInput(cfg, "baseline",  "PIXBASE", "[ADU] Pixel baseline",       [](const PixelT& px) { return px.getBaseline(); });
         }
 
-        // Convenience: load config from a JSON file path.
+        /// @brief initialize() from a JSON file path.
         virtual void initialize(const std::string& jsonPath) { initialize(PixelConfig(jsonPath)); }
 #pragma endregion
 
 #pragma region - per-pixel inputs from a configuration
-        // The FITS image a configuration key names; nullptr when the key is absent or holds a
-        // number. h is an HDU index (1 = primary) or an EXTNAME:
-        //   "key": "<path>"                         → primary HDU
-        //   "key": "<path>", "key.hdu": h           → HDU h
-        //   "key": {"file": "<path>"}               → primary HDU
-        //   "key": {"file": "<path>", "hdu": h}     → HDU h
-        //   "key.file": "<path>" [, "key.hdu": h]   → flat notation, as above
-        // A string starting with '{' is read as a JSON-encoded object.
-        // Throws std::invalid_argument for a malformed entry or an HDU without an image.
+        /// @brief The FITS image a configuration key names.
+        /// @details h is an HDU index (1 = primary) or an EXTNAME:
+        /// @verbatim
+        ///   "key": "<path>"                         → primary HDU
+        ///   "key": "<path>", "key.hdu": h           → HDU h
+        ///   "key": {"file": "<path>"}               → primary HDU
+        ///   "key": {"file": "<path>", "hdu": h}     → HDU h
+        ///   "key.file": "<path>" [, "key.hdu": h]   → flat notation, as above
+        /// @endverbatim
+        /// A string starting with '{' is read as a JSON-encoded object.
+        /// @param cfg Configuration.
+        /// @param key Key.
+        /// @return The image; nullptr when the key is absent or holds a number.
+        /// @throws std::invalid_argument for a malformed entry or an HDU without an image.
         std::shared_ptr<DSL::FITScube> loadImage(const PixelConfig& cfg, const std::string& key) const
         {
             const std::optional<json> source = _fitsSource(cfg, key);
             return source ? _openImage(key, *source) : nullptr;
         }
 
-        // Per-pixel values of a configuration key: a number is applied to every pixel, a FITS
-        // image (see loadImage()) is matrix-sized or detector-sized (see toMatrix()).
-        // Empty when the key is absent.
+        /// @brief Per-pixel values of a configuration key.
+        /// @details A number is applied to every pixel, a FITS image (see loadImage()) is
+        ///          matrix-sized or detector-sized (see toMatrix()).
+        /// @param cfg Configuration.
+        /// @param key Key.
+        /// @return One value per pixel, row-major; empty when the key is absent.
+        /// @throws std::invalid_argument for a malformed entry or a map of another size.
         std::valarray<double> loadMap(const PixelConfig& cfg, const std::string& key) const
         {
             if (const std::optional<json> source = _fitsSource(cfg, key))
@@ -819,18 +925,20 @@ namespace phot2pix
 #pragma endregion
 
 #pragma region - header cards
-        // Simulation inputs recorded by initialize(), as FITS header cards: one per
-        // per-pixel parameter (PIXGAIN, PIXDARK, PIXRN, PIXQE, PIXKTC, PIXBASE), holding
-        // the value it was given or the file name of its map ("dark.fits[1]"), plus the
-        // cards a derived simulator adds with setInputCard(). Write them into an output
-        // with writeInputCards().
+        /// @brief Simulation inputs recorded by initialize(), as FITS header cards.
+        /// @details One per per-pixel parameter (PIXGAIN, PIXDARK, PIXRN, PIXQE, PIXKTC, PIXBASE),
+        ///          holding the value it was given or the file name of its map ("dark.fits[1]"),
+        ///          plus the cards a derived simulator adds with setInputCard(). Write them into an
+        ///          output with writeInputCards().
         const std::vector<HeaderCard>& getInputCards() const { return m_inputCards; }
 
+        /// @brief Write the input cards into the header of image.
         void writeInputCards(DSL::FITScube& image) const { writeCards(image, m_inputCards); }
 #pragma endregion
 
 #pragma region - named map setters (protected — use initialize() from public API)
     protected:
+        /// @brief Set the gain of every pixel (e-/ADU). @throws std::invalid_argument on a wrong size or value.
         void setGainMap(std::span<const double> gains)
         {
             _checkMapSize(gains.size(), "Gain map");
@@ -838,6 +946,7 @@ namespace phot2pix
                 m_pixels[i].setGain(gains[i]);
         }
 
+        /// @brief Set the dark current of every pixel (e-/s). @throws std::invalid_argument on a wrong size or value.
         void setDarkCurrentMap(std::span<const double> darks)
         {
             _checkMapSize(darks.size(), "Dark current map");
@@ -845,6 +954,7 @@ namespace phot2pix
                 m_pixels[i].setDarkCurrent(darks[i]);
         }
 
+        /// @brief Set the read noise of every pixel (e- RMS). @throws std::invalid_argument on a wrong size or value.
         void setReadNoiseMap(std::span<const double> readNoises)
         {
             _checkMapSize(readNoises.size(), "Read noise map");
@@ -852,6 +962,7 @@ namespace phot2pix
                 m_pixels[i].setReadNoise(readNoises[i]);
         }
 
+        /// @brief Set the quantum efficiency of every pixel. @throws std::invalid_argument on a wrong size or value.
         void setQEMap(std::span<const double> qes)
         {
             _checkMapSize(qes.size(), "QE map");
@@ -859,6 +970,7 @@ namespace phot2pix
                 m_pixels[i].setQuantumEfficiency(qes[i]);
         }
 
+        /// @brief Set the baseline of every pixel (ADU). @throws std::invalid_argument on a wrong size or value.
         void setBaselineMap(std::span<const double> baselines)
         {
             _checkMapSize(baselines.size(), "Baseline map");
@@ -866,6 +978,7 @@ namespace phot2pix
                 m_pixels[i].setBaseline(baselines[i]);
         }
 
+        /// @brief Set the kTC noise of every pixel (e- RMS). @throws std::invalid_argument on a wrong size or value.
         void setKTCnoiseMap(std::span<const double> ktcs)
         {
             _checkMapSize(ktcs.size(), "KTC noise map");
@@ -874,8 +987,8 @@ namespace phot2pix
         }
 
     private:
-        // The FITS file and HDU a configuration key names, as {"file": path[, "hdu": h]};
-        // nullopt when the key is absent or holds a number. See loadImage() for the forms.
+        /// @brief The FITS file and HDU a configuration key names, as {"file": path[, "hdu": h]}.
+        /// @return nullopt when the key is absent or holds a number. See loadImage() for the forms.
         static std::optional<json> _fitsSource(const PixelConfig& cfg, const std::string& key)
         {
             // A path, with the HDU, if given, in the "key.hdu" sibling.
@@ -922,8 +1035,8 @@ namespace phot2pix
             return std::make_optional(std::move(source));
         }
 
-        // The image of a {"file": path[, "hdu": h]} source; the primary HDU (1) when h is absent.
-        // The image keeps its data once the file is closed.
+        /// @brief The image of a {"file": path[, "hdu": h]} source; the primary HDU (1) when h is absent.
+        /// @details The image keeps its data once the file is closed.
         static std::shared_ptr<DSL::FITScube> _openImage(const std::string& key, const json& source)
         {
             const std::string path = source.at("file").get<std::string>();
@@ -944,6 +1057,7 @@ namespace phot2pix
             return image;
         }
 
+        /// @brief Apply setter to every pixel with the value of a key (see loadMap()); nothing if it is absent.
         template<typename Setter>
         void _applyMap(const PixelConfig& cfg,
                        const std::string& key,
@@ -962,13 +1076,19 @@ namespace phot2pix
         // simulate() is NOT virtual. It owns thread dispatch and calls _engine().
         // To customise physics, override _engine() in a derived class.
 
-        // Convenience: uniform flux over the full detector.
+        /// @brief Full matrix, uniform flux.
+        /// @param flux         Photons/s/pixel.
+        /// @param exposureTime Exposure time (s).
+        /// @return Image of getWidth() × getHeight() pixels.
         std::shared_ptr<DSL::FITScube> simulate(double flux, double exposureTime) const
         {
             return simulate(std::valarray<double>(flux, m_pixels.size()), exposureTime);
         }
 
-        // Convenience: per-pixel flux from a FITScube.
+        /// @brief Full matrix, flux of a double-precision FITS image.
+        /// @param flux         Photons/s/pixel, matrix-sized.
+        /// @param exposureTime Exposure time (s).
+        /// @return Image of getWidth() × getHeight() pixels.
         std::shared_ptr<DSL::FITScube> simulate(const std::shared_ptr<DSL::FITScube>& flux, double exposureTime) const
         {
             std::valarray<double> fluxArray(0.0, m_pixels.size());
@@ -976,8 +1096,11 @@ namespace phot2pix
             return simulate(fluxArray, exposureTime);
         }
 
-        // Core: per-pixel flux, full detector.
-        // Dispatches to _engine() across std::thread workers when detector is large.
+        /// @brief Full matrix, per-pixel flux.
+        /// @details Dispatches to _engine() across std::thread workers when the detector is large.
+        /// @param flux         Photons/s of every pixel, row-major.
+        /// @param exposureTime Exposure time (s).
+        /// @return Image of getWidth() × getHeight() pixels.
         std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux, double exposureTime) const
         {
             const size_t n        = m_pixels.size();
@@ -993,11 +1116,19 @@ namespace phot2pix
             return _convertFrame(frame, m_width, m_height);
         }
 
-        // Windowed: simulate only a detector sub-region.
-        // Returns a FITScube of size ncols × nrows.
-        // Use when a variable/moving source is localised in a small region:
-        // run the full detector at coarse cadence, then re-run the affected
-        // window at finer time steps and composite the results.
+        /// @brief Window: simulate only a sub-region of the matrix.
+        /// @details Use when a variable/moving source is localised in a small region: run the full
+        ///          detector at coarse cadence, then re-run the affected window at finer time steps
+        ///          and composite the results.
+        /// @param flux         Photons/s of the window pixels (ncols × nrows, row-major).
+        /// @param exposureTime Exposure time (s).
+        /// @param c0           Matrix column of the first window pixel.
+        /// @param r0           Matrix row of the first window pixel.
+        /// @param ncols        Window columns.
+        /// @param nrows        Window rows.
+        /// @return Image of ncols × nrows pixels.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if flux
+        ///         does not have the size of the window.
         std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux,   // ncols*nrows elements, row-major
                   const double&                        exposureTime,
                   const size_t&                        c0,
@@ -1019,11 +1150,16 @@ namespace phot2pix
             else
                 _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame);
 
-            return _convertFrame(frame, m_width, m_height);
+            return _convertFrame(frame, ncols, nrows);
         }
 
-        // cfg-aware simulate overloads — pass a PixelConfig carrying runtime parameters
-        // (e.g. persistence dT) down to pixelresponse() via the cfg-aware _engine hooks.
+        /// @brief Full matrix, with runtime parameters.
+        /// @details cfg (e.g. persistence dT) is passed down to pixelresponse() via the cfg-aware
+        ///          _engine() hooks.
+        /// @param flux         Photons/s of every pixel, row-major.
+        /// @param exposureTime Exposure time (s).
+        /// @param cfg          Runtime parameters.
+        /// @return Image of getWidth() × getHeight() pixels.
         std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux,
                                                  double                        exposureTime,
                                                  const PixelConfig&            cfg) const
@@ -1040,6 +1176,17 @@ namespace phot2pix
             return _convertFrame(frame, m_width, m_height);
         }
 
+        /// @brief Window, with runtime parameters.
+        /// @param flux         Photons/s of the window pixels (ncols × nrows, row-major).
+        /// @param exposureTime Exposure time (s).
+        /// @param c0           Matrix column of the first window pixel.
+        /// @param r0           Matrix row of the first window pixel.
+        /// @param ncols        Window columns.
+        /// @param nrows        Window rows.
+        /// @param cfg          Runtime parameters.
+        /// @return Image of ncols × nrows pixels.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if flux
+        ///         does not have the size of the window.
         std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux,
                                                  double                        exposureTime,
                                                  const size_t&                 c0,
@@ -1061,7 +1208,7 @@ namespace phot2pix
             else
                 _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame, cfg);
 
-            return _convertFrame(frame, m_width, m_height);
+            return _convertFrame(frame, ncols, nrows);
         }
 #pragma endregion
 

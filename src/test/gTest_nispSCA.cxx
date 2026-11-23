@@ -10,7 +10,8 @@
 // (b) a single small-detector MACC exposure with statistical noise-budget
 // checks, (c) persistence, (d) 1/f noise, (e) all three combined as a smoke
 // test, (f) a full 2048x2048 exposure timed for a CPU-cost sanity check,
-// (g) per-exposure parameters (nisp::readout, expose(flux, readout)).
+// (g) per-exposure parameters (nisp::readout, expose(flux, readout)),
+// (h) full well and non-linearity in every readout mode.
 //
 // Most tests use the default MACC mode. The readout modes (selected with
 // "exposureMode") are validated on a full detector in gTest_nispReadoutModes.cxx;
@@ -20,11 +21,16 @@
 #include <gtest/gtest.h>
 #include <nisp/nispSCA.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <limits>
+#include <span>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <valarray>
 #include <vector>
 
@@ -1031,4 +1037,384 @@ TEST(SCA, ExposeWithReadoutUsesItsModeForThatExposureOnly)
 
     EXPECT_THROW(sca.expose(flux, nisp::readout{nisp::mode::CDS, std::nullopt, 0.5}), std::invalid_argument);
     expectMacc();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  (h) Full well and non-linearity
+//
+//  The full well is 20 ke- so that it is reached far below the ADC limit (65535 ADU):
+//  the NISP one (130 ke-) is above it at the NISP gain and baseline, and never shows in a
+//  MACC ramp. Response: P(Q) = Q·(1 + c2·Q + c3·Q²) of Q' = min(Q, 20 ke-), that is −4.4 %
+//  at the full well. A read is B + P(Q)/g, of variance (P'(Q)²·Q + RN²)/g².
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+    constexpr double kFullWell = 20000.0;                  // e-
+    constexpr double kC2 = -2.0e-6, kC3 = -1.0e-11;        // 1/e-, 1/e-²
+    constexpr double kGain = 2.0, kRN = 10.0, kBase = 1000.0;
+    constexpr double kS = 2000.0;                          // e- per frame: the well is full at frame 10
+    constexpr size_t kW = 128, kH = 128;
+    constexpr double kNPix  = static_cast<double>(kW * kH);
+    constexpr double kSigma = 5.0;                         // tolerance in sigma
+
+    double response(double Q, double fullWell = kFullWell)
+    {
+        const double q = std::min(Q, fullWell);
+        return q * (1.0 + q * (kC2 + q * kC3));
+    }
+
+    double responseSlope(double Q)   // P'(Q), 0 above the full well
+    {
+        return (Q < kFullWell) ? 1.0 + Q * (2.0 * kC2 + 3.0 * kC3 * Q) : 0.0;
+    }
+
+    // Full well without a model, frame time 1 s.
+    PixelConfig makeWellCfg()
+    {
+        PixelConfig cfg = makeQuietPixelCfg();
+        cfg.set("gain",       kGain);
+        cfg.set("readNoise",  kRN);
+        cfg.set("baseline",   kBase);
+        cfg.set("frame_time", 1.0);
+        cfg.set("fullWell",   kFullWell);
+        return cfg;
+    }
+
+    // The same with the polynomial model.
+    PixelConfig makeNonLinearCfg()
+    {
+        PixelConfig cfg = makeWellCfg();
+        cfg.set("nlModel", std::string("polynomial"));
+        cfg.set("nl0",     kC2);
+        cfg.set("nl1",     kC3);
+        return cfg;
+    }
+
+    const std::valarray<uint16_t>& uint16Data(const std::shared_ptr<DSL::FITScube>& img)
+    {
+        const std::valarray<uint16_t>* d = img ? img->GetData<uint16_t>() : nullptr;
+        if (!d)
+            throw std::runtime_error("output is not a uint16 image");
+        return *d;
+    }
+
+    // Mean and population variance of plane p, of n pixels.
+    std::pair<double, double> planeStats(const std::valarray<uint16_t>& d, size_t p, size_t n)
+    {
+        double sum = 0.0;
+        for (size_t i = p * n; i < (p + 1) * n; ++i)
+            sum += static_cast<double>(d[i]);
+        const double mean = sum / static_cast<double>(n);
+
+        double ss = 0.0;
+        for (size_t i = p * n; i < (p + 1) * n; ++i)
+        {
+            const double x = static_cast<double>(d[i]) - mean;
+            ss += x * x;
+        }
+        return {mean, ss / static_cast<double>(n)};
+    }
+
+    // Tolerance on the mean of n pixels: variance not reduced by the non-linearity, uint16
+    // rounding, and P(mean Q) instead of the mean of P(Q).
+    double meanTol(double Q, double n = kNPix)
+    {
+        return kSigma * std::sqrt(((Q + 2.0 * kRN * kRN) / (kGain * kGain) + 1.0 / 12.0) / n) + 0.1;
+    }
+}
+
+TEST(SCA, NoFullWellNorNonLinearityByDefault)
+{
+    nisp::SCA sca(16, 16);
+    sca.initialize(makeQuietPixelCfg());
+    for (size_t i = 0; i < sca.size(); ++i)
+        ASSERT_TRUE(std::isinf(sca.at(i).getFullWell()));
+
+    const auto  result = sca.expose(makeUniformFlux(16, 16, 10.0), nisp::macc{2, 1, 0});
+    const auto& hdu    = result->HDU();
+    for (const char* key : {"PIXFW", "NLMODEL", "PIXNL0", "PIXNL1", "PIXNL2"})
+        EXPECT_FALSE(hdu.Exists(key)) << key;
+}
+
+TEST(SCA, MaccReadsFollowTheNonLinearityThenTheFullWell)
+{
+    // 15 reads of 2 ke- each: reads 1–9 are below the full well, 11–15 above. Read 10 is
+    // at the full well, where the shot noise is cut on one side: not checked.
+    constexpr size_t nReads = 15;
+    nisp::SCA sca(kW, kH);
+    sca.initialize(makeNonLinearCfg());
+
+    const auto result = sca.expose(makeUniformFlux(kW, kH, kS), nisp::macc{nReads, 1, 0});
+    ASSERT_NE(result, nullptr);
+    ASSERT_EQ(result->Size(3), nReads);
+    const auto& data = uint16Data(result);
+
+    for (size_t k = 1; k <= nReads; ++k)
+    {
+        const double Q = static_cast<double>(k) * kS;
+        if (std::abs(Q - kFullWell) < 10.0 * std::sqrt(Q))
+            continue;
+
+        const double expectedMean = kBase + response(Q) / kGain;
+        const double slope        = responseSlope(Q);
+        const double expectedVar  = (slope * slope * Q + kRN * kRN) / (kGain * kGain) + 1.0 / 12.0;
+
+        const auto [mean, var] = planeStats(data, k - 1, kW * kH);
+        EXPECT_NEAR(mean, expectedMean, kSigma * std::sqrt(expectedVar / kNPix) + 0.1) << "read " << k;
+        EXPECT_NEAR(var,  expectedVar,  (kSigma * std::sqrt(2.0 / kNPix) + 0.01) * expectedVar)
+            << "read " << k << (Q > kFullWell ? " (above the full well: read noise only)" : " (compressed shot noise)");
+    }
+}
+
+TEST(SCA, FluxCdsAndWindowFollowTheNonLinearityThenTheFullWell)
+{
+    // One step of N frames gives the same signal as N reads of a ramp: the response only
+    // depends on the accumulated charge. 8 frames: 16 ke-, below the full well; 14: above.
+    nisp::SCA sca(kW, kH);
+    sca.initialize(makeNonLinearCfg());
+    const auto flux = makeUniformFlux(kW, kH, kS);
+
+    for (double nFrames : {8.0, 14.0})
+    {
+        const double Q        = nFrames * kS;
+        const double expected = kBase + response(Q) / kGain;
+
+        const auto single = sca.expose(flux, nisp::readout{nisp::mode::FLUX, std::nullopt, nFrames});
+        EXPECT_NEAR(planeStats(uint16Data(single), 0, kW * kH).first, expected, meanTol(Q)) << "FLUX, " << nFrames << " frames";
+
+        constexpr size_t w = 64, h = 48;
+        const auto window = sca.expose(flux, nFrames, 32, 16, w, h);
+        EXPECT_NEAR(planeStats(uint16Data(window), 0, w * h).first, expected, meanTol(Q, static_cast<double>(w * h)))
+            << "window, " << nFrames << " frames";
+
+        // Read N − read 1: the baseline cancels, each read has its own non-linearity.
+        const auto cds = sca.expose(flux, nisp::readout{nisp::mode::CDS, std::nullopt, nFrames});
+        EXPECT_NEAR(planeStats(uint16Data(cds), 0, kW * kH).first, (response(Q) - response(kS)) / kGain, meanTol(Q))
+            << "CDS, " << nFrames << " frames";
+    }
+}
+
+TEST(SCA, SaturatedReadsGiveTheFullWellOfEachPixel)
+{
+    // Full well map, gain 1, no read noise, 1e5 e- per frame: every read is exactly
+    // baseline + full well of its own pixel, and the CDS is 0.
+    constexpr size_t W = 16, H = 16;
+    auto fullWell = [](size_t x, size_t y) { return 10000.0 + static_cast<double>(x + W * y); };
+    const std::string path = writeTestMap("sca_fw_16x16.fits", W, H, fullWell);
+
+    PixelConfig cfg = makeQuietPixelCfg();
+    cfg.set("baseline",   kBase);
+    cfg.set("frame_time", 1.0);
+    cfg.set("fullWell",   path);
+    nisp::SCA sca(W, H);
+    sca.initialize(cfg);
+    const auto flux = makeUniformFlux(W, H, 1.0e5);
+
+    const auto  ramp   = sca.expose(flux, nisp::macc{2, 1, 1});
+    const auto  single = sca.expose(flux, nisp::readout{nisp::mode::FLUX, std::nullopt, 3.0});
+    const auto  cds    = sca.expose(flux, nisp::readout{nisp::mode::CDS,  std::nullopt, 3.0});
+    const auto& rampData = uint16Data(ramp);
+    for (size_t y = 0; y < H; ++y)
+        for (size_t x = 0; x < W; ++x)
+        {
+            const size_t i        = y * W + x;
+            const auto   expected = static_cast<uint16_t>(kBase + fullWell(x, y));
+            ASSERT_FLOAT_EQ(sca.at(x, y).getFullWell(), static_cast<float>(fullWell(x, y)));
+            ASSERT_EQ(rampData[i],             expected) << "MACC read 1, x = " << x << ", y = " << y;
+            ASSERT_EQ(rampData[W * H + i],     expected) << "MACC read 2, x = " << x << ", y = " << y;
+            ASSERT_EQ(uint16Data(single)[i],   expected) << "FLUX, x = " << x << ", y = " << y;
+            ASSERT_EQ(uint16Data(cds)[i],      0u)       << "CDS, x = " << x << ", y = " << y;
+        }
+
+    constexpr size_t c0 = 3, r0 = 5, w = 8, h = 6;
+    const auto window = sca.expose(flux, 3.0, c0, r0, w, h);
+    for (size_t y = 0; y < h; ++y)
+        for (size_t x = 0; x < w; ++x)
+            ASSERT_EQ(uint16Data(window)[y * w + x], static_cast<uint16_t>(kBase + fullWell(c0 + x, r0 + y)))
+                << "window, x = " << x << ", y = " << y;
+
+    EXPECT_EQ(ramp->HDU().GetValueForKey("PIXFW"), "sca_fw_16x16.fits");
+    std::filesystem::remove(path);
+}
+
+TEST(SCA, NonLinearityParametersAreReadFromMaps)
+{
+    constexpr size_t W = 16, H = 16;
+    auto c2 = [](size_t x, size_t y) { return -1.0e-6 * (1.0 + static_cast<double>(x + W * y) / 256.0); };
+    const std::string path = writeTestMap("sca_nl0_16x16.fits", W, H, c2);
+
+    PixelConfig cfg = makeNonLinearCfg();
+    cfg.set("nl0", path);
+    nisp::SCA sca(W, H);
+    sca.initialize(cfg);
+
+    for (size_t y = 0; y < H; ++y)
+        for (size_t x = 0; x < W; ++x)
+        {
+            ASSERT_FLOAT_EQ(sca.at(x, y).getFullWell(), static_cast<float>(kFullWell));
+            ASSERT_FLOAT_EQ(sca.at(x, y).getNlParam(0), static_cast<float>(c2(x, y))) << "x = " << x << ", y = " << y;
+            ASSERT_FLOAT_EQ(sca.at(x, y).getNlParam(1), static_cast<float>(kC3));
+            ASSERT_FLOAT_EQ(sca.at(x, y).getNlParam(2), 0.0f);
+        }
+    std::filesystem::remove(path);
+}
+
+TEST(SCA, NonLinearityCanBeSetWithAFunctor)
+{
+    nisp::SCA sca(kW, kH);
+    sca.initialize(makeNonLinearCfg());
+    const auto   flux = makeUniformFlux(kW, kH, kS);
+    const double Q    = 4.0 * kS;   // 8 ke-
+    auto read = [&sca, &flux]() { return sca.expose(flux, nisp::readout{nisp::mode::FLUX, std::nullopt, 4.0}); };
+
+    auto result = read();
+    EXPECT_EQ(result->HDU().GetValueForKey("NLMODEL"), "polynomial");
+    EXPECT_NEAR(planeStats(uint16Data(result), 0, kW * kH).first, kBase + response(Q) / kGain, meanTol(Q));
+
+    // Captured by value: the SCA keeps its own copy of the table.
+    const double a = 30000.0;
+    {
+        const std::vector<double> table{a};
+        sca.setNonLinearity([table](std::span<const float>, double q) { return table[0] * (1.0 - std::exp(-q / table[0])); });
+    }
+    result = read();
+    EXPECT_EQ(result->HDU().GetValueForKey("NLMODEL"), "custom");
+    EXPECT_NEAR(planeStats(uint16Data(result), 0, kW * kH).first, kBase + a * (1.0 - std::exp(-Q / a)) / kGain, meanTol(Q));
+
+    // Empty functor: linear.
+    sca.setNonLinearity(nonlinearity::functor{});
+    result = read();
+    EXPECT_EQ(result->HDU().GetValueForKey("NLMODEL"), "linear");
+    EXPECT_NEAR(planeStats(uint16Data(result), 0, kW * kH).first, kBase + Q / kGain, meanTol(Q));
+}
+
+TEST(SCA, InvalidFullWellOrNonLinearityThrows)
+{
+    const nonlinearity::functor identity   = [](std::span<const float>, double Q) { return Q; };
+    const nonlinearity::functor decreasing = [](std::span<const float>, double Q) { return Q - Q * Q / kFullWell; };
+    const nonlinearity::functor notANumber = [](std::span<const float>, double) { return std::numeric_limits<double>::quiet_NaN(); };
+
+    // Full well.
+    for (double fullWell : {0.0, -1.0})
+    {
+        PixelConfig cfg = makeQuietPixelCfg();
+        cfg.set("fullWell", fullWell);
+        nisp::SCA sca(4, 4);
+        EXPECT_THROW(sca.initialize(cfg), std::invalid_argument) << "fullWell = " << fullWell;
+    }
+
+    // Model without a full well, from the configuration or from a functor.
+    {
+        PixelConfig cfg = makeQuietPixelCfg();
+        cfg.set("nlModel", std::string("polynomial"));
+        nisp::SCA sca(4, 4);
+        EXPECT_THROW(sca.initialize(cfg), std::invalid_argument);
+
+        nisp::SCA quiet(4, 4);
+        quiet.initialize(makeQuietPixelCfg());
+        EXPECT_THROW(quiet.setNonLinearity(identity), std::invalid_argument);
+        EXPECT_NO_THROW(quiet.setNonLinearity(nonlinearity::functor{}));
+    }
+
+    // Unknown model.
+    {
+        PixelConfig cfg = makeWellCfg();
+        cfg.set("nlModel", std::string("unknown"));
+        nisp::SCA sca(4, 4);
+        EXPECT_THROW(sca.initialize(cfg), std::invalid_argument);
+    }
+
+    // Response that decreases before the full well: P is maximum at 10 ke-.
+    {
+        PixelConfig cfg = makeNonLinearCfg();
+        cfg.set("nl0", -5.0e-5);
+        nisp::SCA sca(4, 4);
+        EXPECT_THROW(sca.initialize(cfg), std::invalid_argument);
+    }
+
+    // A rejected functor leaves the model in place.
+    nisp::SCA sca(4, 4);
+    sca.initialize(makeNonLinearCfg());
+    EXPECT_THROW(sca.setNonLinearity(decreasing), std::invalid_argument);
+    EXPECT_THROW(sca.setNonLinearity(notANumber), std::invalid_argument);
+    EXPECT_EQ(sca.expose(makeUniformFlux(4, 4, 10.0), nisp::macc{2, 1, 0})->HDU().GetValueForKey("NLMODEL"), "polynomial");
+
+    // New parameters are checked with the model already set.
+    EXPECT_THROW(sca.initialize(PixelConfig{{"nl0", -5.0e-5}}), std::invalid_argument);
+}
+
+TEST(SCA, OutputHeaderRecordsTheFullWellAndTheNonLinearity)
+{
+    nisp::SCA sca(4, 4);
+    sca.initialize(makeNonLinearCfg());
+    const auto  result = sca.expose(makeUniformFlux(4, 4, 10.0), nisp::macc{2, 1, 0});
+    const auto& hdu    = result->HDU();
+
+    EXPECT_NEAR (hdu.GetDoubleValueForKey("PIXFW"), kFullWell, 1e-9);
+    EXPECT_EQ   (hdu.GetValueForKey("NLMODEL"), "polynomial");
+    EXPECT_NEAR (hdu.GetDoubleValueForKey("PIXNL0"), kC2, 1e-6 * std::abs(kC2));   // not written as 0
+    EXPECT_NEAR (hdu.GetDoubleValueForKey("PIXNL1"), kC3, 1e-6 * std::abs(kC3));
+    EXPECT_FALSE(hdu.Exists("PIXNL2"));   // not given
+}
+
+TEST(SCA, DpuSlopeFollowsTheNonLinearity)
+{
+    // MACC(4,4,4), 200 e- per frame, gain 1 and no read noise: 5.6 ke- at the last read.
+    // The DPU fits a straight line, so the slope is that of the chord between the first and
+    // the last group: −1.2 % here. It is compared with the slope of the same linear pixels.
+    constexpr size_t nG = 4, nR = 4, nD = 4;
+    constexpr double S  = 200.0;
+    auto dpuMean = [](PixelConfig cfg)
+    {
+        cfg.set("gain",         1.0);
+        cfg.set("readNoise",    0.0);
+        cfg.set("exposureMode", std::string("DPU"));
+        nisp::SCA sca(kW, kH);
+        sca.initialize(cfg);
+        const auto result = sca.expose(makeUniformFlux(kW, kH, S), nisp::macc{nG, nR, nD});
+        return planeStats(uint16Data(result), 0, kW * kH).first;
+    };
+
+    // Average charge and average response of the reads of group g.
+    auto group = [](size_t g)
+    {
+        double Q = 0.0, P = 0.0;
+        for (size_t r = 1; r <= nR; ++r)
+        {
+            const double q = S * static_cast<double>(g * (nR + nD) + r);
+            Q += q / static_cast<double>(nR);
+            P += response(q) / static_cast<double>(nR);
+        }
+        return std::make_pair(Q, P);
+    };
+    const auto [Q0, P0] = group(0);
+    const auto [Q3, P3] = group(nG - 1);
+
+    const double linear    = dpuMean(makeWellCfg());
+    const double nonLinear = dpuMean(makeNonLinearCfg());
+    EXPECT_NEAR(linear, S * static_cast<double>(nR + nD), 2.0);
+    EXPECT_NEAR(nonLinear / linear, (P3 - P0) / (Q3 - Q0), 1.5e-3);
+}
+
+TEST(SCA, DpuDoesNotFlagAPlateauBelowTheAdcLimit)
+{
+    // The NISP DPU only tests 65535: a pixel whose full well is below is not flagged, and
+    // its plateau is fitted as signal. Full well 3 ke-, 1600 e- per group: the group
+    // averages are 500, 2100, 3000 and 3000 e-, that is a slope of √((1600² + 900²) / 3).
+    PixelConfig cfg = makeWellCfg();
+    cfg.set("gain",         1.0);
+    cfg.set("readNoise",    0.0);
+    cfg.set("fullWell",     3000.0);
+    cfg.set("exposureMode", std::string("DPU"));
+    nisp::SCA sca(kW, kH);
+    sca.initialize(cfg);
+
+    const auto  result = sca.expose(makeUniformFlux(kW, kH, 200.0), nisp::macc{4, 4, 4});
+    const auto& data   = uint16Data(result);
+    const auto flagged = std::count(std::begin(data), std::begin(data) + kW * kH, uint16_t(65535));   // slope plane
+    EXPECT_EQ(flagged, 0) << "a plateau below the ADC limit must not be flagged";
+
+    const double expected = std::sqrt((1600.0 * 1600.0 + 900.0 * 900.0) / 3.0);   // 1059.9 ADU, instead of 1600
+    EXPECT_NEAR(planeStats(data, 0, kW * kH).first, expected, 0.01 * expected);
 }

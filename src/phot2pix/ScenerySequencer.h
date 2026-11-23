@@ -6,28 +6,32 @@
 //
 // ScenerySequencer.h
 //
-// A sequence of exposures read from the configuration, simulated in order on one detector:
-//
-//   "flux": [ {"file": "<path>", "hdu": <index or EXTNAME>, "exposureTime": <s>, "output": "<path>"}, ... ]
-//
-//   "file"          FITS image of the flux (photons/s/pixel), matrix-sized or detector-sized
-//                   (see DetectorSimulator::toMatrix()).
-//   "hdu"           HDU index (1 = primary) or EXTNAME of "file". Default: 1.
-//   "flux"          Uniform flux (photons/s/pixel, >= 0) applied to every pixel, instead of
-//                   "file" (e.g. 0 for a dark exposure). Exactly one of "file" or "flux".
-//   "exposureTime"  Exposure time (s), > 0. Required by this class; a detector family may
-//                   accept another timing instead (NISP: "macc", see nisp::ScenerySequencer).
-//   "output"        File the exposure is written to (replaced if it exists). Without it the
-//                   exposure is simulated but not saved: it still counts for the effects that
-//                   remember the past exposures (persistence).
-//
-// Each exposure is saved as soon as it is simulated, so only one is in memory at a time, with
-// the cards FLUX ("file.fits[hdu]" or the uniform value), SEQIDX (its number, from 1) and SEQNUM (number of
-// exposures in the sequence).
-//
-// A detector family derives from ScenerySequencer to accept its own keys (_checkExposure())
-// and adds a run() for its own detector, which calls that detector's exposure function
-// (NISP: run(SCA&) calls SCA::expose()).
+/// @file ScenerySequencer.h
+/// @brief A sequence of exposures read from the configuration, simulated in order on one detector
+///        (phot2pix::ScenerySequencer).
+///
+/// @verbatim
+///   "flux": [ {"file": "<path>", "hdu": <index or EXTNAME>, "exposureTime": <s>, "output": "<path>"}, ... ]
+///
+///   "file"          FITS image of the flux (photons/s/pixel), matrix-sized or detector-sized
+///                   (see DetectorSimulator::toMatrix()).
+///   "hdu"           HDU index (1 = primary) or EXTNAME of "file". Default: 1.
+///   "flux"          Uniform flux (photons/s/pixel, >= 0) applied to every pixel, instead of
+///                   "file" (e.g. 0 for a dark exposure). Exactly one of "file" or "flux".
+///   "exposureTime"  Exposure time (s), > 0. Required by this class; a detector family may
+///                   accept another timing instead (NISP: "macc", see nisp::ScenerySequencer).
+///   "output"        File the exposure is written to (replaced if it exists). Without it the
+///                   exposure is simulated but not saved: it still counts for the effects that
+///                   remember the past exposures (persistence).
+/// @endverbatim
+///
+/// Each exposure is saved as soon as it is simulated, so only one is in memory at a time, with
+/// the cards FLUX ("file.fits[hdu]" or the uniform value), SEQIDX (its number, from 1) and SEQNUM
+/// (number of exposures in the sequence).
+///
+/// A detector family derives from ScenerySequencer to accept its own keys (_checkExposure())
+/// and adds a run() for its own detector, which calls that detector's exposure function
+/// (NISP: run(SCA&) calls SCA::expose()).
 //
 // Later:
 //   The scene will be built by generators owned by this class (sky, sky background,
@@ -61,10 +65,12 @@
 
 namespace phot2pix
 {
+    /// @brief Sequence of exposures of the "flux" array, simulated in order on one detector
+    ///        (see ScenerySequencer.h).
     class ScenerySequencer
     {
     public:
-        /// One entry of the "flux" array.
+        /// @brief One entry of the "flux" array.
         struct Exposure
         {
             size_t      index;   ///< position in the "flux" array, from 0
@@ -74,36 +80,45 @@ namespace phot2pix
             std::string output;  ///< the entry's "output"; empty → not saved
         };
 
+        /// @brief Empty sequence: call initialize().
         ScenerySequencer() = default;
+        /// @brief Destructor.
         virtual ~ScenerySequencer() = default;
 
-        /// True if cfg holds a sequence of exposures: "flux" is a JSON array.
+        /// @brief True if cfg holds a sequence of exposures: "flux" is a JSON array.
         static bool inConfig(const PixelConfig& cfg);
 
-        /// Read and check every entry of the "flux" array (see the top of this file), then
-        /// _checkExposure() for each. Throws std::invalid_argument, naming the entry, if one is
-        /// malformed; the previous sequence is then kept.
+        /// @brief Read and check every entry of the "flux" array (see ScenerySequencer.h), then
+        ///        _checkExposure() for each.
+        /// @param cfg Configuration.
+        /// @throws std::invalid_argument, naming the entry, if one is malformed; the previous
+        ///         sequence is then kept.
         virtual void initialize(const PixelConfig& cfg);
 
+        /// @brief Number of exposures.
         size_t size() const { return m_exposures.size(); }
+        /// @brief The exposures, in array order.
         const std::vector<Exposure>& getExposures() const { return m_exposures; }
 
-        /// Directory the outputs are written to: a relative "output" is taken relative to it, an
-        /// absolute one is kept. Created when the first output is written. Default: none (the
-        /// current directory).
+        /// @brief Set the directory the outputs are written to.
+        /// @details A relative "output" is taken relative to it, an absolute one is kept. Created
+        ///          when the first output is written. Default: none (the current directory).
+        /// @param directory Directory; empty for the current one.
         void setOutputDirectory(const std::string& directory) { m_outputDirectory = directory; }
+        /// @brief Directory the outputs are written to; empty for the current one.
         const std::string& getOutputDirectory() const { return m_outputDirectory; }
 
-        /// File an exposure is written to: its "output" in the output directory; empty when the
-        /// exposure is not saved.
+        /// @brief File an exposure is written to: its "output" in the output directory.
+        /// @return Path; empty when the exposure is not saved.
         std::string outputPath(const Exposure& e) const;
 
-        /// Simulate the exposures in array order on detector (already initialized):
-        /// simulate(flux, "exposureTime") for each, saved when it has an "output".
-        /// Throws std::logic_error if initialize() has not been called.
-        ///
-        /// Not virtual: DetectorSimulator is a template. A detector family adds its own run()
-        /// overload, which hides this one (nisp::ScenerySequencer::run(SCA&)).
+        /// @brief Simulate the exposures in array order.
+        /// @details simulate(flux, "exposureTime") for each, saved when it has an "output".
+        ///          Not virtual: DetectorSimulator is a template. A detector family adds its own run()
+        ///          overload, which hides this one (nisp::ScenerySequencer::run(SCA&)).
+        /// @tparam PixelT Pixel model of the detector.
+        /// @param detector Detector, already initialized.
+        /// @throws std::logic_error if initialize() has not been called.
         template<typename PixelT>
         void run(const DetectorSimulator<PixelT>& detector) const
         {
@@ -116,19 +131,25 @@ namespace phot2pix
         }
 
     protected:
-        /// Check the detector-specific keys of one entry; called by initialize(). Throws
-        /// (any std::exception) if the entry cannot be simulated. Requires "exposureTime".
+        /// @brief Check the detector-specific keys of one entry; called by initialize().
+        /// @details This class requires "exposureTime".
+        /// @param e Entry.
+        /// @throws std::exception (any) if the entry cannot be simulated.
         virtual void _checkExposure(const Exposure& e) const;
 
-        /// Write the FLUX, SEQIDX and SEQNUM cards into image and, when e.output is set,
-        /// write image to outputPath(e) (replacing it; its directory is created if missing).
+        /// @brief Write the FLUX, SEQIDX and SEQNUM cards into image and, when e.output is set,
+        ///        write image to outputPath(e).
+        /// @details An existing file is replaced; its directory is created if missing.
+        /// @param e     Exposure.
+        /// @param image Simulated image of that exposure.
         void _save(const Exposure& e, DSL::FITScube& image) const;
 
-        /// Throws std::logic_error if initialize() has not been called.
+        /// @brief Check that there is a sequence.
+        /// @throws std::logic_error if initialize() has not been called.
         void _checkInitialized() const;
 
     private:
-        std::vector<Exposure> m_exposures;
+        std::vector<Exposure> m_exposures;         ///< The exposures, in array order
         std::string           m_outputDirectory;   ///< see setOutputDirectory(); empty → current directory
     };
 }

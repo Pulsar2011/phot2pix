@@ -8,7 +8,7 @@
     "flux"         : 10.0,
 
     "exposureMode" : "MACC",
-    "macc"         : [4, 16, 4],
+    "macc"         : [4, 16, 11],
 
     "frame_time"   : 1.45408,
     "offset"       : 0.0,
@@ -19,5 +19,10 @@
     "readNoise"    : 0.0,
     "QE"           : 1.0,
     "KTCnoise"     : 0.0,
-    "baseline"     : 0.0
+    "baseline"     : 0.0,
+
+    "fullWell"     : 130000.0,
+    "nlModel"      : "polynomial",
+    "nl0"          : -6.25e-7,
+    "nl1"          : -3.1e-13
 }

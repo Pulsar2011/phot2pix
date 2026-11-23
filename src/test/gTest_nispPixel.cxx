@@ -13,6 +13,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <valarray>
 #include <vector>
@@ -38,7 +41,7 @@ static double expectedKubicFlux(double c, double gain, size_t nf, size_t nd)
 {
     const double alpha = (1.0 - static_cast<double>(nf) * static_cast<double>(nf))
                         / (3.0 * static_cast<double>(nf) * (static_cast<double>(nf) + static_cast<double>(nd)));
-    const double fe    = 1.0 / gain;
+    const double fe    = gain;   // e-/ADU
     const double gamma = (2.0 * fe) / (alpha + 1.0);
     const double ffit  = c * c;
     return (1.0 / gamma) * (std::sqrt(1.0 + gamma * gamma * ffit) - 1.0);
@@ -253,6 +256,219 @@ TEST(nispPixel, ReadWithoutReadNoiseIsExact)
 {
     nisp::pixel p(0.0, 0.0, 2.0, 1.0, 0.0, 0.0);
     EXPECT_DOUBLE_EQ(p.read(123.25), 123.25);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  nisp::pixel — full well and non-linearity: read(charge, nl)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+    constexpr float  kFullWell = 130000.0f;                  // e-
+    constexpr float  kC2 = -6.0e-7f, kC3 = -3.1e-13f;        // 1/e-, 1/e-²
+    constexpr double kGain = 1.92, kBaseline = 10000.0;      // e-/ADU, ADU
+
+    // Noiseless pixel with a full well and the coefficients of the polynomial model.
+    nisp::pixel makeWellPixel(double readNoise = 0.0)
+    {
+        nisp::pixel p(0.0, readNoise, kGain, 1.0, 0.0, kBaseline);
+        p.setFullWell(kFullWell);
+        p.setNlParam(0, kC2);
+        p.setNlParam(1, kC3);
+        return p;
+    }
+
+    // Accumulated charge (ADU, reset level included) of Q electrons.
+    double charge(double Q) { return kBaseline + Q / kGain; }
+
+    // Q·(1 + c2·Q + c3·Q²), with the coefficients the pixel holds (float).
+    double polynomialResponse(double Q)
+    {
+        const double c2 = kC2, c3 = kC3;
+        return Q + c2 * Q * Q + c3 * Q * Q * Q;
+    }
+}
+
+TEST(nispPixel, NoFullWellByDefault)
+{
+    // Infinite full well: read(charge, nl) is read(charge), whatever the model.
+    nisp::pixel p(0.0, 0.0, kGain, 1.0, 0.0, kBaseline);
+    EXPECT_TRUE(std::isinf(p.getFullWell()));
+    for (size_t k = 0; k < nonlinearity::nParam; ++k)
+        EXPECT_FLOAT_EQ(p.getNlParam(k), 0.0f) << "parameter " << k;
+
+    const nonlinearity::functor half = [](std::span<const float>, double Q) { return 0.5 * Q; };
+    for (double Q : {0.0, 1.0e3, 1.0e6, 1.0e9})
+        EXPECT_DOUBLE_EQ(p.read(charge(Q), half), p.read(charge(Q))) << "Q = " << Q;
+}
+
+TEST(nispPixel, ReadAppliesTheNonLinearityBelowTheFullWell)
+{
+    const nisp::pixel           p  = makeWellPixel();
+    const nonlinearity::functor nl = nonlinearity::polynomial;
+
+    for (double Q : {0.0, 1.0, 1.0e3, 2.0e4, 8.0e4, 1.299e5})
+        EXPECT_NEAR(p.read(charge(Q), nl), charge(polynomialResponse(Q)), 1e-6) << "Q = " << Q;
+
+    // These coefficients are those of a 5 % deviation at 80 ke-.
+    const double measured = (p.read(charge(8.0e4), nl) - kBaseline) * kGain;
+    EXPECT_NEAR(measured / 8.0e4 - 1.0, -0.05, 1e-4);
+}
+
+TEST(nispPixel, ReadIsConstantAboveTheFullWell)
+{
+    const nisp::pixel           p  = makeWellPixel();
+    const nonlinearity::functor nl = nonlinearity::polynomial;
+
+    const double plateau = charge(polynomialResponse(kFullWell));
+    for (double Q : {1.0 * kFullWell, 1.001 * kFullWell, 2.0 * kFullWell, 1.0e7})
+        EXPECT_NEAR(p.read(charge(Q), nl), plateau, 1e-6) << "Q = " << Q;
+}
+
+TEST(nispPixel, EmptyModelIsLinearUpToTheFullWell)
+{
+    const nisp::pixel           p = makeWellPixel();
+    const nonlinearity::functor none;
+
+    for (double Q : {1.0e3, 8.0e4})
+        EXPECT_NEAR(p.read(charge(Q), none), charge(Q), 1e-6) << "Q = " << Q;
+    for (double Q : {1.4e5, 1.0e7})
+        EXPECT_NEAR(p.read(charge(Q), none), charge(kFullWell), 1e-6) << "Q = " << Q;
+}
+
+TEST(nispPixel, BaselineDoesNotFillTheWell)
+{
+    // The baseline is an electronic offset: a baseline larger than the full well
+    // changes neither the non-linearity nor the plateau.
+    const nonlinearity::functor nl = nonlinearity::polynomial;
+    nisp::pixel low (0.0, 0.0, 1.0, 1.0, 0.0, 0.0);
+    nisp::pixel high(0.0, 0.0, 1.0, 1.0, 0.0, 50000.0);
+    for (nisp::pixel* p : {&low, &high})
+    {
+        p->setFullWell(20000.0f);
+        p->setNlParam(0, -2.0e-6f);
+    }
+
+    EXPECT_DOUBLE_EQ(high.read(50000.0, nl), 50000.0);
+    for (double Q : {1.0e3, 1.5e4, 2.0e4, 1.0e5})
+        EXPECT_NEAR(high.read(50000.0 + Q, nl) - 50000.0, low.read(Q, nl), 1e-6) << "Q = " << Q;
+}
+
+TEST(nispPixel, ChargeBelowTheBaselineIsLinear)
+{
+    // kTC noise can put the charge below the baseline. A model is not called there:
+    // this one would return NaN.
+    const nisp::pixel           p  = makeWellPixel();
+    const nonlinearity::functor nl = [](std::span<const float>, double Q) { return std::exp(std::log(Q)); };
+
+    EXPECT_NEAR(p.read(kBaseline - 50.0, nl), kBaseline - 50.0, 1e-9);
+    EXPECT_NEAR(p.read(kBaseline,        nl), kBaseline,        1e-9);
+}
+
+TEST(nispPixel, ModelReceivesTheParametersOfThePixelAndItsCaptures)
+{
+    nisp::pixel p;
+    p.setFullWell(20000.0f);
+    const std::vector<float> values{0.125f, 0.5f, 0.0625f};
+    ASSERT_EQ(values.size(), nonlinearity::nParam);
+    for (size_t k = 0; k < values.size(); ++k)
+        p.setNlParam(k, values[k]);
+
+    const double captured = 0.25;
+    size_t       nParam   = 0;
+    const nonlinearity::functor f = [captured, &nParam](std::span<const float> param, double Q)
+    {
+        nParam = param.size();
+        return Q * (captured + param[0] + param[1] + param[2]);   // Q × 0.9375
+    };
+
+    EXPECT_DOUBLE_EQ(p.nlResponse(1000.0, f), 937.5);
+    EXPECT_EQ(nParam, nonlinearity::nParam);
+}
+
+TEST(nispPixel, CopiesKeepTheFullWellAndTheNonLinearity)
+{
+    const nisp::pixel           original = makeWellPixel();
+    const nonlinearity::functor nl       = nonlinearity::polynomial;
+
+    const nisp::pixel copy(original);
+    nisp::pixel       assigned;
+    assigned = original;
+
+    for (const nisp::pixel* p : {&copy, static_cast<const nisp::pixel*>(&assigned)})
+    {
+        EXPECT_FLOAT_EQ(p->getFullWell(), kFullWell);
+        EXPECT_FLOAT_EQ(p->getNlParam(0), kC2);
+        EXPECT_FLOAT_EQ(p->getNlParam(1), kC3);
+        for (double Q : {8.0e4, 1.0e7})
+            EXPECT_DOUBLE_EQ(p->read(charge(Q), nl), original.read(charge(Q), nl)) << "Q = " << Q;
+    }
+}
+
+TEST(nispPixel, InvalidFullWellOrParameterThrows)
+{
+    nisp::pixel p = makeWellPixel();
+    EXPECT_THROW(p.setFullWell(0.0f),                                    std::invalid_argument);
+    EXPECT_THROW(p.setFullWell(-1.0f),                                   std::invalid_argument);
+    EXPECT_THROW(p.setFullWell(std::numeric_limits<float>::quiet_NaN()), std::invalid_argument);
+    EXPECT_FLOAT_EQ(p.getFullWell(), kFullWell) << "a rejected value must not be kept";
+
+    EXPECT_THROW(p.setNlParam(nonlinearity::nParam, 0.0f), std::out_of_range);
+}
+
+TEST(nispPixel, StoredChargeIsLimitedByTheFullWell)
+{
+    const nisp::pixel p = makeWellPixel();
+    EXPECT_DOUBLE_EQ(p.storedCharge(1000.0), 1000.0);
+    EXPECT_DOUBLE_EQ(p.storedCharge(1.0e7),  static_cast<double>(kFullWell));
+
+    const nisp::pixel none;
+    EXPECT_DOUBLE_EQ(none.storedCharge(1.0e7), 1.0e7);
+}
+
+TEST(nispPixel, ReadNoiseIsNotCompressed)
+{
+    // The read noise is added after the full well and the non-linearity: at any charge,
+    // below or above the full well, the read variance is (RN/gain)².
+    constexpr double readNoise = 13.0;
+    constexpr double var       = (readNoise / kGain) * (readNoise / kGain);
+    const nisp::pixel           p  = makeWellPixel(readNoise);
+    const nonlinearity::functor nl = nonlinearity::polynomial;
+
+    constexpr double k       = 5.0;
+    constexpr size_t nSample = 10'000;
+    const double     n       = static_cast<double>(nSample);
+
+    for (double Q : {8.0e4, 1.0e7})
+    {
+        const double expected = charge(polynomialResponse(std::min<double>(Q, kFullWell)));
+
+        double sigMean = 0.0, sigVar = 0.0;
+        for (size_t i = 0; i < nSample; ++i)
+        {
+            const double x = p.read(charge(Q), nl) - expected;
+            sigMean += x;
+            sigVar  += x * x;
+        }
+        sigMean /= n;
+        sigVar   = sigVar / n - sigMean * sigMean;
+
+        EXPECT_NEAR(sigMean, 0.0, k * std::sqrt(var / n))                  << "Q = " << Q;
+        EXPECT_NEAR(sigVar,  var, k * std::sqrt(2.0) * var / std::sqrt(n)) << "Q = " << Q;
+    }
+}
+
+TEST(nispPixel, NonLinearityModelFromItsName)
+{
+    const nonlinearity::functor f = nonlinearity::fromString("polynomial");
+    ASSERT_TRUE(f);
+
+    const std::vector<float> param{kC2, kC3, 0.0f};
+    EXPECT_DOUBLE_EQ(f(param, 8.0e4), nonlinearity::polynomial(param, 8.0e4));
+    EXPECT_NEAR     (f(param, 8.0e4), polynomialResponse(8.0e4), 1e-6);
+
+    EXPECT_THROW(nonlinearity::fromString("unknown"), std::invalid_argument);
+    EXPECT_THROW(nonlinearity::fromString(""),        std::invalid_argument);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

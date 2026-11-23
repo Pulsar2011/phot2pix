@@ -19,5 +19,10 @@
     "readNoise"    : 0.0,
     "QE"           : 1.0,
     "KTCnoise"     : 0.0,
-    "baseline"     : 0.0
+    "baseline"     : 0.0,
+
+    "fullWell"     : 130000.0,
+    "nlModel"      : "polynomial",
+    "nl0"          : 0.0,
+    "nl1"          : 0.0
 }

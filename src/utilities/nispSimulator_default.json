@@ -21,6 +21,11 @@
     "KTCnoise"     : 48.0,
     "baseline"     : 10000.0,
 
+    "fullWell"     : 130000.0,
+    "nlModel"      : "polynomial",
+    "nl0"          : -6.25e-7,
+    "nl1"          : 0.0,
+
     "oneOverF"     : {
         "amplitude"     : 0.0,
         "slope"         : 1.0,

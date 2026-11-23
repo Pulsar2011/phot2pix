@@ -6,6 +6,8 @@
 //
 // PixelConfig.h
 //
+/// @file PixelConfig.h
+/// @brief phot2pix::PixelConfig, the typed key/value configuration, and the FITS header cards built from it.
 
 #ifndef P2P_PIXEL_CONFIG_H
 #define P2P_PIXEL_CONFIG_H
@@ -25,21 +27,20 @@
 
 namespace phot2pix
 {
+    /// @brief JSON value (nlohmann::json).
     using json = nlohmann::json;
 
-    /// Value of a FITS header card: a number, a count, or a string.
+    /// @brief Value of a FITS header card: a number, a count, or a string.
     using CardValue = std::variant<double, size_t, std::string>;
 
-    /// One FITS header card describing a simulation input: keyword (at most 8
-    /// characters), value, and a comment that starts with the unit in square
-    /// brackets, following the FITS convention ("[e-/ADU] Pixel gain").
-    /// PixelConfig::card() builds the value of an input as the configuration gave
-    /// it; DetectorSimulator records and writes the cards of its inputs.
+    /// @brief One FITS header card describing a simulation input.
+    /// @details PixelConfig::card() builds the value of an input as the configuration gave
+    ///          it; DetectorSimulator records and writes the cards of its inputs.
     struct HeaderCard
     {
-        std::string key;
-        CardValue   value;
-        std::string comment;
+        std::string key;       ///< Keyword, at most 8 characters
+        CardValue   value;     ///< Value
+        std::string comment;   ///< Comment, starting with the unit in square brackets ("[e-/ADU] Pixel gain")
     };
 
     /**
@@ -52,34 +53,42 @@ namespace phot2pix
      * passing the config up to the parent constructor.
      *
      * Usage:
+     * @code
      *   PixelConfig cfg = {{"dark", 0.001}, {"readNoise", 5.0}, {"gain", 1.5}};
      *   double rn = cfg.get<double>("readNoise");          // throws if missing
      *   double rn = cfg.get<double>("readNoise", 3.0);     // with default
+     * @endcode
      */
     class PixelConfig
     {
     public:
-        // size_t is listed only when it is a type of its own. On macOS it is (unsigned long, while
-        // uint64_t is unsigned long long); on 64-bit Linux both are unsigned long, and a variant
-        // holding the same type twice rejects assignment, get<T>() and holds_alternative<T>() for it.
+        /// @brief Stored value.
+        /// @details size_t is listed only when it is a type of its own. On macOS it is (unsigned long, while
+        ///          uint64_t is unsigned long long); on 64-bit Linux both are unsigned long, and a variant
+        ///          holding the same type twice rejects assignment, get<T>() and holds_alternative<T>() for it.
         using Value = std::conditional_t<std::is_same_v<size_t, uint64_t>,
             std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t,         float, double, std::string, json>,
             std::variant<bool, int8_t, int16_t, int32_t, int64_t, uint8_t, uint16_t, uint32_t, uint64_t, size_t, float, double, std::string, json>>;
 
+        /// @brief Empty configuration.
         PixelConfig() = default;
 
-        /// Brace-list construction: {{"dark", 0.001}, {"readNoise", 5.0}, ...}
+        /// @brief Brace-list construction: {{"dark", 0.001}, {"readNoise", 5.0}, ...}
+        /// @param params Keys and values.
         PixelConfig(std::initializer_list<std::pair<const std::string, Value>> params)
             : m_params(params)
         {}
 
-        /// Build from an already-parsed nlohmann::json object.
+        /// @brief Build from an already-parsed nlohmann::json object.
+        /// @param j JSON object; null values are ignored.
         explicit PixelConfig(const json& j)
         {
             _fromJson(j);
         }
 
-        /// Build from a JSON file path.
+        /// @brief Build from a JSON file.
+        /// @param filepath Path of the file.
+        /// @throws std::runtime_error if the file cannot be opened; json::parse_error if it is not valid JSON.
         explicit PixelConfig(const std::string& filepath)
         {
             std::ifstream file(filepath);
@@ -92,8 +101,11 @@ namespace phot2pix
         //  Accessors
         // ------------------------------------------------------------------ //
 
-        /// Retrieve a value with the expected type T. Throws if key is absent
-        /// or the stored type does not match T.
+        /// @brief Value of a key, with the expected type T.
+        /// @tparam T Stored type, without conversion (see getAsDouble() for numbers).
+        /// @param key Key.
+        /// @return Stored value.
+        /// @throws std::out_of_range if key is absent, std::bad_variant_access if the stored type is not T.
         template<typename T>
         T get(const std::string& key) const
         {
@@ -105,7 +117,11 @@ namespace phot2pix
             return std::get<T>(it->second);
         }
 
-        /// Retrieve a value, returning defaultVal if the key is absent.
+        /// @brief Value of a key, or defaultVal if the key is absent.
+        /// @tparam T Stored type, without conversion.
+        /// @param key        Key.
+        /// @param defaultVal Value returned when key is absent.
+        /// @throws std::bad_variant_access if the key is present with another type.
         template<typename T>
         T get(const std::string& key, T defaultVal) const
         {
@@ -116,30 +132,36 @@ namespace phot2pix
             return std::get<T>(it->second);
         }
 
-        /// Store or overwrite a value.
+        /// @brief Store or overwrite a value.
+        /// @tparam T One of the types of Value.
+        /// @param key   Key.
+        /// @param value Value.
         template<typename T>
         void set(const std::string& key, T value)
         {
             m_params[key] = Value(std::move(value));
         }
 
+        /// @brief True if key is present.
         bool has(const std::string& key) const
         {
             return m_params.count(key) != 0;
         }
 
-        /// Merge entries from another PixelConfig (existing keys are NOT overwritten).
+        /// @brief Merge entries from another PixelConfig (existing keys are NOT overwritten).
+        /// @param defaults Entries to add.
         void mergeDefaults(const PixelConfig& defaults)
         {
             for (const auto& [k, v] : defaults.m_params)
                 m_params.emplace(k, v);   // emplace does nothing if key exists
         }
 
-        /// Return the stored value cast to double, regardless of the stored numeric type.
-        /// Works for all arithmetic types (double, float, int64_t, uint64_t, …).
-        /// std::string is not convertible to double and causes std::invalid_argument.
-        /// Throws std::out_of_range   if key is absent.
-        /// Throws std::invalid_argument if the stored type is not numeric.
+        /// @brief Stored value cast to double, whatever the stored numeric type.
+        /// @details Works for all arithmetic types (double, float, int64_t, uint64_t, …).
+        /// @param key Key.
+        /// @throws std::out_of_range     if key is absent.
+        /// @throws std::invalid_argument if the stored value is a string.
+        /// @throws json::type_error      if it is a JSON array or object.
         double getAsDouble(const std::string& key) const
         {
             auto it = m_params.find(key);
@@ -155,7 +177,9 @@ namespace phot2pix
             }, it->second);
         }
 
-        /// Return the raw json node for array/object keys. Throws if absent or not a json type.
+        /// @brief JSON node of an array or object key.
+        /// @param key Key.
+        /// @throws std::out_of_range if key is absent, std::invalid_argument if it is not a JSON array or object.
         const json& getJson(const std::string& key) const
         {
             auto it = m_params.find(key);
@@ -166,13 +190,15 @@ namespace phot2pix
             return std::get<json>(it->second);
         }
 
-        /// Non-throwing overload: returns defaultVal if the key is absent or non-numeric.
+        /// @brief Non-throwing overload: defaultVal if the key is absent or not numeric.
+        /// @param key        Key.
+        /// @param defaultVal Value returned when key is absent or not numeric.
         double getAsDouble(const std::string& key, double defaultVal) const noexcept
         {
             try { return getAsDouble(key); } catch (...) { return defaultVal; }
         }
 
-        /// Serialize back to a nlohmann::json object.
+        /// @brief Serialize back to a nlohmann::json object.
         json toJson() const
         {
             json j;
@@ -183,15 +209,19 @@ namespace phot2pix
             return j;
         }
 
-        /// Header-card value describing the input `key` as the configuration gave it,
-        /// in the forms DetectorSimulator::initialize() accepts for a per-pixel parameter:
+        /// @brief Header-card value describing the input `key` as the configuration gave it.
+        /// @details In the forms DetectorSimulator::initialize() accepts for a per-pixel parameter:
+        /// @verbatim
         ///   "key": number                        → the number
         ///   "key": "path" [+ "key.hdu": h]       → "file.fits" or "file.fits[h]"
         ///   "key": {"file": "path", "hdu": h}    → "file.fits[h]"
         ///   "key.file": "path" [+ "key.hdu": h]  → "file.fits[h]"
         ///   any other JSON value                 → its compact JSON text
+        /// @endverbatim
         /// Only the file name is kept, not its directory: a FITS string value holds at
-        /// most 68 characters. Returns nullopt when the key is absent.
+        /// most 68 characters.
+        /// @param key Key.
+        /// @return The card value; nullopt when the key is absent.
         std::optional<CardValue> card(const std::string& key) const
         {
             const auto sibling = [this, &key]() -> json
@@ -233,19 +263,21 @@ namespace phot2pix
         }
 
     private:
-        std::unordered_map<std::string, Value> m_params;
+        std::unordered_map<std::string, Value> m_params;   ///< Keys and values
 
+        /// @brief JSON form of a stored value.
         static json _toJson(const Value& v)
         {
             return std::visit([](const auto& x) { return json(x); }, v);
         }
 
+        /// @brief File name of a path, without its directory.
         static std::string _fileName(const std::string& path)
         {
             return std::filesystem::path(path).filename().string();
         }
 
-        // "[h]" for an HDU given as an index or an EXTNAME, "" when absent.
+        /// @brief "[h]" for an HDU given as an index or an EXTNAME, "" when absent.
         static std::string _hduSuffix(const json& hdu)
         {
             if (hdu.is_number())
@@ -255,7 +287,7 @@ namespace phot2pix
             return "";
         }
 
-        // {"file": path, "hdu": h} → "file.fits[h]"; anything else → fallback.
+        /// @brief {"file": path, "hdu": h} → "file.fits[h]"; anything else → fallback.
         static std::string _fileCard(const json& j, const std::string& fallback)
         {
             if (j.is_object() && j.contains("file") && j["file"].is_string())
@@ -263,6 +295,7 @@ namespace phot2pix
             return fallback;
         }
 
+        /// @brief Store every entry of a JSON object, with the C++ type of its value (null is ignored).
         void _fromJson(const json& j)
         {
             for (const auto& [k, v] : j.items())

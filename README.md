@@ -1,3 +1,5 @@
+![Project logo](Phot2Pix.png)
+
 # phot2pix
 
 **Photon-to-Pixel CCD/CMOS sensor simulator library**

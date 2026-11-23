@@ -5,6 +5,12 @@
 //  You may share and adapt this code with attribution, Non Comercial use only.
 //
 //
+/// @file nispSimulator.cxx
+/// @brief Command-line tool: simulates one NISP detector from a JSON configuration.
+///
+/// The detector keys are read by nisp::SCA. This tool reads the matrix size ("width", "height"), the
+/// flux ("flux"), the timing ("exposureTime" or the MACC parameters) and "benchmark". A "flux" array
+/// is a sequence of exposures, see nisp::ScenerySequencer.
 
 #include <nisp/nispSCA.h>
 #include <nisp/nispScenerySequencer.h>
@@ -29,13 +35,16 @@
 
 using namespace DSL;
 
-const std::string DSF_need = "v1.5.0";
-const std::string ThisVersion = "v0.1.0";
+const std::string DSF_need = "v1.5.0";      ///< Oldest DSF version the tool works with
+const std::string ThisVersion = "v0.1.0";   ///< Version of the tool
 
+/// @brief Command-line options of nispSimulator.
 class InputParameters : public DOption
 {
     public:
-    
+
+    /// @brief Declare the options of the tool.
+    /// @throws std::runtime_error if the installed DSF is older than DSF_need.
     InputParameters():DOption()
     {
         AddDescription("Generate NISP exposure simulation for single NISP detectors.");
@@ -48,8 +57,10 @@ class InputParameters : public DOption
             throw std::runtime_error("[ERROR] UserParameters::UserParameters: Incompatible DSF version, please update your DSF installation to "+DSF_need+" at minimum.");
     }
 
+    /// @brief Destructor.
     virtual ~InputParameters(){};
 
+    /// @brief No option of its own: accepts every argument.
     bool UserParameters(std::vector<std::string>::const_iterator& it, const std::vector<std::string>& arg)
     {
         return true;
@@ -106,6 +117,8 @@ namespace
     }
 }
 
+/// @brief Read the configuration, simulate the exposure (or the sequence) and write the output.
+/// @details In DPU mode, the output file holds the three planes in the HDUs SCI, CHI2 and ERR.
 int main(int argc, char **argv)
 {
     try
@@ -358,8 +371,26 @@ int main(int argc, char **argv)
         if(!outputFile.empty())
         {
             tStep = Clock::now();
-            result->Write(outputFile, true);
-            tWrite = secondsSince(tStep);
+            if(cfg.has("exposureMode") && cfg.get<std::string>("exposureMode") == "DPU")
+            {
+                std::shared_ptr<DSL::FITScube> slope = result->Layer(0);
+                std::shared_ptr<DSL::FITScube> chi2  = result->Layer(1);
+                std::shared_ptr<DSL::FITScube> err   = result->Layer(2);
+                slope->SetName("SCI") ;
+                chi2 ->SetName("CHI2");
+                err  ->SetName("ERR") ;
+                
+                FITSmanager outfile = FITSmanager::Create(outputFile, true);
+                outfile.AppendImage(*slope);
+                outfile.AppendImage(*chi2);
+                outfile.AppendImage(*err);
+                outfile.Write();
+                outfile.Close();
+            }
+            else
+                result->Write(outputFile, true);
+            
+                tWrite = secondsSince(tStep);
 
             if(dbg >= 1)
                 std::cout << kInfoTag << "written        : " << outputFile << " (" << tWrite << " s)" << std::endl;

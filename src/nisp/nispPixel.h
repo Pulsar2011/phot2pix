@@ -6,6 +6,8 @@
 //
 // nispPixel.h
 //
+/// @file nispPixel.h
+/// @brief nisp::pixel (the H2RG pixel), its non-linearity models, and nisp::Ramp (slope estimators).
 
 #ifndef _NISP_HAWAII_PIXEL_H_
 #define _NISP_HAWAII_PIXEL_H_
@@ -13,41 +15,141 @@
 #include "nispPixel.h"
 #include <phot2pix/phot2pix.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <functional>
+#include <limits>
+#include <span>
+#include <stdexcept>
+#include <string>
+
 namespace nisp
 {
-    // NISP H2RG pixel. Uses the phot2pix::pixsim stages as they are:
-    //   resetLevel()  baseline + kTC, once per reset
-    //   integrate()   signal + dark with shot noise, accumulates between reads
-    //   read()        + read noise, once per read (never accumulated)
-    // nisp::SCA chains them for every readout mode (MACC, UTR, CDS, FLUX).
-    // Override them here to add NISP-specific pixel physics.
+#pragma region - Non-linearity models
+    /// @brief Models of the non-linear response of a pixel.
+    namespace nonlinearity
+    {
+        constexpr size_t nParam = 3;   ///< Parameters held by each pixel ("nl0", "nl1", "nl2"); 0 when not given
+
+        /// @brief Response of a pixel: measured signal (e-) for a stored charge Q (e-), 0 < Q <= full well.
+        /// @details It must tend to Q at low charge (otherwise it changes the gain) and increase up to the
+        ///          full well. Called from several threads: it must not throw nor modify what it captures.
+        using functor = std::function<double(std::span<const float> param, double Q)>;
+
+        /// @brief Polynomial response Q·(1 + c2·Q + c3·Q²).
+        /// @param param {c2 (1/e-), c3 (1/e-²)}; the third parameter is not used.
+        /// @param Q     Stored charge (e-).
+        /// @return Measured signal (e-).
+        double polynomial(std::span<const float> param, double Q);
+
+        /// @brief Model named by an "nlModel" value ("polynomial").
+        /// @throws std::invalid_argument for any other name.
+        functor fromString(const std::string& name);
+    }
+#pragma endregion
+
+    /// @brief NISP H2RG pixel: the phot2pix::pixsim stages, with a full well and a non-linear response.
+    /// @details
+    ///   - resetLevel(): baseline + kTC, once per reset;
+    ///   - integrate(): signal + dark with shot noise, accumulates between reads;
+    ///   - read(charge, nl): full well and non-linearity of the accumulated charge, then
+    ///     pixsim::read(): + read noise, once per read (never accumulated).
+    ///
+    /// nisp::SCA chains them for every readout mode (MACC, UTR, CDS, FLUX).
+    /// Override them here to add NISP-specific pixel physics.
     class pixel : public phot2pix::pixsim
     {
+        private:
+            float                                   m_fullWell = std::numeric_limits<float>::infinity(); ///< Full well (e-); infinity: none
+            std::array<float, nonlinearity::nParam> m_nlParam{};                                         ///< Parameters of the non-linearity model
 
         protected:
+            /// @brief Nothing to validate here: setFullWell() and SCA check the added parameters.
             void _userValidation() override
             { }
 
         public:
+            /// @brief Ideal pixel, without full well.
             pixel() : phot2pix::pixsim() { _userValidation(); }
+            /// @brief Pixel with the six phot2pix::pixsim parameters, without full well.
+            /// @param darkCurrent Dark current (e-/s), >= 0.
+            /// @param readNoise   Read noise (e- RMS per read), >= 0.
+            /// @param gain        Gain (e-/ADU), > 0.
+            /// @param QE          Quantum efficiency, in [0, 1].
+            /// @param KTCnoise    Reset (kTC) noise (e- RMS per reset), >= 0.
+            /// @param baseline    Baseline (ADU), >= 0.
+            /// @throws std::invalid_argument if a parameter is out of range.
             pixel(const double& darkCurrent, const double& readNoise, const double& gain, const double& QE, const double& KTCnoise, const double& baseline) : phot2pix::pixsim(darkCurrent, readNoise, gain, QE, KTCnoise, baseline) { _userValidation(); }
 
-            pixel(const pixel& other) : phot2pix::pixsim(other) {};
+            /// @brief Copy constructor: full well and non-linearity parameters included.
+            pixel(const pixel& other) = default;
 
+            /// @brief Destructor.
             virtual ~pixel() = default;
+
+            /// @brief Set the full well.
+            /// @param fullWell Full well (e-), > 0; infinity for none.
+            /// @throws std::invalid_argument if it is not > 0.
+            void setFullWell(float fullWell)
+            {
+                if (!(fullWell > 0.0f))   // also rejects NaN
+                    throw std::invalid_argument("Full well must be positive. FW=" + std::to_string(fullWell));
+                m_fullWell = fullWell;
+            }
+            /// @brief Set parameter k of the non-linearity model. @throws std::out_of_range if k >= nonlinearity::nParam.
+            void setNlParam(size_t k, float value) { m_nlParam.at(k) = value; }
+
+            /// @brief Full well (e-); infinity: none.
+            float getFullWell() const { return m_fullWell; }
+            /// @brief Parameter k of the non-linearity model. @throws std::out_of_range if k >= nonlinearity::nParam.
+            float getNlParam(size_t k) const { return m_nlParam.at(k); }
+
+            /// @brief Charge the pixel holds (e-) when Q electrons were generated.
+            double storedCharge(double Q) const { return std::min(Q, static_cast<double>(m_fullWell)); }
+
+            /// @brief Measured signal (e-) for a stored charge Q (e-).
+            /// @details Linear if nl is empty, and for Q <= 0 (kTC noise), which a model does not have
+            ///          to support.
+            /// @param Q  Stored charge (e-).
+            /// @param nl Non-linearity model.
+            double nlResponse(double Q, const nonlinearity::functor& nl) const
+            {
+                return (nl && Q > 0.0) ? nl(m_nlParam, Q) : Q;
+            }
+
+            using phot2pix::pixsim::read;   ///< read(charge): read noise only, no full well, linear
+
+            /// @brief One read of the accumulated charge: full well, then non-linearity, then read noise.
+            /// @details The baseline is an electronic offset: it does not fill the well. The charge
+            ///          itself is not modified. Without full well, this is read(charge).
+            /// @param charge Total accumulated charge (ADU, linear, reset level included).
+            /// @param nl     Non-linearity model; empty for a linear response.
+            /// @return Measured value (ADU).
+            double read(const double& charge, const nonlinearity::functor& nl) const
+            {
+                if (std::isinf(m_fullWell))
+                    return read(charge);
+
+                const double Q = storedCharge((charge - m_baseline) * m_gain);   // ADU → e-
+                return read(m_baseline + nlResponse(Q, nl) / m_gain);            // e- → ADU, + read noise
+            }
     };
 
 
 #pragma region - Ramp processing
 
+    /// @brief Reads of one or several pixels, as a flat array.
     typedef std::valarray<double> rawLines;
 
+    /**
+     * @class Ramp
+     * @brief The reads of one pixel: co-addition into groups, and CDS, Fowler and slope estimators.
+     * @details A view on the reads of one pixel (UTR or MACC), selected in a larger array by a
+     *          std::slice. It does not own the data.
+     **/
     class Ramp
     {
-    /**
-     * \class Ramp DetectorData "gacen/DetectorData.h"
-     * \details Helper class to process UTR or MACC
-     **/
 #pragma region -- private member
     private:
         rawLines* const fdata;   ///< Pointer to the raw pixel data array (not owned; shared with the parent datacube).
@@ -88,14 +190,15 @@ namespace nisp
          @brief Copy constructor
          **/
         Ramp(const Ramp& r): fdata(r.fdata),fstr(r.fstr),fgain(r.fgain),fsigma(r.fsigma),nreads(r.nreads),ndrops(r.ndrops){};
+        /// @brief Destructor; the data are not freed.
         ~Ramp(){};
 
 #pragma endregion
 #pragma region --  modifier
 
-        /// Set the number of reads per coadded group. Must match the MACC pattern used in coadd() / getSlope().
+        /// @brief Set the number of reads per coadded group. Must match the MACC pattern used in coadd() / getSlope().
         inline void reads_per_group(const int16_t &n) {nreads = static_cast<size_t>(n);}
-        /// Set the number of dropped frames per group. Must match the MACC pattern used in coadd() / getSlope().
+        /// @brief Set the number of dropped frames per group. Must match the MACC pattern used in coadd() / getSlope().
         inline void drops_per_group(const int16_t &n) {ndrops = static_cast<size_t>(n);}
 
         inline const size_t& get_reads_per_group() const { return nreads;} ///< Return the current reads-per-group setting.
@@ -105,7 +208,7 @@ namespace nisp
 #pragma endregion
 
 #pragma region --   accessor
-        /// Return a copy of the raw ramp data (the frames selected by \c fstr from the parent array).
+        /// @brief Copy of the raw ramp data (the frames selected by \c fstr from the parent array).
         inline const rawLines getRamp() const {return (rawLines) (*fdata)[fstr];}
         
 #pragma endregion
@@ -155,9 +258,10 @@ namespace nisp
         /**
          @brief Compute EUCLID Flux and Chi2 from COADDED group.
          @details Compute the EUCLID Flux, Chi2 quality factor and associated error on the flux based on Kubic et al, Publications of the Astronomical Society of the Pacific, 128:104504, 2016. The flux is estimated from equation (20). The quality factor, as the reduce chi2, is estimated from equation (19) and flux error form equation (12).
-         @param flux Upon return flux value in pix_unit/Goup, where pix_unit is the pixel unit, either e- when fe is 1 or ADU if fe is defferent to 1.
-         @param chi2 Upon return reduced chi2 value.
-         @param err Upon return flux error estimation value.
+         @param flux Upon return flux value in pix_unit/Group, where pix_unit is the pixel unit, either e- when the gain is 1 or ADU if it is different from 1.
+         @param chi2 Upon return reduced chi2 value: chi2 / (number of groups - 2), not defined for 2 groups.
+         @param err Upon return flux error estimation value, in the same unit as flux.
+         @throws std::runtime_error if the ramp has less than 2 groups.
          @note If the ramp is not already in the form of coadded groups, number of reads, number of drops and number of groups have to be tunned to this ramp otherwise the flux estimator will be biased.
          */
         void getSlope(double &flux, double &chi2, double& err) const;

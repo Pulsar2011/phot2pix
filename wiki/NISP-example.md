@@ -26,7 +26,7 @@
 | `../phot2pix/PixelSimulator.h/.cxx` | `phot2pix::pixsim`: the three stages of a pixel (reset, integration, read) |
 | `../phot2pix/DetectorSimulator.h` | `phot2pix::DetectorSimulator<PixelT>`: the pixel array, its geometry, per-pixel FITS maps, threaded simulation, and the input header cards |
 | `../phot2pix/ScenerySequencer.h/.cxx` | `phot2pix::ScenerySequencer`: a sequence of exposures on one detector ([Sequences of exposures](ScenerySequencer)) |
-| `nispPixel.h/.cxx` | `nisp::pixel`: the H2RG pixel. `nisp::Ramp`: the DPU slope estimator (group co-adding, Kubik slope, Fowler, CDS) |
+| `nispPixel.h/.cxx` | `nisp::pixel`: the H2RG pixel, with its full well and non-linear response. `nisp::nonlinearity`: the models of that response. `nisp::Ramp`: the DPU slope estimator (group co-adding, Kubik slope, Fowler, CDS) |
 | `nispSCA.h/.cxx` | `nisp::SCA`: the detector, its readout modes, the reference pixel correction and its output header. `nisp::macc`: MACC parameters. `nisp::readout`: the parameters of one exposure. `nisp::persistence`: the persistence model (`model`, `pixelArray`, `scheduler`) |
 | `nispScenerySequencer.h/.cxx` | `nisp::ScenerySequencer`: a sequence of NISP exposures, each with its own MACC parameters or exposure time and readout mode ([details](ScenerySequencer#3-the-nisp-override)) |
 | `nispGeometry.h` | `nisp::Geometry`: the H2RG layout (2048 × 2048, reference border), derived from `phot2pix::Geometry` |
@@ -50,16 +50,18 @@ classDiagram
     SCA o-- OneOverFNoise : readout noise
     OneOverFNoise o-- NispGeometry : copy
     OneOverFNoise ..> Stream : beginStream()
+    SCA o-- functor : non-linearity model
+    pixel ..> functor : read(charge, nl)
     SCA o-- scheduler : persistence
     scheduler o-- pixelArray
     SCA ..> Ramp : DPU slope
 ```
 
-`NispGeometry` stands for `nisp::Geometry`.
+`NispGeometry` stands for `nisp::Geometry`, `functor` for `nisp::nonlinearity::functor`.
 
 How the layers map onto the [philosophy](Philosophy):
 
-- **Pixel:** `nisp::pixel` uses the three `pixsim` stages unchanged (reset level, integration, read). NISP-specific pixel physics would go there, by overriding a stage.
+- **Pixel:** `nisp::pixel` uses the reset and integration stages of `pixsim` unchanged, and adds the full well and the non-linear response to the read: `read(charge, nl)`. Other NISP-specific pixel physics would go there too, by overriding a stage.
 - **Detector:** `nisp::SCA` inherits `DetectorSimulator<nisp::pixel>` **privately** and gives it a `nisp::Geometry`. Its simulation engines produce **charge only** (`resetLevel() + integrate()`), never a complete read. The geometry, the per-pixel maps and the cards that describe them come from the base class.
 - **Instrument:** `nisp::SCA` marks the reference pixels, sequences the reads of each readout mode, adds the read noise (through `pixel::read()`) and the readout noise of the output channels at each read, runs the DPU processing (reference pixel correction, then slope) and writes the output header. Its only public simulation entry point is `expose()`; the reference pixel correction is also public, as two static functions ([§5](#reference-pixel-correction-of-a-ramp)).
 
@@ -77,8 +79,9 @@ flowchart TD
         I4["④ persistence scheduler<br/>persistence traps"]
         I5["⑤ readout noise, OneOverFNoise<br/>oneOverF, bias_voltage_noise, pedestal_drift<br/>channel layout checked against the detector"]
         I6["⑥ reference pixels<br/>QE = 0, refDark"]
-        I7["⑦ input cards<br/>DETSIZE, REFBORD, REFDARK, readout noise, persistence"]
-        I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7
+        I7["⑦ full well and non-linearity<br/>fullWell, nlModel, nl0, nl1, nl2: numbers or FITS maps<br/>model checked to increase up to the full well of every pixel"]
+        I8["⑧ input cards<br/>DETSIZE, REFBORD, REFDARK, full well, non-linearity, readout noise, persistence"]
+        I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7 --> I8
     end
 
     CFG --> INIT
@@ -99,7 +102,7 @@ flowchart TD
 ```
 
 1. **Configuration.** Every parameter lives in one `PixelConfig`, normally read from a JSON file ([§4](#4-configuration-reference)). The library reads all the detector keys; `nispSimulator` reads only the matrix size, the flux and the readout pattern.
-2. **Initialisation** (`SCA::initialize`, in the order of the diagram). The base class configures the geometry first, so that the FITS maps are cropped at the right place, then applies the pixel model. The SCA then reads its own settings, creates the persistence scheduler, configures the readout noise (and fails if the channel layout does not fit the detector), sets the reference pixels, and records every input as a header card.
+2. **Initialisation** (`SCA::initialize`, in the order of the diagram). The base class configures the geometry first, so that the FITS maps are cropped at the right place, then applies the pixel model. The SCA then reads its own settings, creates the persistence scheduler, configures the readout noise (and fails if the channel layout does not fit the detector), sets the reference pixels, then the full well and the non-linearity, and records every input as a header card.
 3. **Exposure** (`SCA::expose`). The charge of every pixel is simulated step by step and read according to `exposureMode` ([§3.3](#33-the-algorithm), [§5](#5-readout-modes)).
 4. **Output.** A `uint16` image or cube, whose header holds the readout description and every input of the model ([§6](#6-output-header)).
 
@@ -120,9 +123,11 @@ This section writes down what the code computes. Every ε is an independent draw
 | $`B`$ | Baseline | ADU | `baseline` |
 | $`\sigma_{\mathrm{kTC}}`$ | Reset (kTC) noise | e⁻ | `KTCnoise` |
 | $`\sigma_{\mathrm{RN}}`$ | Read noise | e⁻ | `readNoise` |
+| $`Q_{\mathrm{FW}}`$ | Full well | e⁻ | `fullWell` |
+| $`c_2, c_3`$ | Non-linearity (`polynomial`) | (e⁻)⁻¹, (e⁻)⁻² | `nl0`, `nl1` |
 | $`t_f`$ | Frame time | s | `frame_time` |
 
-**The three stages** (`phot2pix::pixsim`, used unchanged by `nisp::pixel`). Every stage returns ADU:
+**The three stages** (`phot2pix::pixsim`). Every stage returns ADU:
 
 ```math
 \begin{aligned}
@@ -133,6 +138,23 @@ This section writes down what the code computes. Every ε is an independent draw
 ```
 
 *S* is the mean number of electrons collected. Its shot noise √S is the Gaussian approximation of Poisson, and I(Δt) = 0 when S = 0.
+
+**Full well and non-linearity** (`nisp::pixel::read(charge, nl)`, used by every readout mode). The accumulated charge *Q* stays linear; each read converts it to electrons above the baseline, limits it to the full well, and applies the non-linear response *P* before the read noise:
+
+```math
+q = \min\big(g\,(Q - B),\ Q_{\mathrm{FW}}\big),
+\qquad
+P(q) = q\,\big(1 + c_2\,q + c_3\,q^2\big),
+\qquad
+M(Q) = B + \frac{P(q)}{g} + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_M
+```
+
+- *P* is the `polynomial` model. A model is any function of the charge and of the parameters of the pixel ([§5](#non-linearity-model)). P(q) = q for q ≤ 0 (kTC noise can put the charge below the baseline), and without a model.
+- The kTC noise and the persistence are part of the charge, so they share the well. The baseline is an electronic offset: it does not fill it.
+- The read noise and the readout noise are added after the response: they are not compressed. The shot noise is: the variance of a read is (P′(q)²·q + σ_RN²)/g² below the full well, and σ_RN²/g² above.
+- Without `fullWell` (the default), M(Q) is the linear read above.
+
+The statistics below are those of the linear pixel, far from the full well.
 
 **A single read** (`pixelresponse()`, the FLUX mode) chains the three stages:
 
@@ -172,7 +194,7 @@ The last relation is the CDS: the reset level *R* and its kTC noise cancel. Thes
 
 ### 3.2 The full array
 
-Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}`$. Pixels remain independent, except through two terms that the SCA adds on top of the pixel model:
+Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}, Q_{\mathrm{FW},i}, c_{2,i}, c_{3,i}`$. Pixels remain independent, except through two terms that the SCA adds on top of the pixel model:
 
 - the **readout noise** $`\mathcal{R}`$, in electrons, added at each read: the 1/f noise of each output channel, the bias voltage noise shared by all channels and the pedestal drift of each channel;
 - the **persistence** *P*, which depends on the previous exposures and is added to the charge.
@@ -208,10 +230,10 @@ $`R_i`$ is drawn at the first step only; the later steps are run with `baseline 
 #### MACC and UTR: one layer of the output cube
 
 ```math
-Y_i[\ell] = \mathcal{Q}\Big( Q_i[m_\ell] + \frac{\sigma_{\mathrm{RN},i}}{g_i}\,\varepsilon_{i,\ell} + \frac{\mathcal{R}_i[n_\ell]}{g_i} \Big)
+Y_i[\ell] = \mathcal{Q}\Big( M_i\big(Q_i[m_\ell]\big) + \frac{\mathcal{R}_i[n_\ell]}{g_i} \Big)
 ```
 
-where $`m_\ell`$ is the step that ends at frame $`n_\ell`$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
+where $`M_i`$ is the read of §3.1 (full well, non-linearity, read noise) and $`m_\ell`$ is the step that ends at frame $`n_\ell`$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
 
 #### Physical detector and placement of the matrix
 
@@ -298,7 +320,7 @@ P_i[m] = \sum_j E_i^{(j)} \sum_k f_k\,\tau_k\, e^{-\Delta_j[m]/\tau_k} \left( 1 
 \Delta_j[m] = \sum_{m' < m} \Delta t_{m'} + n_j\,\delta
 ```
 
-$`f_k`$ is therefore a release rate (s⁻¹) per stored electron, and $`f_k\,\tau_k`$ the fraction of the stored charge that trap *k* releases in total ([§4.8](#48-persistence)); consecutive steps add up to the release over their total duration. The elapsed time $`\Delta_j[m]`$ counts the simulated steps since exposure *j*, plus the delay δ = `dT` between two exposures, once for each of the $`n_j`$ exposures that have ended since *j* (exposure *j* included). $`P_i[m]`$ is added to the charge as it is, without conversion by $`g_i`$.
+$`f_k`$ is therefore a release rate (s⁻¹) per stored electron, and $`f_k\,\tau_k`$ the fraction of the stored charge that trap *k* releases in total ([§4.8](#48-persistence)); consecutive steps add up to the release over their total duration. The elapsed time $`\Delta_j[m]`$ counts the simulated steps since exposure *j*, plus the delay δ = `dT` between two exposures, once for each of the $`n_j`$ exposures that have ended since *j* (exposure *j* included). $`P_i[m]`$ is added to the charge as it is, without conversion by $`g_i`$. $`E_i^{(j)}`$ is not limited by the full well ([§10](#10-known-limitations)).
 
 #### FLUX and CDS
 
@@ -365,16 +387,16 @@ d_g = G_{g+1} - G_g,
 g < n_{\mathrm{good}}
 ```
 
-and the Kubik et al. (2016) estimator, with $`\sigma_{\mathrm{DPU}}`$ = `dpu_noise` and $`g_{\mathrm{DPU}}`$ = `dpu_gain`, is
+and the Kubik et al. (2016) estimator, with $`\sigma_{\mathrm{DPU}}`$ = `dpu_noise` (e⁻) and $`g_{\mathrm{DPU}}`$ = `dpu_gain` (e⁻ ADU⁻¹, the $`f_e`$ of the paper), is
 
 ```math
 \alpha = \frac{1 - n_r^2}{3\,n_r\,(n_r + n_d)},
 \qquad
 \sigma = \frac{\sigma_{\mathrm{DPU}}}{g_{\mathrm{DPU}}},
 \qquad
-\beta = \frac{2\,\sigma^2}{g_{\mathrm{DPU}}\, n_r\,(1 + \alpha)},
+\beta = \frac{2\,\sigma^2\,g_{\mathrm{DPU}}}{n_r\,(1 + \alpha)},
 \qquad
-\gamma = \frac{2}{g_{\mathrm{DPU}}\,(1 + \alpha)}
+\gamma = \frac{2\,g_{\mathrm{DPU}}}{1 + \alpha}
 ```
 
 ```math
@@ -389,7 +411,17 @@ Y_i =
 \end{cases}
 ```
 
-$`\hat F`$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated pixel, $`\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i`$.
+$`\hat F`$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated linear pixel, $`\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i`$. The estimator also gives the χ² of the fit (not reduced, n_good − 2 degrees of freedom) and the error of the slope, in the same unit:
+
+```math
+\hat F_x = \sqrt{\bar F} - \beta,
+\qquad
+\chi^2 = \gamma\,\Big[(n_{\mathrm{good}} - 1)\,\hat F_x - \big(G_{n_{\mathrm{good}}-1} - G_0\big)\Big],
+\qquad
+\sigma_{\hat F} = \sqrt{\frac{2\,(\hat F_x + \beta)^2}{(n_{\mathrm{good}} - 1)\,\big(1 + \gamma\,(\hat F_x + \beta)\big)}}
+```
+
+The output has three planes: $`\mathcal{Q}_{so}(\hat F)`$, $`\mathcal{Q}(\chi^2)`$ and $`\mathcal{Q}_{so}(\sigma_{\hat F})`$. With $`n_{\mathrm{good}} = 2`$ there is no degree of freedom and the χ² is 0; with $`n_{\mathrm{good}} < 2`$ the last two planes are 0.
 
 ### 3.3 The algorithm
 
@@ -404,7 +436,7 @@ flowchart TD
     RST["① resetLevel()<br/>$$R = B + \frac{\sigma_{\mathrm{kTC}}}{g}\,\varepsilon_R$$"]
     INT["② integrate(φ, Δt)<br/>$$S = (\eta\,\phi + D)\,\Delta t$$<br/>$$I = \frac{S + \sqrt{S}\,\varepsilon_I}{g}$$"]
     Q[("charge $$Q$$ in ADU<br/>kept by the SCA")]
-    RD["③ read(Q)<br/>$$y = Q + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_M$$"]
+    RD["③ read(Q, nl)<br/>full well, non-linearity, read noise<br/>$$y = B + \frac{P(q)}{g} + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_M$$"]
     Y["read value $$y_n$$"]
 
     RST -->|"first step only: $$Q = R$$"| Q
@@ -454,8 +486,8 @@ flowchart TD
     REG --> DPUQ{"DPU?"}
     DPUQ -->|"no: MACC, UTR"| CUBE["uint16 cube<br/>$$W \times H \times n_g n_r$$"]
     DPUQ -->|"yes"| RPC["reference pixel correction, threaded<br/>$$c_y^{(\mathrm{ch})}[\ell]$$ of every read: medians of T, B, L, R<br/>the uint16 cube is not modified"]
-    RPC --> DPU["per pixel, threaded<br/>cut at the first saturated group, on the raw reads: $$n_{\mathrm{good}}$$<br/>subtract the correction in double: $$Y' = Y - c$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$<br/>output $$\mathcal{Q}_{so}(\hat F)$$"]
-    DPU --> MAP["uint16 slope map<br/>$$W \times H$$"]
+    RPC --> DPU["per pixel, threaded<br/>cut at the first saturated group, on the raw reads: $$n_{\mathrm{good}}$$<br/>subtract the correction in double: $$Y' = Y - c$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$, $$\chi^2$$, error<br/>output $$\mathcal{Q}_{so}(\hat F)$$, $$\mathcal{Q}(\chi^2)$$, $$\mathcal{Q}_{so}(\sigma_{\hat F})$$"]
+    DPU --> MAP["uint16 slope, chi2 and error planes<br/>$$W \times H \times 3$$"]
 ```
 
 Two invariants hold throughout the loop:
@@ -508,6 +540,9 @@ Each key is either a number, applied to every pixel, or a per-pixel FITS map, ma
 | `QE` | η | 0 – 1 | 1 | 0.94 | Fraction of the incident photons converted to electrons | Multiplies the flux; the reference pixels get 0 |
 | `KTCnoise` | σ_kTC | e⁻ RMS | 0 | 48 | Reset noise: random offset of the reset level | Drawn once per reset, shared by every read of the ramp, so it cancels in any difference of reads |
 | `baseline` | B | ADU | 0 | 10 000 | Mean reset level (bias pedestal) of the pixel | Level of a read with no charge; constant over the ramp; ≥ 0. A constant offset per channel belongs here, as a map |
+| `fullWell` | Q_FW | e⁻ | none | 130 000 | Largest charge the pixel can hold (arXiv:2507.11326) | Limits the charge at each read; > 0 for every pixel. With the NISP gain and baseline, the ADC saturates first (65 535 ADU) |
+| `nlModel` | P | — | none (linear) | `polynomial` | Non-linear response of the pixel | A name, the same model for every pixel. Needs `fullWell`; must increase up to it for every pixel, otherwise `initialize()` throws. Only `polynomial` is built in ([§5](#non-linearity-model)) |
+| `nl0`, `nl1`, `nl2` | c₂, c₃ for `polynomial` | (e⁻)⁻¹, (e⁻)⁻² | 0 | −6.25 × 10⁻⁷, 0 | Parameters of the model. From a ramp fit a₀ + a₁t + a₂t² + a₃t³ in ADU: c₂ = a₂/(a₁²·g), c₃ = a₃/(a₁³·g²) | `polynomial` uses `nl0` and `nl1`. −6.25 × 10⁻⁷ is a deviation of 5 % at 80 ke⁻, the limit for 95 % of the pixels (arXiv:2507.11326): a pessimistic pixel |
 
 ### 4.5 Readout modes and timing
 
@@ -521,7 +556,7 @@ Each key is either a number, applied to every pixel, or a per-pixel FITS map, ma
 
 | Key | Unit | Default | Meaning and use |
 |---|---|---|---|
-| `offset` (or `dpu_offset`) | ADU | 0 | Added before the `uint16` conversion: DN = value × `scale` + `offset`. Keeps negative values (noise on the CDS of a dark pixel) above 0. Applied in CDS, FLUX, DPU and windowed reads, not to MACC/UTR layers |
+| `offset` (or `dpu_offset`) | ADU | 0 | Added before the `uint16` conversion: DN = value × `scale` + `offset`. Keeps negative values (noise on the CDS of a dark pixel) above 0. Applied in CDS, FLUX, DPU (slope and error, not the χ²) and windowed reads, not to MACC/UTR layers |
 | `scale` (or `dpu_scale`) | — | 1 | Multiplies the value before the conversion. For DPU, NISP uses SFACTOR = ng − 1, so DN − OFFSET is the signal integrated over `INTTIME` |
 | `dpu_gain` | e⁻ ADU⁻¹ | mean pixel `gain` | Gain the DPU slope estimator assumes (header `GAIN`). Set it to simulate a DPU calibrated differently from the detector |
 | `dpu_noise` | e⁻ | mean pixel `readNoise` | Read noise per read the estimator assumes (header `RN`). It does not include the readout noise: when the readout noise is large, set it to the total noise of one read |
@@ -643,6 +678,7 @@ The NISP averages of `src/utilities/nispSimulator_default.json` (Euclid Collabor
 
     "gain": 1.92, "dark": 0.01, "readNoise": 13.0,
     "QE": 0.94, "KTCnoise": 48.0, "baseline": 10000.0,
+    "fullWell": 130000.0, "nlModel": "polynomial", "nl0": -6.25e-7, "nl1": 0.0,
     "refBorder": 4,
 
     "oneOverF":           { "amplitude": 15.0, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
@@ -653,6 +689,7 @@ The NISP averages of `src/utilities/nispSimulator_default.json` (Euclid Collabor
 
 - The full detector: 4 reference pixels on each side, QE 0, dark current from `dark`.
 - MACC(4,16,4) ramp fitted by the DPU. The output is DN = slope × 3 + 1024, so (DN − 1024) is the signal integrated over 87.2 s: 10 ph/s × 0.94 × 87.2 s / 1.92 ≈ 427 ADU.
+- Full well of 130 ke⁻ and quadratic non-linearity, −5 % at 80 ke⁻ (negligible at this flux).
 - Per read: 13 e⁻ read noise, then pink 1/f noise of 15 e⁻ per channel, 10 e⁻ of common bands, and channel offsets of 8 e⁻ RMS drifting by 0.05 e⁻/s.
 
 ---
@@ -679,7 +716,7 @@ The mode set by `exposureMode` decides what `expose()` computes:
 | **UTR** | Same as MACC | UTR ramp of ⌊t / t_frame⌋ reads | W × H × N cube of reads |
 | **CDS** | Last read − first read over the MACC duration | Last − first over *t* | W × H |
 | **FLUX** | One read after the MACC duration | One read after *t* | W × H |
-| **DPU** | Ramp, then onboard slope fitting | Slope fitted on a UTR ramp | W × H slope map |
+| **DPU** | Ramp, then onboard slope fitting | Slope fitted on a UTR ramp | W × H × 3 cube: slope, χ², error of the slope |
 
 The MACC duration is (ng·(nr+nd) − nd)·t_frame, i.e. 76 frames for MACC(4,16,4).
 
@@ -694,7 +731,7 @@ read  : R  R ··· R  │  · · · · │ R  R ··· R   │  · · · · │
 1. One array `cumul` holds the **charge** of every pixel, in ADU.
 2. For each frame that is read:
    - `cumul += resetLevel() + integrate()` on the first frame, `cumul += integrate()` afterwards;
-   - then the layer is written as `uint16( pixel.read(cumul) + readout noise / gain )`.
+   - then the layer is written as `uint16( pixel.read(cumul, nl) + readout noise / gain )`, the read applying the full well, the non-linearity and the read noise. `cumul` itself stays linear.
 3. For dropped frames: `cumul += integrate()` over nd frames; nothing is read or stored, but the readout-noise stream advances by nd frames.
 4. Read noise and readout noise are added to the layer **only**, never to `cumul`. Every read has RN², and two consecutive reads differ by 2·RN², as on the real detector.
 
@@ -720,13 +757,38 @@ A single read after the whole exposure: reset level + integration over *t* + one
 
 The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::getReferencePixelCorrection(ramp)` then computes the reference pixel correction $`c_y^{(\mathrm{ch})}`$ of every read, with mode `ALL` ([§3.2](#reference-pixel-correction)). On a matrix smaller than 2048 × 2048 there is no correction, and a warning is printed. The header keyword `REFCORR` records whether the correction was applied. Then, for each pixel (threaded, with no allocation per pixel):
 
-1. **Saturation:** the reads are copied group by group, up to the first group that contains a saturated read (65535). Only the groups before it are used. With fewer than 2 good groups, the pixel is set to 65535.
+1. **Saturation:** the reads are copied group by group, up to the first group that contains a saturated read (65535). Only the groups before it are used. With fewer than 2 good groups, the pixel is set to 65535. As on the flight DPU, 65535 is the only test: a pixel whose full well is reached below the ADC limit is not flagged, and its plateau is fitted as signal.
 2. **Reference pixel correction** (when on): while the reads are copied, the pixel's correction is subtracted in double. The `uint16` ramp itself is never modified, so nothing wraps around below 0, and the saturation test sees the raw reads.
 3. **Co-adding:** each group is averaged (`Ramp::coadd`).
 4. **Slope:** the Kubik et al. 2016 estimator (`Ramp::getSlope`) is applied, with σ = `dpu_noise` / `dpu_gain` (in ADU). It uses only the differences between groups, so the level left by the correction does not matter.
-5. **Output:** `uint16(slope × scale + offset)`, the slope being in **ADU per group interval** ((nr+nd) frames).
+5. **Output**, one plane each:
+   - plane 0, `uint16(slope × scale + offset)`, the slope being in **ADU per group interval** ((nr+nd) frames);
+   - plane 1, `uint16(χ²)`, not reduced: n_good − 2 degrees of freedom, 0 with 2 good groups;
+   - plane 2, `uint16(error × scale + offset)`, the error of the slope, converted like the slope.
+
+The estimator is linear: with a non-linear response, the slope is that of the chord between the first and the last group, and the χ² grows with the curvature.
 
 To convert to a flux: flux [e⁻/s] = slope × gain / ((nr+nd)·t_frame) = slope × (ng − 1) × gain / `INTTIME`, with slope = (DN − `OFFSET`) / `SFACTOR`. With `scale` = ng − 1, DN − `OFFSET` is directly the signal integrated over `INTTIME`.
+
+### Non-linearity model
+
+The response *P* ([§3.1](#31-one-pixel)) is a `nisp::nonlinearity::functor`, one for the SCA, called at each read with the parameters of the pixel (`nl0`, `nl1`, `nl2`) and its charge in electrons. It is chosen with `nlModel`, or given from C++ without changing the library:
+
+```cpp
+sca.initialize(cfg);                                  // sets fullWell, nl0, nl1, nl2
+
+const std::vector<double> lut = readMyTable();        // measured response, captured by value
+sca.setNonLinearity([lut](std::span<const float> p, double Q)
+{
+    return interpolate(lut, Q) * (1.0 + p[0] * Q);    // measured signal (e-)
+});
+
+sca.setNonLinearity(nisp::nonlinearity::functor{});   // empty: linear
+```
+
+- The function must tend to Q at low charge (otherwise it changes the gain) and increase up to the full well. It is checked on 32 charges for every pixel when it is set, and rejected with an exception otherwise; the previous model is then kept.
+- It is called from several threads: it must not throw nor modify what it captures.
+- To add a built-in model, write its function in `nispPixel.cxx`, declare it in `nispPixel.h` and name it in `nonlinearity::fromString()`.
 
 ### Reference pixel correction of a ramp
 
@@ -782,7 +844,7 @@ Every comment starts with the unit in square brackets (FITS convention), e.g. `G
 | `INTTIME`, `EXPTIME` | Integration and exposure times, s. For DPU, `INTTIME` = (ng − 1)(nr + nd)·t_frame, the span from the first to the last group (87.2 s for MACC(4,16,4)) |
 | `FRTIME` | Frame time, s |
 | `GAIN`, `RN` | Gain (e⁻/ADU) and read noise (e⁻) used by the DPU |
-| `OFFSET`, `SFACTOR` | DN = value × `SFACTOR` + `OFFSET` (ADU) |
+| `OFFSET`, `SFACTOR` | DN = value × `SFACTOR` + `OFFSET` (ADU). Does not apply to the χ² plane of the DPU, nor to MACC/UTR layers |
 | `PERSIST` | `ON` when persistence is modelled |
 | `PHOT2PIX` | Library version |
 
@@ -793,6 +855,7 @@ Every comment starts with the unit in square brackets (FITS convention), e.g. `G
 | `PIXGAIN`, `PIXDARK`, `PIXRN`, `PIXQE`, `PIXKTC`, `PIXBASE` | Pixel model as given: the value (e⁻/ADU, e⁻/s, e⁻, –, e⁻, ADU), or the file name of the per-pixel map with its HDU, e.g. `'dark.fits[DARK]'`. Recorded by `DetectorSimulator`, so every simulator gets them |
 | `DETSIZE`, `DETSEC` | Physical detector size, and the section of it covered by this image (`'[1:2048,1:2048]'`, 1-based) |
 | `REFBORD`, `REFDARK` | Reference border (pix) and reference-pixel dark current (e⁻/s, when `refDark` is given) |
+| `PIXFW`, `NLMODEL`, `PIXNL0` – `PIXNL2` | Full well (e⁻), non-linearity model and its parameters, for the keys that are given (value or map file). `NLMODEL` is `custom` after `setNonLinearity()`, `linear` if the functor is empty |
 | `CHANWID` | Columns per output channel |
 | `OOFAMP`, `OOFSLOPE`, `OOFPOLES` | `oneOverF` |
 | `BIASAMP`, `BIASSLOP`, `BIASPOLE` | `bias_voltage_noise` |
@@ -810,6 +873,8 @@ A file is recorded by its name only (a FITS string holds at most 68 characters).
 |---|---|---|---|
 | Shot noise (signal, dark) | `pixsim::integrate()` | Gaussian approximation of Poisson; accumulates | `QE`, `dark`, flux |
 | Reset (kTC) noise, baseline | `pixsim::resetLevel()` | Drawn once per ramp, at the first frame | `KTCnoise`, `baseline` |
+| Full well | `nisp::pixel::read()` | Charge limited at each read, per pixel | `fullWell` |
+| Non-linearity | `nisp::pixel::read()` | Response model applied to the limited charge, before the read noise | `nlModel`, `nl0` – `nl2`, or `SCA::setNonLinearity()` |
 | Read noise | `pixsim::read()` | Independent at each read | `readNoise` |
 | 1/f noise | `nisp::OneOverFNoise` | Per output channel, independent between channels, continuous in time over a ramp | `oneOverF` |
 | Bias voltage noise | `nisp::OneOverFNoise` | 1/f series common to all channels, at the same pixel clock | `bias_voltage_noise` |
@@ -817,7 +882,7 @@ A file is recorded by its name only (a FITS string holds at most 68 characters).
 | Reference pixels | `nisp::SCA`, `nisp::Geometry` | Physical border with QE = 0 | `refBorder`, `refDark` |
 | Reference pixel correction | `nisp::SCA` | Eq. 3 of arXiv:2507.11326: medians of the top and bottom reference lines per channel, plus sliding medians of the left and right reference columns per line. Applied by the DPU, or on request to any cube | `mode` argument; the DPU uses `ALL`, switched by `refPixCorr` |
 | Persistence | `nisp::persistence` | Charge released by traps filled during previous exposures | `persistence` |
-| Digitisation | `nisp::SCA` | Rounding and clamping to `uint16`; `offset`/`scale` are applied in CDS, FLUX and DPU, not to MACC/UTR layers | `offset`, `scale` |
+| Digitisation | `nisp::SCA` | Rounding and clamping to `uint16`; `offset`/`scale` are applied in CDS, FLUX and DPU (not to its χ²), not to MACC/UTR layers | `offset`, `scale` |
 
 ### Reference pixels and the readout noise they measure
 
@@ -850,10 +915,16 @@ nispSimulator -o exposure.fits -d 1 my_config.json
 
 The tool reads `width`, `height`, `flux`, `macc` or `exposureTime`, and `benchmark` ([§4.2](#42-matrix-flux-and-readout-pattern-nispsimulator)), passes the whole configuration to `SCA::initialize()`, reads a flux image with `SCA::loadImage()` (the file and HDU, as for a per-pixel map) and maps it onto the matrix with `SCA::toMatrix()` (matrix-sized, or detector-sized cropped at `detectorOrigin`), and adds `FLUX` and `FLUXSEC` to the output header.
 
+In `DPU` mode, the three planes are written as three HDUs, `SCI` (slope), `CHI2` and `ERR`. The other modes write one image or cube.
+
 Ready-made configurations:
 
-- `src/utilities/nispSimulator_default.json`: averaged NISP pixel values, readout noise present but set to 0.
-- `src/utilities/testcases/`: one configuration per readout mode at 10 ph/s. `CDS`, `FLUX` and `MACC` have every detector effect off (gain 1, QE 1); `UTR` and `DPU` use the NISP pixel values with readout noise on.
+- `src/utilities/nispSimulator_default.json`: averaged NISP pixel values, with full well and non-linearity; readout noise present but set to 0.
+- `src/utilities/testcases/`: one configuration per readout mode, and a sequence.
+  - `CDS`: every detector effect off (gain 1, QE 1, non-linearity 0), 10 ph/s.
+  - `MACC`: the same with the non-linearity on.
+  - `UTR` and `DPU`: NISP pixel values, non-linearity and readout noise on, 10 ph/s.
+  - `FLUX` and `SEQUENCE`: the same, with the flux read from FITS images (paths to adapt).
 
 ---
 
@@ -867,7 +938,7 @@ Ready-made configurations:
 | UTR | Read k = (k+1)·S, 76 reads | Least-squares slope |
 | CDS | 75·S = 1090.56 ADU | CDS / (75·t_frame) |
 | FLUX | 76·S = 1105.10 ADU | Value / (76·t_frame) |
-| DPU | ≈ 290.8 ADU per group, scatter ≈ 9.4 ADU | Value / (20·t_frame) |
+| DPU | Slope ≈ 290.8 ADU per group, scatter ≈ 9.4 ADU; error ≈ 8.4 ADU; loose check of the χ² | Slope / (20·t_frame) |
 
 `src/test/gTest_nispSCA.cxx` checks the noise budget and the detector:
 
@@ -878,27 +949,43 @@ Ready-made configurations:
 - The reference pixels follow the physical border (default origin in the corner, 2044-wide matrix, `refBorder` 0); a detector-sized map is cropped at the origin; a matrix larger than the detector is rejected.
 - The output header records the inputs.
 - Persistence raises the signal of the next exposure, by the charge released during its frame after the delay `dT`.
+- Full well and non-linearity, with a 20 ke⁻ well reached below the ADC limit:
+  - the mean and variance of every MACC read follow P(q), then stay at the full well with the read noise only; FLUX, CDS and a window follow the same response;
+  - saturated reads give exactly the full well of each pixel, read from a map;
+  - the model can be a capturing functor; invalid full wells and models are rejected; the header records them;
+  - the DPU slope is that of the chord of the response, and a plateau below 65535 is not flagged.
 
 `src/test/gTest_persistence.cxx` checks the persistence model on its own: the release over a step, consecutive steps adding up to one step, a total release of f·τ, the scheduler clock and the delay between exposures.
 
 `src/test/gTest_nispOneOverFNoise.cxx` checks the readout-noise components on their own: configuration parsing and errors, the placement of the matrix on the physical detector (partial channels line up with the physical ones), the spectral index set by `slope`, bias voltage noise shared by all channels (including the pixel-clock offset of a 2040-wide frame), one pedestal offset per channel and per frame with RMS σ, and the drift equation evaluated at the read time of each physical row, in windows and along a stream.
 
-`src/test/gTest_detector.cxx` checks `phot2pix::Geometry` (placement, extraction of a matrix-sized or detector-sized map, derived geometries); `gTest_pixelconfig.cxx` checks `PixelConfig::card()` for every input form; `gTest_nispPixel.cxx` checks the pixel stages and the `Ramp` estimator.
+`src/test/gTest_detector.cxx` checks `phot2pix::Geometry` (placement, extraction of a matrix-sized or detector-sized map, derived geometries); `gTest_pixelconfig.cxx` checks `PixelConfig::card()` for every input form; `gTest_nispPixel.cxx` checks the pixel stages, the full well and the non-linearity of one read, and the `Ramp` estimator.
 
 ---
 
 ## 10. Known limitations
 
 - With MACC parameters, the UTR mode produces the same output as MACC, and the MACC output always writes `MODE = MACC`. The MACC `EXPTIME` counts the drops after the last group.
-- The gain convention inside `Ramp::getSlope()` has only been validated at gain 1: at other gains the shot-noise term of the estimator uses g instead of 1/g, which biases the slope slightly low.
+- DPU:
+  - the planes hold integers, so the χ² (about n_good − 2 on average for a linear pixel) and the error × `scale` are rounded to 1;
+  - no test runs the DPU at a gain other than 1;
+  - `nispSimulator` writes the three HDUs only when `exposureMode` is written exactly `DPU`, and for a single exposure; otherwise the output is the three-plane cube.
 - The readout-noise model reads every channel in the same direction and has no row or frame overhead.
 - Persistence:
   - the charge stored after a MACC ramp uses the last integration interval instead of the total exposure;
-  - the released charge, in electrons, is added to the charge in ADU without division by the gain.
-- Saturation is applied at `uint16` conversion only; there is no full-well model on the accumulated charge yet.
+  - the released charge, in electrons, is added to the charge in ADU without division by the gain;
+  - the stored charge is not limited by the full well: a saturated star leaves more persistence than its pixels can hold.
+- Full well and non-linearity:
+  - the ADC limit (65535) is applied to each read in MACC, UTR and DPU, but only to the result in CDS, FLUX and windowed reads: a CDS can subtract a read above the ADC limit, and with `scale` ≠ 1 the limit moves;
+  - `pixelresponse()` of a lone `nisp::pixel` is linear and has no full well: it calls `read(charge)` without the model. The SCA never uses it;
+  - there is no count-rate non-linearity, no brighter-fatter effect and no blooming.
 - Reference pixel correction:
   - it needs a full 2048 × 2048 matrix. A smaller one, such as the 2040 × 2040 active area used by `gTest_nispReadoutModes`, is not corrected, and a warning is printed;
   - in the DPU, `refPixCorr` only switches the correction on or off. The mode is always `ALL`;
   - no test covers the correction yet.
+
+---
+
+*This wiki page has been generated by AI (Claude Opus 5.5) by reading the code itself.*
 
 <!-- This page is generated from wiki/NISP-example.md in the phot2pix repository. Edit it there: changes made in the web interface are overwritten on the next push. -->

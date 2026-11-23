@@ -8,7 +8,7 @@
     "flux"         : 10.0,
 
     "exposureMode" : "DPU",
-    "macc"         : [4, 16, 4],
+    "macc"         : [15, 16, 11],
 
     "frame_time"   : 1.45408,
     "offset"       : 1024.0,
@@ -21,6 +21,11 @@
     "QE"           : 0.94,
     "KTCnoise"     : 48.0,
     "baseline"     : 10000.0,
+
+    "fullWell"     : 130000.0,
+    "nlModel"      : "polynomial",
+    "nl0"          : -6.25e-7,
+    "nl1"          : -3.1e-13,
 
     "oneOverF"           : { "amplitude": 22.3, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
     "bias_voltage_noise" : { "amplitude": 22.3, "slope": 2.0, "nPoles": 168 },

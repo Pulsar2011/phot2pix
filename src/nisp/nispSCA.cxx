@@ -11,6 +11,7 @@
 #include "nispPixel.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <future>
@@ -527,13 +528,13 @@ namespace nisp
                     for (size_t i = begin; i < end; ++i)
                     {
                         cumul[i] += charge[i];
-                        layer[i]  = toUint16(m_pixels[i].read(cumul[i]));
+                        layer[i]  = toUint16(m_pixels[i].read(cumul[i], m_nl));
                     }
                 else
                     for (size_t i = begin; i < end; ++i)
                     {
                         cumul[i] += charge[i];
-                        layer[i]  = toUint16(m_pixels[i].read(cumul[i]) + (*oneOverF)[i] / m_pixels[i].getGain());   // e- → ADU
+                        layer[i]  = toUint16(m_pixels[i].read(cumul[i], m_nl) + (*oneOverF)[i] / m_pixels[i].getGain());   // e- → ADU
                     }
             });
     }
@@ -550,7 +551,7 @@ namespace nisp
             [this, &charge](size_t begin, size_t end)
             {
                 for (size_t i = begin; i < end; ++i)
-                    charge[i] = m_pixels[i].read(charge[i]);
+                    charge[i] = m_pixels[i].read(charge[i], m_nl);
             });
 
         if (oneOverF.valid())
@@ -581,7 +582,7 @@ namespace nisp
             {
                 for (size_t r = rowBegin; r < rowEnd; ++r)
                     for (size_t c = 0; c < ncols; ++c)
-                        charge[r * ncols + c] = m_pixels[(r0 + r) * width + c0 + c].read(charge[r * ncols + c]);
+                        charge[r * ncols + c] = m_pixels[(r0 + r) * width + c0 + c].read(charge[r * ncols + c], m_nl);
             });
 
         if (oneOverF.valid())
@@ -595,6 +596,38 @@ namespace nisp
                             charge[r * ncols + c] += noiseMap[r * ncols + c] / m_pixels[(r0 + r) * width + c0 + c].getGain();   // e- → ADU
                 });
         }
+    }
+
+    void SCA::_checkResponse(const nonlinearity::functor& f) const
+    {
+        if (!f)
+            return;
+
+        constexpr int nSteps = 32;   // charges tested per pixel, from 0 to the full well
+        std::atomic<size_t> nBad{0};
+
+        parallelFor(size(), getThreadCount(),
+            [this, &f, &nBad](size_t begin, size_t end)
+            {
+                for (size_t i = begin; i < end; ++i)
+                {
+                    const double fullWell = m_pixels[i].getFullWell();
+                    double previous = 0.0;
+                    bool   good     = std::isfinite(fullWell);
+                    for (int k = 1; good && k <= nSteps; ++k)
+                    {
+                        const double S = m_pixels[i].nlResponse(fullWell * k / nSteps, f);
+                        good     = std::isfinite(S) && S > previous;
+                        previous = S;
+                    }
+                    if (!good)
+                        ++nBad;
+                }
+            });
+
+        if (nBad > 0)
+            throw std::invalid_argument("SCA: the non-linearity model needs a finite \"fullWell\" and must increase up to it: "
+                                        + std::to_string(nBad.load()) + " of " + std::to_string(size()) + " pixels do not comply.");
     }
 
     void SCA::initialize(const phot2pix::PixelConfig& cfg)
@@ -704,6 +737,27 @@ namespace nisp
                     }
         }
 
+        // Full well "fullWell" (e-), and non-linearity: model "nlModel" with the parameters
+        // "nl0", "nl1", … of each pixel. Each number may be a FITS map. No full well and a
+        // linear response by default.
+        {
+            const std::valarray<double> fullWell = loadMap(cfg, "fullWell");
+            for (size_t i = 0; i < fullWell.size(); ++i)
+                m_pixels[i].setFullWell(static_cast<float>(fullWell[i]));   // throws if not > 0
+
+            for (size_t k = 0; k < nonlinearity::nParam; ++k)
+            {
+                const std::valarray<double> param = loadMap(cfg, "nl" + std::to_string(k));
+                for (size_t i = 0; i < param.size(); ++i)
+                    m_pixels[i].setNlParam(k, static_cast<float>(param[i]));
+            }
+
+            if (cfg.has("nlModel"))
+                setNonLinearity(nonlinearity::fromString(cfg.get<std::string>("nlModel")));
+            else
+                _checkResponse(m_nl);   // a model already set, with the new values
+        }
+
         _recordInputs(cfg);
     }
 
@@ -715,6 +769,15 @@ namespace nisp
         setInputCard({"REFBORD", geometry.refBorder, "[pix] Reference pixels on each side of the detector"});
         if (cfg.has("refDark"))
             setInputCard({"REFDARK", cfg.getAsDouble("refDark"), "[e-/s] Dark current of the reference pixels"});
+
+        // ── Full well and non-linearity: the keys that are given ──
+        if (const auto value = cfg.card("fullWell"))
+            setInputCard({"PIXFW", *value, "[e-] Pixel full well"});
+        if (cfg.has("nlModel"))
+            setInputCard({"NLMODEL", cfg.get<std::string>("nlModel"), "Non-linearity model"});
+        for (size_t k = 0; k < nonlinearity::nParam; ++k)
+            if (const auto value = cfg.card("nl" + std::to_string(k)))
+                setInputCard({"PIXNL" + std::to_string(k), *value, "Parameter of the non-linearity model"});
 
         // ── Readout noise: the components that are on ──
         for (const char* prefix : {"CHANWID", "OOF", "BIAS", "PED"})
@@ -1327,7 +1390,7 @@ namespace nisp
         const size_t W    = MACC->Size(1);
         const size_t nPix = MACC->Size(1) * MACC->Size(2);
 
-        std::shared_ptr<DSL::FITScube> result = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint16_t>({MACC->Size(1), MACC->Size(2)}));
+        std::shared_ptr<DSL::FITScube> result = std::shared_ptr<DSL::FITScube>(new DSL::FITSimg<uint16_t>({MACC->Size(1), MACC->Size(2),3}));
         *(result) *=0;
         std::valarray<uint16_t>& outData = *(result->GetData<uint16_t>());
 
@@ -1385,6 +1448,8 @@ namespace nisp
                 grouped.getSlope(slope, chi2, err);
 
                 outData[i] = toUint16(slope * dpuScale + dpuOffset);   // rounded, clamped to [0, 65535], NaN → 0
+                outData[i+nPix] = toUint16(chi2 * static_cast<double>(nGood - 2));   // reduced chi2 → chi2 (2 groups: NaN → 0)
+                outData[i+2*nPix] = toUint16(err * dpuScale + dpuOffset);            // same conversion as the slope
             }
         });
 

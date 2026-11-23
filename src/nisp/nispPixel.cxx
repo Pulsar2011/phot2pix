@@ -11,7 +11,29 @@
 
 namespace nisp
 {
-    // nisp::pixel uses phot2pix::pixsim::resetLevel() / integrate() / read() as they are.
+    // nisp::pixel uses phot2pix::pixsim::resetLevel() / integrate() as they are; read(charge, nl)
+    // applies the full well and the non-linearity before phot2pix::pixsim::read().
+
+#pragma region - Non-linearity models
+    // To add a model: write its function here, declare it in nispPixel.h and name it in fromString().
+    namespace nonlinearity
+    {
+
+        double polynomial(std::span<const float> param, double Q)
+        {
+            // NOTE one din't use the DST::Math::polynomial::polyev() because it is not constexpr and we want to be able to use it in a constexpr context.
+            // It also not obtimized for large number of pixel and will significantly slow down the simulation.
+            return Q * (1.0 + Q * (param[0] + Q * param[1]));
+        }
+
+        functor fromString(const std::string& name)
+        {
+            if (name == "polynomial") return polynomial;
+
+            throw std::invalid_argument("unknown nlModel '" + name + "' (expected polynomial).");
+        }
+    }
+#pragma endregion
 
 #pragma region - Ramp class implementation
 #pragma region -- methods
@@ -122,7 +144,7 @@ namespace nisp
     //   alpha = (1 − nf²) / (3·nf·(nf+nd))          [eq. A2, correlation correction]
     //   beta  = 2·σ²·fe / (nf·(alpha+1))            [effective noise per CDS difference]
     //   gamma = 2·fe / (alpha+1)                    [flux-to-CDS conversion factor]
-    //   fe    = 1/gain                              [electron-to-ADU ratio]
+    //   fe    = gain                                [conversion gain, e⁻/ADU]
     //
     // The CDS differences d[i] = group[i+1] − group[i] (i = 0 … ng−2) are formed.
     // A pseudo-flux estimate is derived from the mean of (d+β)² (eq. 20), then
@@ -139,7 +161,7 @@ namespace nisp
         double ng = static_cast<double>( fstr.size() );
         double nf = static_cast<double>( nreads );
         double nd = static_cast<double>( ndrops );
-        double fe = 1.0 / fgain;
+        double fe = fgain;
 
         double alpha = (1. - nf*nf) / (3. * nf * (nf + nd));
         double beta  = 2. * (fsigma*fsigma) * fe / (nf * (alpha + 1.));

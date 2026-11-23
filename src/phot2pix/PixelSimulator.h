@@ -6,6 +6,8 @@
 //
 // PixelSimulator.h
 //
+/// @file PixelSimulator.h
+/// @brief phot2pix::pixsim, the three stages of a pixel: reset, integration and read.
 
 
 #ifndef P2P_PIXEL_SIMULATOR_H
@@ -16,25 +18,30 @@
 
 namespace phot2pix
 {
-    //@namespace phot2pix
-    //@brief phot2pix namespace for the photon to pixel conversion
+    /// @namespace phot2pix
+    /// @brief Photon to pixel conversion: the instrument-agnostic core of the simulator.
 
 #pragma region - pixel class definition
+    /**
+     * @class pixsim
+     * @brief Default pixel: converts the photons it receives into ADU.
+     * @details The response is split into three stages, each one a virtual method:
+     *          resetLevel(), integrate() and read(). Derived classes override the stage whose
+     *          physics they change. pixelresponse() chains the three stages for a single read.
+     *          A pixel holds its parameters only, never the accumulated charge: the caller keeps it.
+     */
     class pixsim
     {
-        /*
-        @class pixel
-        @brief Default pixel class to simulate the pixel response to photons
-        @details This class is default pixel class behaviour which used to simulate pixel response to photons. It aim to be inherited by daughter class with specific overriding of the pixel responses.
-        */
-
         private:
 
 #pragma region - protected member
         protected:
-            // @brief Validate base + derived parameters; call from derived ctors
-            //        after their own members are initialized so that the derived
-            //        vtable is active and _userValidation() dispatches correctly.
+            /// @brief Check the parameters, then call _userValidation().
+            /// @details Call it from the constructors of derived classes, after their own members are
+            ///          initialized, so that the derived vtable is active and _userValidation()
+            ///          dispatches correctly.
+            /// @throws std::invalid_argument if a parameter is out of range: dark current, read noise,
+            ///         kTC noise or baseline < 0, gain <= 0, quantum efficiency outside [0, 1].
             void _validateState();
             double m_darkCurrent; ///< Dark current in electrons per second
             double m_readNoise; ///< Read noise in electrons
@@ -43,7 +50,8 @@ namespace phot2pix
             double m_KTCnoise; ///< KTC noise in electrons
             double m_baseline; ///< Baseline in ADU
 
-            // @brief User-defined validation for derived classes
+            /// @brief Validation of the parameters added by a derived class. Does nothing by default.
+            /// @details Called by _validateState(), so by every setter and every copy: keep it cheap.
             virtual void _userValidation() {};
 
 #pragma endregion
@@ -51,30 +59,57 @@ namespace phot2pix
         public:
 
 #pragma region - ctor/dtor
+            /// @brief Ideal pixel: gain 1 e-/ADU, quantum efficiency 1, no noise, no dark current, baseline 0.
             pixsim();
+
+            /// @brief Pixel with its six parameters.
+            /// @param darkCurrent Dark current (e-/s), >= 0.
+            /// @param readNoise   Read noise (e- RMS per read), >= 0.
+            /// @param gain        Gain (e-/ADU), > 0.
+            /// @param QE          Quantum efficiency, in [0, 1].
+            /// @param m_KTCnoise  Reset (kTC) noise (e- RMS per reset), >= 0.
+            /// @param baseline    Baseline (ADU), >= 0.
+            /// @throws std::invalid_argument if a parameter is out of range.
             explicit pixsim(const double& darkCurrent, const double& readNoise, const double& gain, const double& QE, const double& m_KTCnoise, const double& baseline);
 
+            /// @brief Copy constructor.
             pixsim(const pixsim& other);
+            /// @brief Copy assignment.
             pixsim& operator=(const pixsim& other);
 
+            /// @brief Destructor.
             virtual ~pixsim();
 #pragma endregion
 
 #pragma region modifier
+            // Every setter throws std::invalid_argument if the value is out of range.
+
+            /// @brief Set the dark current (e-/s), >= 0. @throws std::invalid_argument otherwise.
             void setDarkCurrent(const double& darkCurrent) { m_darkCurrent = darkCurrent; _validateState();}
+            /// @brief Set the read noise (e- RMS per read), >= 0. @throws std::invalid_argument otherwise.
             void setReadNoise(const double& readNoise)     { m_readNoise = readNoise; _validateState();}
+            /// @brief Set the gain (e-/ADU), > 0. @throws std::invalid_argument otherwise.
             void setGain(const double& gain)               { m_gain = gain; _validateState(); }
+            /// @brief Set the quantum efficiency, in [0, 1]. @throws std::invalid_argument otherwise.
             void setQuantumEfficiency(const double& QE)    { m_quantumEfficiency = QE; _validateState();}
+            /// @brief Set the reset (kTC) noise (e- RMS per reset), >= 0. @throws std::invalid_argument otherwise.
             void setKTCnoise(const double& KTCnoise)       { m_KTCnoise = KTCnoise; _validateState();}
+            /// @brief Set the baseline (ADU), >= 0. @throws std::invalid_argument otherwise.
             void setBaseline(const double& baseline)       { m_baseline = baseline; _validateState();}
 #pragma endregion
 
 #pragma region accessor
+            /// @brief Dark current (e-/s).
             const double& getDarkCurrent() const { return m_darkCurrent;}
+            /// @brief Read noise (e- RMS per read).
             const double& getReadNoise() const { return m_readNoise;}
+            /// @brief Gain (e-/ADU).
             const double& getGain() const { return m_gain;}
+            /// @brief Quantum efficiency, in [0, 1].
             const double& getQuantumEfficiency() const { return m_quantumEfficiency;}
+            /// @brief Reset (kTC) noise (e- RMS per reset).
             const double& getKTCnoise() const { return m_KTCnoise;}
+            /// @brief Baseline (ADU).
             const double& getBaseline() const { return m_baseline;}
 #pragma endregion
 
@@ -86,39 +121,54 @@ namespace phot2pix
             //   read 1 : charge  = resetLevel() + integrate(...)   value = read(charge)
             //   read k : charge += integrate(...)                  value = read(charge)
 
-            // @brief Reset level, in ADU: baseline + kTC noise draw. Set once per reset,
-            //        common to every read until the next reset.
+            /// @brief Reset level: baseline + kTC noise draw.
+            /// @details Drawn once per reset, common to every read until the next reset.
+            /// @return Reset level (ADU).
             virtual double resetLevel() const;
 
-            // @brief Charge collected over exposureTime, in ADU: signal + dark current with
-            //        their shot noise. This is what accumulates in the pixel between reads:
-            //        no reset level, no read noise.
+            /// @brief Charge collected over exposureTime: signal + dark current with their shot noise.
+            /// @details This is what accumulates in the pixel between reads: no reset level, no read
+            ///          noise. The shot noise is the Gaussian approximation of Poisson.
+            /// @param flux         Photons/s received by the pixel.
+            /// @param exposureTime Integration time (s).
+            /// @return Collected charge (ADU).
             virtual double integrate(const double& flux, const double& exposureTime) const;
 
-            // @brief Runtime-parameter overload of integrate(). The base class ignores cfg.
+            /// @brief integrate() with runtime parameters. The base class ignores cfg.
+            /// @param flux         Photons/s received by the pixel.
+            /// @param exposureTime Integration time (s).
+            /// @param cfg          Runtime parameters, for derived classes.
+            /// @return Collected charge (ADU).
             virtual double integrate(const double& flux, const double& exposureTime, const PixelConfig& cfg) const
             {
                 return integrate(flux, exposureTime);
             }
 
-            // @brief One read of the charge accumulated in the pixel, in ADU: charge + one
-            //        independent read-noise draw N(0, readNoise)/gain. Called once per read;
-            //        its result is a measurement and is never fed back into the charge.
+            /// @brief One read of the accumulated charge: charge + N(0, readNoise)/gain.
+            /// @details Called once per read, with an independent draw each time. The result is a
+            ///          measurement and is never fed back into the charge.
+            /// @param charge Accumulated charge, reset level included (ADU).
+            /// @return Measured value (ADU).
             virtual double read(const double& charge) const;
 #pragma endregion
 
 #pragma region - pixel response
-            // @details Simulate a single-read exposure: read(resetLevel() + integrate(flux, exposureTime)).
-            //          Default behaviour is a purely linear response with shot noise, reset
-            //          level (baseline + kTC) and read noise. Override the stages above to change
-            //          one physical effect, or override pixelresponse() itself to provide a
-            //          completely different single-read model.
+            /// @brief Single-read exposure: read(resetLevel() + integrate(flux, exposureTime)).
+            /// @details By default a purely linear response with shot noise, reset level (baseline +
+            ///          kTC) and read noise. Override the stages above to change one physical effect,
+            ///          or pixelresponse() itself for a completely different single-read model.
+            /// @param flux         Photons/s received by the pixel.
+            /// @param exposureTime Exposure time (s).
+            /// @return Read value (ADU).
             virtual double pixelresponse(const double& flux, const double& exposureTime) const;
 
-            // Optional runtime-parameter overload. Derived classes can override this to
-            // extract extra parameters (e.g. "dT" for persistence) from cfg.
-            // The base class ignores cfg and delegates to the two-argument form, so a
-            // model that only overrides pixelresponse(flux, exposureTime) is used by both.
+            /// @brief pixelresponse() with runtime parameters (e.g. "dT" for persistence).
+            /// @details The base class ignores cfg and delegates to the two-argument form, so a model
+            ///          that only overrides pixelresponse(flux, exposureTime) is used by both.
+            /// @param flux         Photons/s received by the pixel.
+            /// @param exposureTime Exposure time (s).
+            /// @param cfg          Runtime parameters, for derived classes.
+            /// @return Read value (ADU).
             virtual double pixelresponse(const double& flux, const double& exposureTime, const PixelConfig& cfg) const
             {
                 return pixelresponse(flux, exposureTime);

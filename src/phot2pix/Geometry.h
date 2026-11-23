@@ -6,25 +6,28 @@
 //
 // Geometry.h
 //
-// Physical detector, and placement of the simulated matrix on it.
-//
-// The physical detector is width × height pixels. A simulated matrix of W × H pixels
-// is a part of that detector, placed at (x0, y0): matrix pixel (x, y) is physical
-// pixel (x0 + x, y0 + y). Unless "detectorOrigin" is given, (x0, y0) = (0, 0): the
-// first pixel of the matrix is the first pixel of the detector.
-//
-// The geometry maps the per-pixel inputs onto the matrix (extract()): a map is either
-// matrix-sized (W × H, used as is) or detector-sized (width × height, the section
-// [x0, x0+W) × [y0, y0+H) is used). A full-detector calibration map can then be used
-// to simulate any part of the detector.
-//
-// By default (DetectorSimulator without an explicit geometry) the detector is the
-// matrix. A detector family derives from Geometry to add its own layout (reference
-// pixels, …) by overriding configure(), isReference() and clone(): see nisp::Geometry.
-//
-// Configuration (all optional; absent keys leave the current value unchanged):
-//   "detectorSize"  : [width, height]   physical width and height
-//   "detectorOrigin": [x0, y0]          placement of the matrix (default: [0, 0])
+/// @file Geometry.h
+/// @brief Physical detector, and placement of the simulated matrix on it (phot2pix::Geometry).
+///
+/// The physical detector is width × height pixels. A simulated matrix of W × H pixels
+/// is a part of that detector, placed at (x0, y0): matrix pixel (x, y) is physical
+/// pixel (x0 + x, y0 + y). Unless "detectorOrigin" is given, (x0, y0) = (0, 0): the
+/// first pixel of the matrix is the first pixel of the detector.
+///
+/// The geometry maps the per-pixel inputs onto the matrix (extract()): a map is either
+/// matrix-sized (W × H, used as is) or detector-sized (width × height, the section
+/// [x0, x0+W) × [y0, y0+H) is used). A full-detector calibration map can then be used
+/// to simulate any part of the detector.
+///
+/// By default (DetectorSimulator without an explicit geometry) the detector is the
+/// matrix. A detector family derives from Geometry to add its own layout (reference
+/// pixels, …) by overriding configure(), isReference() and clone(): see nisp::Geometry.
+///
+/// Configuration (all optional; absent keys leave the current value unchanged):
+/// @verbatim
+///   "detectorSize"  : [width, height]   physical width and height
+///   "detectorOrigin": [x0, y0]          placement of the matrix (default: [0, 0])
+/// @endverbatim
 
 #ifndef P2P_GEOMETRY_H
 #define P2P_GEOMETRY_H
@@ -45,6 +48,7 @@ namespace phot2pix
 
 #pragma region - Geometry
 
+    /// @brief Physical detector and placement of the simulated matrix on it (see Geometry.h).
     class Geometry
     {
     public:
@@ -52,19 +56,25 @@ namespace phot2pix
         size_t height;   ///< physical detector rows
         std::optional<std::pair<size_t, size_t>> origin;   ///< explicit placement of the matrix; (0, 0) when empty
 
+        /// @brief Physical detector of w × h pixels.
+        /// @param w Columns, > 0.
+        /// @param h Rows, > 0.
+        /// @throws std::invalid_argument if w or h is 0.
         Geometry(size_t w, size_t h) : width(w), height(h)
         {
             if (w == 0 || h == 0)
                 throw std::invalid_argument("phot2pix::Geometry: the detector size must be > 0.");
         }
 
+        /// @brief Destructor.
         virtual ~Geometry() = default;
 
-        /// Copy of this geometry with its dynamic type (configure a copy, then commit it).
+        /// @brief Copy of this geometry with its dynamic type (configure a copy, then commit it).
         virtual std::shared_ptr<Geometry> clone() const { return std::make_shared<Geometry>(*this); }
 
-        /// Read "detectorSize" and "detectorOrigin" from cfg (see the header comment).
-        /// Throws std::invalid_argument on a malformed value; the geometry is then unchanged.
+        /// @brief Read "detectorSize" and "detectorOrigin" from cfg (see Geometry.h).
+        /// @param cfg Configuration; absent keys leave the current value unchanged.
+        /// @throws std::invalid_argument on a malformed value; the geometry is then unchanged.
         virtual void configure(const PixelConfig& cfg)
         {
             Geometry g = *this;
@@ -86,11 +96,13 @@ namespace phot2pix
             origin = g.origin;
         }
 
-        /// True if physical pixel (px, py) is a reference pixel (no photodiode). None by default.
+        /// @brief True if physical pixel (px, py) is a reference pixel (no photodiode). None by default.
         virtual bool isReference(size_t /*px*/, size_t /*py*/) const { return false; }
 
-        /// Origin (x0, y0) of a W × H matrix on the detector: "detectorOrigin" if given,
-        /// otherwise (0, 0). Throws std::invalid_argument if the matrix does not fit.
+        /// @brief Origin (x0, y0) of a W × H matrix on the detector: "detectorOrigin" if given, otherwise (0, 0).
+        /// @param W Matrix columns.
+        /// @param H Matrix rows.
+        /// @throws std::invalid_argument if the matrix does not fit.
         std::pair<size_t, size_t> place(size_t W, size_t H) const
         {
             const auto [x0, y0] = origin.value_or(std::pair<size_t, size_t>{0, 0});
@@ -102,10 +114,17 @@ namespace phot2pix
             return {x0, y0};
         }
 
-        /// Values of the W × H matrix from a mapW × mapH map (row-major):
-        ///   W × H          → the map as is (matrix coordinates);
-        ///   width × height → the section [x0, x0+W) × [y0, y0+H) (detector coordinates).
-        /// Throws std::invalid_argument otherwise; `what` names the map in the message.
+        /// @brief Values of the W × H matrix from a mapW × mapH map (row-major).
+        /// @details A W × H map is used as is (matrix coordinates); a width × height map gives its
+        ///          section [x0, x0+W) × [y0, y0+H) (detector coordinates).
+        /// @param map  Values of the map, row-major.
+        /// @param mapW Map columns.
+        /// @param mapH Map rows.
+        /// @param W    Matrix columns.
+        /// @param H    Matrix rows.
+        /// @param what Name of the map in the error messages.
+        /// @return W × H values, row-major.
+        /// @throws std::invalid_argument if the map has any other size.
         std::valarray<double> extract(const std::valarray<double>& map, size_t mapW, size_t mapH,
                                       size_t W, size_t H, const std::string& what) const
         {
@@ -129,7 +148,8 @@ namespace phot2pix
         }
 
     protected:
-        // [a, b] of non-negative integers.
+        /// @brief Value of a key holding [a, b], two non-negative integers.
+        /// @throws std::invalid_argument if the value has another form.
         static std::pair<size_t, size_t> _pair(const PixelConfig& cfg, const char* key)
         {
             const std::string what = std::string("phot2pix::Geometry: '") + key + "'";

@@ -29,8 +29,8 @@
 //   UTR   76 layers, layer k holds (k+1)*S                 flux = least-squares slope
 //   CDS   1 frame, last - first read = 75*S = 1090.56      flux = CDS / (75*tf)
 //   FLUX  1 frame, 76*S = 1105.10                          flux = value / (76*tf)
-//   DPU   1 frame, Kubik et al. 2016 slope in ADU/group,   flux = value / (20*tf)
-//         (nr+nd)*S = 290.82
+//   DPU   3 planes: Kubik et al. 2016 slope in ADU/group,  flux = value / (20*tf)
+//         (nr+nd)*S = 290.82, its reduced chi2 and its error
 //
 // The DPU test is the last one in the file so that, run as a single binary,
 // a crash there does not hide the other results (ctest runs each test in its
@@ -275,12 +275,13 @@ TEST(NispReadoutModes, DPU)
 
     auto result = sca->expose(flux, kMacc);
     ASSERT_NE(result, nullptr);
-    ASSERT_EQ(result->GetDimension(), 2u);
+    ASSERT_EQ(result->GetDimension(), 3u);
     ASSERT_EQ(result->Size(1), kW);
     ASSERT_EQ(result->Size(2), kH);
+    ASSERT_EQ(result->Size(3), 3u);   // slope, chi2, error
     const auto& data = uint16Data(result);
 
-    // No pixel may come out empty or saturated (would flag a NaN / failed fit).
+    // No slope may come out empty or saturated (would flag a NaN / failed fit).
     size_t nBad = 0;
     for (size_t i = 0; i < kNPix; ++i)
         if (data[i] == 0 || data[i] == 65535)
@@ -298,6 +299,14 @@ TEST(NispReadoutModes, DPU)
 
     const double fluxEstimate = s.mean / (static_cast<double>(kNR + kND) * kFrameTime);
     EXPECT_NEAR(fluxEstimate, kFlux, 5e-3 * kFlux) << "DPU flux estimate (ph/s)";
+
+    // Reduced chi2 (mean 0.89) and error of the slope (mean 8.43 ADU/group, same independent
+    // re-implementation). Both planes hold integers: the checks are no finer than 1.
+    const Stats chi2 = planeStats(data, kNPix,     kNPix);
+    const Stats err  = planeStats(data, 2 * kNPix, kNPix);
+    EXPECT_GT  (chi2.mean, 0.0)       << "DPU chi2 plane is empty";
+    EXPECT_LT  (chi2.mean, 2.0)       << "DPU reduced chi2";
+    EXPECT_NEAR(err.mean,  8.43, 1.0) << "DPU error on the slope (ADU/group)";
 
     EXPECT_EQ  (result->HDU().GetValueForKey("MODE"), "DPU");
     EXPECT_NEAR(result->HDU().GetDoubleValueForKey("NG"), kNG, 1e-9);
