@@ -27,7 +27,8 @@ The library is instrument-agnostic by design. The `src/nisp/` subdirectory provi
 | Library | Role | Notes |
 |---|---|---|
 | [`DSTmath`]:https://gitlab.in2p3.fr/deepskyproject/deepskymath | RNG and math primitives | Required; part of the DeepSky toolkit |
-| [`DSTfits`]:https://gitlab.in2p3.fr/deepskyproject/dstfits | FITS I/O (read/write) | Required; wraps `cfitsio` + `wcslib` + `Minuit2` |
+| [`DSTfits`]:https://gitlab.in2p3.fr/deepskyproject/dstfits | FITS I/O (read/write) | Required; wraps `cfitsio` + `wcslib` + `Minuit2` – provided as submodules |
+| [`DSTcore`]:https://gitlab.in2p3.fr/deepskyproject/deepskysys | Command Line Tools Helpers | Required to build utilities |
 | `nlohmann/json` | JSON parsing for `PixelConfig` | Fetched automatically if not found |
 | GoogleTest | Unit test runner | Git submodule; only needed when `-DBUILD_TESTING=ON` |
 
