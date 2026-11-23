@@ -1,0 +1,61 @@
+{
+    "width"        : 2048,
+    "height"       : 2048,
+    "detectorOrigin": [0, 0],
+
+    "flux"         : [
+        {"file": "<INPUT FITS FILE>", "hdu": "DET13.SCI",
+         "exposureMode": "DPU", "macc": [4, 4, 4], "output": "seq_macc_0.fits"},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET11.SCI",
+         "exposureMode": "FLUX", "macc": [1, 1, 0]},
+        {"file": "<INPUT FITS FILE>", "hdu": "DET22.SCI",
+         "exposureMode": "DPU", "macc": [4, 4, 4], "output": "seq_macc_1.fits"},
+         {"flux":0.0,"exposureMode": "FLUX", "exposureTime": 500,"output": "seq_dark_start.fits"},
+         {"flux":0.0,"exposureMode": "FLUX", "exposureTime": 500},
+         {"flux":0.0,"exposureMode": "FLUX", "exposureTime": 500},
+         {"flux":0.0,"exposureMode": "FLUX", "exposureTime": 500},
+         {"flux":0.0,"exposureMode": "FLUX", "exposureTime": 500},
+         {"flux":0.0,"exposureMode": "FLUX", "exposureTime": 500, "output": "seq_dark_end.fits"}
+    ],
+
+    "exposureMode" : "MACC",
+
+    "frame_time"   : 1.45408,
+    "offset"       : 1024.0,
+    "scale"        : 3.0,
+
+    "gain"         : 1.92,
+    "dark"         : 0.001,
+    "readNoise"    : 13.0,
+    "QE"           : 0.94,
+    "KTCnoise"     : 48.0,
+    "baseline"     : 10000.0,
+
+    "fullWell"     : 130000.0,
+    "nlModel"      : "polynomial",
+    "nl0"          : -6.25e-7,
+    "nl1"          : -3.1e-13,
+
+    "persistence"  : [ {"f": 2.0e-4,  "t": 110.0},
+                       {"f": 2.78e-6, "t": 2500.0} ],
+
+    "oneOverF"           : { "amplitude": 35.0, "slope": 0.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "bias_voltage_noise" : { "amplitude": 10.0, "slope": 0.5, "nPoles": 16 },
+    "pedestal_drift"     : { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [] } }
+}

@@ -3,7 +3,7 @@
     "height"       : 2048,
     "detectorOrigin": [0, 0],
 
-    "benchmark"    : 0,
+    "benchmark"    : 1,
 
     "flux"         : 10.0,
 
@@ -28,6 +28,6 @@
     "nl1"          : -3.1e-13,
 
     "oneOverF"           : { "amplitude": 22.3, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
-    "bias_voltage_noise" : { "amplitude": 22.3, "slope": 2.0, "nPoles": 168 },
+    "bias_voltage_noise" : { "amplitude": 22.3, "slope": 2.0, "nPoles": 16 },
     "pedestal_drift"     : { "sigma": 2.3, "t0": 0.0, "drift": { "poly": [0.0,0.005] } }
 }
