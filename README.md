@@ -33,6 +33,9 @@ The library is instrument-agnostic by design. The `src/nisp/` subdirectory provi
 
 C++ standard: **C++23**. CMake ≥ 3.20.
 
+## Doxygen website:
+ https://phot2pix-b41428.pages.in2p3.fr
+
 ---
 
 ## Getting the source
