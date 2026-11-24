@@ -12,7 +12,7 @@
 // test, (f) a full 2048x2048 exposure timed for a CPU-cost sanity check,
 // (g) per-exposure parameters (nisp::readout, expose(flux, readout)),
 // (h) full well and non-linearity in every readout mode,
-// (i) photon transfer curve: gain and read noise recovered from CDS exposures.
+// (i) photon transfer curve: gain and read noise recovered from CDS and DPU exposures.
 //
 // Most tests use the default MACC mode. The readout modes (selected with
 // "exposureMode") are validated on a full detector in gTest_nispReadoutModes.cxx;
@@ -1423,6 +1423,59 @@ TEST(SCA, DpuDoesNotFlagAPlateauBelowTheAdcLimit)
 // ═══════════════════════════════════════════════════════════════════════════════
 //  (i) Photon transfer curve to check the gain and the read noise
 // ═══════════════════════════════════════════════════════════════════════════════
+
+namespace
+{
+    // Gain and read noise of a photon transfer curve.
+    struct PtcFit
+    {
+        double gain,      gainErr;         // e-/ADU
+        double readNoise, readNoiseErr;    // e-
+        double chi2;                       // (number of points − 2) degrees of freedom
+    };
+
+    // Straight line Var = mean / g + 2·RN² / g² + quant fitted to the points (mean, var), in ADU
+    // and ADU², each measured over n pixels: the error on a variance is Var·√(2/n).
+    // quant is the rounding noise (ADU²). NaN read noise if the intercept is below it.
+    PtcFit fitPtc(const std::vector<double>& mean, const std::vector<double>& var, double n, double quant)
+    {
+        double sw = 0.0, swx = 0.0, swxx = 0.0, swy = 0.0, swxy = 0.0;
+        for (size_t i = 0; i < mean.size(); ++i)
+        {
+            const double w = n / (2.0 * var[i] * var[i]);
+            sw   += w;
+            swx  += w * mean[i];
+            swxx += w * mean[i] * mean[i];
+            swy  += w * var[i];
+            swxy += w * mean[i] * var[i];
+        }
+
+        // Var = slope·mean + intercept, and the covariance matrix of the fit.
+        const double det       = sw * swxx - swx * swx;
+        const double slope     = (sw * swxy - swx * swy) / det;
+        const double intercept = (swxx * swy - swx * swxy) / det;
+        const double varSlope  = sw / det;
+        const double varInter  = swxx / det;
+        const double covar     = -swx / det;
+
+        PtcFit fit{};
+        for (size_t i = 0; i < mean.size(); ++i)
+        {
+            const double r = var[i] - slope * mean[i] - intercept;
+            fit.chi2 += r * r * n / (2.0 * var[i] * var[i]);
+        }
+
+        const double readVar = intercept - quant;   // 2·RN²/g²
+        fit.gain         = 1.0 / slope;
+        fit.gainErr      = std::sqrt(varSlope) / (slope * slope);
+        fit.readNoise    = fit.gain * std::sqrt(readVar / 2.0);
+        fit.readNoiseErr = fit.readNoise * std::sqrt(varInter / (4.0 * readVar * readVar)
+                                                     + varSlope / (slope * slope)
+                                                     - covar / (slope * readVar));
+        return fit;
+    }
+}
+
 TEST(SCA, PhotonTransferCurveGivesTheGainAndTheReadNoise)
 {
     // Use of CDS exposures of increasing length, uniform flux, uniform pixels matrixes without correlated noise.
@@ -1455,9 +1508,7 @@ TEST(SCA, PhotonTransferCurveGivesTheGainAndTheReadNoise)
             });
 
             // 94 e- to 18.7 ke-: at most 37.9 kADU (gain 0.5, offset included), below the ADC limit.
-            // Weighted sums of the fit: the error on a variance of n Gaussian pixels is Var·√(2/n).
-            std::vector<double> x, y, weight;
-            double sw = 0.0, swx = 0.0, swxx = 0.0, swy = 0.0, swxy = 0.0;
+            std::vector<double> means, vars;
             for (const double nFrames : {2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 200.0})
             {
                 const auto result = sca.expose(flux, nFrames);
@@ -1465,57 +1516,98 @@ TEST(SCA, PhotonTransferCurveGivesTheGainAndTheReadNoise)
 
                 const auto [mean, var] = planeStats(uint16Data(result), 0, W * H);
                 ASSERT_GT(var, 0.0) << nFrames << " frames";
-
-                const double xi = mean - offset;
-                const double w  = n / (2.0 * var * var);
-                x.push_back(xi);
-                y.push_back(var);
-                weight.push_back(w);
-
-                sw   += w;
-                swx  += w * xi;
-                swxx += w * xi * xi;
-                swy  += w * var;
-                swxy += w * xi * var;
+                means.push_back(mean - offset);
+                vars.push_back(var);
             }
 
-            // Var = slope·mean + intercept, and the covariance matrix of the fit.
-            const double det       = sw * swxx - swx * swx;
-            const double slope     = (sw * swxy - swx * swy) / det;
-            const double intercept = (swxx * swy - swx * swxy) / det;
-            const double varSlope  = sw / det;
-            const double varInter  = swxx / det;
-            const double covar     = -swx / det;
+            const PtcFit fit = fitPtc(means, vars, n, quant);
+
+            std::cout << "[SCA PTC] gain " << g << " e-/ADU & RN " << RN << " e- : "
+                      << fit.gain      << " +/- " << fit.gainErr      << " e-/ADU, read noise "
+                      << fit.readNoise << " +/- " << fit.readNoiseErr << " e-\n";
 
             // Straight line: 8 points, 6 degrees of freedom (P(chi2 > 40) = 5e-7).
-            double chi2 = 0.0;
-            for (size_t i = 0; i < x.size(); ++i)
-            {
-                const double r = y[i] - slope * x[i] - intercept;
-                chi2 += weight[i] * r * r;
-            }
-            EXPECT_LT(chi2, 40.0) << "the photon transfer curve is not a straight line";
+            EXPECT_LT(fit.chi2, 40.0) << "the photon transfer curve is not a straight line";
 
-            ASSERT_GT(slope, 0.0);
-            const double gain    = 1.0 / slope;
-            const double gainErr = std::sqrt(varSlope) / (slope * slope);
-
-            const double readVar = intercept - quant;   // 2·RN²/g²
-            ASSERT_GT(readVar, 0.0);
-            const double readNoise    = gain * std::sqrt(readVar / 2.0);
-            const double readNoiseErr = readNoise * std::sqrt(varInter / (4.0 * readVar * readVar)
-                                                              + varSlope / (slope * slope)
-                                                              - covar / (slope * readVar));
-
-            std::cout << "[SCA PTC] gain " << g << " e-/ADU & RN "<<RN<<" e- : " << gain << " +/- " << gainErr
-                      << " e-/ADU, read noise " << readNoise << " +/- " << readNoiseErr << " e-\n";
-
-            EXPECT_NEAR(gain,      g,  kSigma * gainErr)      << "gain (e-/ADU)";
-            EXPECT_NEAR(readNoise, RN, kSigma * readNoiseErr) << "read noise (e-)";
+            EXPECT_NEAR(fit.gain,      g,  kSigma * fit.gainErr)      << "gain (e-/ADU)";
+            EXPECT_NEAR(fit.readNoise, RN, kSigma * fit.readNoiseErr) << "read noise (e-)";
 
             // The fit must be precise enough for these checks to mean something (0.3 % and 0.5 %).
-            EXPECT_LT(gainErr,      0.005 * g);
-            EXPECT_LT(readNoiseErr, 0.010 * RN);
+            EXPECT_LT(fit.gainErr,      0.005 * g);
+            EXPECT_LT(fit.readNoiseErr, 0.010 * RN);
+        }
+    }
+}
+
+TEST(SCA, DpuPhotonTransferCurveGivesTheGainAndTheReadNoise)
+{
+    // Same curve with the DPU: MACC(ng, 1, 0) with ng increasing, at constant flux.
+    // The slope is per frame, so it does not change with ng: the signal of a point is
+    // slope × (ng − 1), which is the value of plane 0 with "scale" = ng − 1. At first order it
+    // is last read − first read (baseline and kTC cancel), so with S the signal in e-:
+    //   mean = S / g,   Var = (S + 2·RN²) / g² + 3/12
+    // 3/12: uint16 rounding of both reads by the ADC, then of the output by the DPU.
+    //
+    // Beyond first order, the estimator also uses the scatter of the differences (and dpu_gain,
+    // here the pixel gain): a relative effect of 1 / (2·S per frame) on the variance. With
+    // 470 e- per frame, it moves the measured gain by less than 0.1 %, below the fit error.
+    // Plane 2 cannot replace the variance over the matrix: it is computed with dpu_gain and
+    // would give it back.
+    constexpr size_t W = 256, H = 256;
+    constexpr double n     = static_cast<double>(W * H);
+    constexpr double quant = 3.0 / 12.0;     // ADU²
+    const auto       flux  = makeUniformFlux(W, H, 500.0);
+
+    // ng − 1: 470 e- to 18.8 ke-; the last read is at most 39.5 kADU (gain 0.5), below the ADC limit.
+    const std::vector<size_t> intervals{1, 2, 3, 5, 8, 12, 20, 30, 40};
+
+    for (const double RN : {5.0, 10.0, 13.0, 20.0, 24.0})   // e-
+    {
+        std::cout << std::endl;
+        SCOPED_TRACE("read noise " + std::to_string(RN) + " e-");
+
+        for (const double g : {0.5, 1.0, 1.92, 4.0})
+        {
+            SCOPED_TRACE("gain " + std::to_string(g) + " e-/ADU");
+
+            std::vector<double> means, vars;
+            for (const size_t nInt : intervals)
+            {
+                nisp::SCA sca(W, H);
+                sca.initialize(PixelConfig{
+                    {"gain", g}, {"dark", 0.01}, {"readNoise", RN}, {"QE", 0.94},
+                    {"KTCnoise", 48.0}, {"baseline", 1000.0}, {"frame_time", 1.0},
+                    {"scale", static_cast<double>(nInt)}, {"offset", 0.0},
+                    {"exposureMode", std::string("DPU")}, {"refPixCorr", std::string("OFF")},
+                    {"detectorOrigin", activeOrigin()}
+                });
+
+                const auto result = sca.expose(flux, nisp::macc{nInt + 1, 1, 0});
+                ASSERT_NE(result, nullptr);
+                ASSERT_EQ(result->Size(3), 3u);
+
+                const auto [mean, var] = planeStats(uint16Data(result), 0, W * H);
+                ASSERT_GT(var, 0.0) << "MACC(" << nInt + 1 << ",1,0)";
+                means.push_back(mean);
+                vars.push_back(var);
+            }
+
+            const PtcFit fit = fitPtc(means, vars, n, quant);
+
+            std::cout << "[SCA DPU PTC] gain " << g << " e-/ADU & RN " << RN << " e- : "
+                      << fit.gain      << " +/- " << fit.gainErr      << " e-/ADU, read noise "
+                      << fit.readNoise << " +/- " << fit.readNoiseErr << " e-\n";
+
+            // Straight line: 9 points, 7 degrees of freedom (P(chi2 > 45) = 1e-7).
+            EXPECT_LT(fit.chi2, 45.0) << "the photon transfer curve is not a straight line";
+
+            EXPECT_NEAR(fit.gain,      g,  kSigma * fit.gainErr)      << "gain (e-/ADU)";
+            EXPECT_NEAR(fit.readNoise, RN, kSigma * fit.readNoiseErr) << "read noise (e-)";
+
+            // Precision of the fit: 0.3 % on the gain. The first point is at 470 e-, so the read
+            // noise is less constrained than with the CDS: 0.6 % at 24 e-, 3.3 % at 5 e-.
+            EXPECT_LT(fit.gainErr,      0.005 * g);
+            EXPECT_LT(fit.readNoiseErr, 0.050 * RN);
         }
     }
 }
