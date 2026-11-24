@@ -151,7 +151,7 @@ namespace nisp
     // corrected for the non-linear bias to obtain the final flux (eq. 20, full form).
     // The reduced χ² (eq. 19) uses a Fowler (first-last) estimate as reference.
     // The flux error (eq. 12) is propagated from the CDS scatter.
-    void Ramp::getSlope(double& flux, double& chi2, double &err) const
+    void Ramp::getSlope(double& flux, double& chi2, double &err2) const
     {
         //std::cout<<"read noise :"<<fsigma<<std::endl;
         //std::cout<<"gain       :"<<fgain<<std::endl;
@@ -199,9 +199,8 @@ namespace nisp
         chi2 = gamma * (nCds*pseudo_flux - lf);
         chi2 /= ( ng - 2. ); // <- Get Normalized chi2
 
-        err = 2*(pseudo_flux+beta)*(pseudo_flux+beta)/nCds;
-        err /= (1.+gamma*(pseudo_flux+beta));
-        err = sqrt(err);
+        err2 = 2*(pseudo_flux+beta)*(pseudo_flux+beta)/nCds;
+        err2 /= (1.+gamma*(pseudo_flux+beta));
     }
 
     // Fowler sampling: simplest possible slope estimate — last frame minus first frame.

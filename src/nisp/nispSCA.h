@@ -476,7 +476,7 @@ namespace nisp
         ///          the output are:
         ///          - 0: slope per group interval, × scale + offset; 65535 with less than 2 good groups;
         ///          - 1: chi2 (not reduced), 0 with 2 good groups or less;
-        ///          - 2: error of the slope, × scale + offset; 0 with less than 2 good groups.
+        ///          - 2: squared error of the slope, × 100 x scale + offset; 0 with less than 2 good groups.
         /// @return uint16 cube of W × H × 3.
         /// @throws std::invalid_argument with less than 2 groups.
         std::shared_ptr<DSL::FITScube> expose_dpu(const std::valarray<double>& flux,

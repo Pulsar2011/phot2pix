@@ -118,7 +118,7 @@ namespace
 }
 
 /// @brief Read the configuration, simulate the exposure (or the sequence) and write the output.
-/// @details In DPU mode, the output file holds the three planes in the HDUs SCI, CHI2 and ERR.
+/// @details In DPU mode, the output file holds the three planes in the HDUs SCI, CHI2 and ERR2.
 int main(int argc, char **argv)
 {
     try
@@ -376,9 +376,9 @@ int main(int argc, char **argv)
                 std::shared_ptr<DSL::FITScube> slope = result->Layer(0);
                 std::shared_ptr<DSL::FITScube> chi2  = result->Layer(1);
                 std::shared_ptr<DSL::FITScube> err   = result->Layer(2);
-                slope->SetName("SCI") ;
+                slope->SetName("SCI") ; slope->HDU().ValueForKey("BUNIT","ADU",DSL::key_type::fChar);
                 chi2 ->SetName("CHI2");
-                err  ->SetName("ERR") ;
+                err  ->SetName("ERR2") ; err->HDU().ValueForKey("BUNIT","10**-2ADU**2",DSL::key_type::fChar);
                 
                 FITSmanager outfile = FITSmanager::Create(outputFile, true);
                 outfile.AppendImage(*slope);

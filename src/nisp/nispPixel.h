@@ -260,11 +260,11 @@ namespace nisp
          @details Compute the EUCLID Flux, Chi2 quality factor and associated error on the flux based on Kubic et al, Publications of the Astronomical Society of the Pacific, 128:104504, 2016. The flux is estimated from equation (20). The quality factor, as the reduce chi2, is estimated from equation (19) and flux error form equation (12).
          @param flux Upon return flux value in pix_unit/Group, where pix_unit is the pixel unit, either e- when the gain is 1 or ADU if it is different from 1.
          @param chi2 Upon return reduced chi2 value: chi2 / (number of groups - 2), not defined for 2 groups.
-         @param err Upon return flux error estimation value, in the same unit as flux.
+         @param err2 Upon return squarred flux error estimation value, in the same unit as flux at the power of 2.
          @throws std::runtime_error if the ramp has less than 2 groups.
          @note If the ramp is not already in the form of coadded groups, number of reads, number of drops and number of groups have to be tunned to this ramp otherwise the flux estimator will be biased.
          */
-        void getSlope(double &flux, double &chi2, double& err) const;
+        void getSlope(double &flux, double &chi2, double& err2) const;
         
         /**
          @brief Compute Flux from a fowler

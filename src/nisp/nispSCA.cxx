@@ -1449,7 +1449,7 @@ namespace nisp
 
                 outData[i] = toUint16(slope * dpuScale + dpuOffset);   // rounded, clamped to [0, 65535], NaN → 0
                 outData[i+nPix] = toUint16(chi2 * static_cast<double>(nGood - 2));   // reduced chi2 → chi2 (2 groups: NaN → 0)
-                outData[i+2*nPix] = toUint16(err * dpuScale + dpuOffset);            // same conversion as the slope
+                outData[i+2*nPix] = toUint16(err * 100. * dpuScale + dpuOffset);            // x100 with same conversion as the slope
             }
         });
 

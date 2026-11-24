@@ -707,11 +707,11 @@ TEST(nispRamp, CoaddStatisticalErrorMatchesObservedScatter)
         nisp::Ramp  raw(&utr, std::slice(0, nFrames, 1), sigma, gain);
         nisp::Ramp& macc = raw.coadd(ngr, nreads, ndrops);
 
-        double flux = 0.0, chi2 = 0.0, err = 0.0;
-        macc.getSlope(flux, chi2, err);
+        double flux = 0.0, chi2 = 0.0, err2 = 0.0;
+        macc.getSlope(flux, chi2, err2);
 
         fluxSamples.push_back(flux);
-        errSamples.push_back(err);
+        errSamples.push_back(err2);
 
         delete &macc;
     }
@@ -725,7 +725,7 @@ TEST(nispRamp, CoaddStatisticalErrorMatchesObservedScatter)
     double varFlux = 0.0;
     for (double f : fluxSamples) varFlux += (f - meanFlux) * (f - meanFlux);
     varFlux /= (n - 1.0);
-    const double empiricalStd = std::sqrt(varFlux);
+    const double empiricalStd = varFlux;
 
     // Broad factor-of-3 band rather than a tight relative tolerance: this
     // checks `err` is in the right ballpark (not zero, not orders of

@@ -278,7 +278,7 @@ TEST(NispReadoutModes, DPU)
     ASSERT_EQ(result->GetDimension(), 3u);
     ASSERT_EQ(result->Size(1), kW);
     ASSERT_EQ(result->Size(2), kH);
-    ASSERT_EQ(result->Size(3), 3u);   // slope, chi2, error
+    ASSERT_EQ(result->Size(3), 3u);   // slope, chi2, error2*100.
     const auto& data = uint16Data(result);
 
     // No slope may come out empty or saturated (would flag a NaN / failed fit).
@@ -306,7 +306,7 @@ TEST(NispReadoutModes, DPU)
     const Stats err  = planeStats(data, 2 * kNPix, kNPix);
     EXPECT_GT  (chi2.mean, 0.0)       << "DPU chi2 plane is empty";
     EXPECT_LT  (chi2.mean, 2.0)       << "DPU reduced chi2";
-    EXPECT_NEAR(err.mean,  8.43, 1.0) << "DPU error on the slope (ADU/group)";
+    EXPECT_NEAR(err.mean/100.,  8.43*8.43, 1.0) << "DPU error on the slope (ADU/group)";
 
     EXPECT_EQ  (result->HDU().GetValueForKey("MODE"), "DPU");
     EXPECT_NEAR(result->HDU().GetDoubleValueForKey("NG"), kNG, 1e-9);

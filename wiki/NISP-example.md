@@ -411,17 +411,17 @@ Y_i =
 \end{cases}
 ```
 
-$`\hat F`$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated linear pixel, $`\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i`$. The estimator also gives the χ² of the fit (not reduced, n_good − 2 degrees of freedom) and the error of the slope, in the same unit:
+$`\hat F`$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated linear pixel, $`\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i`$. The estimator also gives the χ² of the fit (not reduced, n_good − 2 degrees of freedom) and the square of the error of the slope estimate, in the square unit of the slope (ADU² per group interval²):
 
 ```math
 \hat F_x = \sqrt{\bar F} - \beta,
 \qquad
 \chi^2 = \gamma\,\Big[(n_{\mathrm{good}} - 1)\,\hat F_x - \big(G_{n_{\mathrm{good}}-1} - G_0\big)\Big],
 \qquad
-\sigma_{\hat F} = \sqrt{\frac{2\,(\hat F_x + \beta)^2}{(n_{\mathrm{good}} - 1)\,\big(1 + \gamma\,(\hat F_x + \beta)\big)}}
+\sigma_{\hat F}^2 = \frac{2\,(\hat F_x + \beta)^2}{(n_{\mathrm{good}} - 1)\,\big(1 + \gamma\,(\hat F_x + \beta)\big)}
 ```
 
-The output has three planes: $`\mathcal{Q}_{so}(\hat F)`$, $`\mathcal{Q}(\chi^2)`$ and $`\mathcal{Q}_{so}(\sigma_{\hat F})`$. With $`n_{\mathrm{good}} = 2`$ there is no degree of freedom and the χ² is 0; with $`n_{\mathrm{good}} < 2`$ the last two planes are 0.
+The output has three planes: $`\mathcal{Q}_{so}(\hat F)`$, $`\mathcal{Q}(\chi^2)`$ and $`\mathcal{Q}_{so}(100\,\sigma_{\hat F}^2)`$. With $`n_{\mathrm{good}} = 2`$ there is no degree of freedom and the χ² is 0; with $`n_{\mathrm{good}} < 2`$ the last two planes are 0.
 
 ### 3.3 The algorithm
 
@@ -486,8 +486,8 @@ flowchart TD
     REG --> DPUQ{"DPU?"}
     DPUQ -->|"no: MACC, UTR"| CUBE["uint16 cube<br/>$$W \times H \times n_g n_r$$"]
     DPUQ -->|"yes"| RPC["reference pixel correction, threaded<br/>$$c_y^{(\mathrm{ch})}[\ell]$$ of every read: medians of T, B, L, R<br/>the uint16 cube is not modified"]
-    RPC --> DPU["per pixel, threaded<br/>cut at the first saturated group, on the raw reads: $$n_{\mathrm{good}}$$<br/>subtract the correction in double: $$Y' = Y - c$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$, $$\chi^2$$, error<br/>output $$\mathcal{Q}_{so}(\hat F)$$, $$\mathcal{Q}(\chi^2)$$, $$\mathcal{Q}_{so}(\sigma_{\hat F})$$"]
-    DPU --> MAP["uint16 slope, chi2 and error planes<br/>$$W \times H \times 3$$"]
+    RPC --> DPU["per pixel, threaded<br/>cut at the first saturated group, on the raw reads: $$n_{\mathrm{good}}$$<br/>subtract the correction in double: $$Y' = Y - c$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$, $$\chi^2$$, squared error<br/>output $$\mathcal{Q}_{so}(\hat F)$$, $$\mathcal{Q}(\chi^2)$$, $$\mathcal{Q}_{so}(100 \sigma_{\hat F}^2)$$"]
+    DPU --> MAP["uint16 slope, chi2 and squared error planes<br/>$$W \times H \times 3$$"]
 ```
 
 Two invariants hold throughout the loop:
@@ -556,7 +556,7 @@ Each key is either a number, applied to every pixel, or a per-pixel FITS map, ma
 
 | Key | Unit | Default | Meaning and use |
 |---|---|---|---|
-| `offset` (or `dpu_offset`) | ADU | 0 | Added before the `uint16` conversion: DN = value × `scale` + `offset`. Keeps negative values (noise on the CDS of a dark pixel) above 0. Applied in CDS, FLUX, DPU (slope and error, not the χ²) and windowed reads, not to MACC/UTR layers |
+| `offset` (or `dpu_offset`) | ADU | 0 | Added before the `uint16` conversion: DN = value × `scale` + `offset`. Keeps negative values (noise on the CDS of a dark pixel) above 0. Applied in CDS, FLUX, DPU (slope and squared error × 100, not the χ²) and windowed reads, not to MACC/UTR layers |
 | `scale` (or `dpu_scale`) | — | 1 | Multiplies the value before the conversion. For DPU, NISP uses SFACTOR = ng − 1, so DN − OFFSET is the signal integrated over `INTTIME` |
 | `dpu_gain` | e⁻ ADU⁻¹ | mean pixel `gain` | Gain the DPU slope estimator assumes (header `GAIN`). Set it to simulate a DPU calibrated differently from the detector |
 | `dpu_noise` | e⁻ | mean pixel `readNoise` | Read noise per read the estimator assumes (header `RN`). It does not include the readout noise: when the readout noise is large, set it to the total noise of one read |
@@ -716,7 +716,7 @@ The mode set by `exposureMode` decides what `expose()` computes:
 | **UTR** | Same as MACC | UTR ramp of ⌊t / t_frame⌋ reads | W × H × N cube of reads |
 | **CDS** | Last read − first read over the MACC duration | Last − first over *t* | W × H |
 | **FLUX** | One read after the MACC duration | One read after *t* | W × H |
-| **DPU** | Ramp, then onboard slope fitting | Slope fitted on a UTR ramp | W × H × 3 cube: slope, χ², error of the slope |
+| **DPU** | Ramp, then onboard slope fitting | Slope fitted on a UTR ramp | W × H × 3 cube: slope, χ², squared error of the slope (× 100) |
 
 The MACC duration is (ng·(nr+nd) − nd)·t_frame, i.e. 76 frames for MACC(4,16,4).
 
@@ -764,7 +764,7 @@ The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::g
 5. **Output**, one plane each:
    - plane 0, `uint16(slope × scale + offset)`, the slope being in **ADU per group interval** ((nr+nd) frames);
    - plane 1, `uint16(χ²)`, not reduced: n_good − 2 degrees of freedom, 0 with 2 good groups;
-   - plane 2, `uint16(error × scale + offset)`, the error of the slope, converted like the slope.
+   - plane 2, `uint16(error² × 100 × scale + offset)`, the squared error (variance) of the slope, in **(ADU per group interval)²**. The factor 100 limits the precision lost when rounding to `uint16`: with `scale` = 1, the step is 0.01 ADU².
 
 The estimator is linear: with a non-linear response, the slope is that of the chord between the first and the last group, and the χ² grows with the curvature.
 
@@ -915,7 +915,7 @@ nispSimulator -o exposure.fits -d 1 my_config.json
 
 The tool reads `width`, `height`, `flux`, `macc` or `exposureTime`, and `benchmark` ([§4.2](#42-matrix-flux-and-readout-pattern-nispsimulator)), passes the whole configuration to `SCA::initialize()`, reads a flux image with `SCA::loadImage()` (the file and HDU, as for a per-pixel map) and maps it onto the matrix with `SCA::toMatrix()` (matrix-sized, or detector-sized cropped at `detectorOrigin`), and adds `FLUX` and `FLUXSEC` to the output header.
 
-In `DPU` mode, the three planes are written as three HDUs, `SCI` (slope), `CHI2` and `ERR`. The other modes write one image or cube.
+In `DPU` mode, the three planes are written as three HDUs, `SCI` (slope), `CHI2` and `ERR2` (squared error of the slope, × 100). The other modes write one image or cube.
 
 Ready-made configurations:
 
@@ -938,7 +938,7 @@ Ready-made configurations:
 | UTR | Read k = (k+1)·S, 76 reads | Least-squares slope |
 | CDS | 75·S = 1090.56 ADU | CDS / (75·t_frame) |
 | FLUX | 76·S = 1105.10 ADU | Value / (76·t_frame) |
-| DPU | Slope ≈ 290.8 ADU per group, scatter ≈ 9.4 ADU; error ≈ 8.4 ADU; loose check of the χ² | Slope / (20·t_frame) |
+| DPU | Slope ≈ 290.8 ADU per group, scatter ≈ 9.4 ADU; squared error ≈ 71 ADU²; loose check of the χ² | Slope / (20·t_frame) |
 
 `src/test/gTest_nispSCA.cxx` checks the noise budget and the detector:
 
@@ -967,7 +967,7 @@ Ready-made configurations:
 
 - With MACC parameters, the UTR mode produces the same output as MACC, and the MACC output always writes `MODE = MACC`. The MACC `EXPTIME` counts the drops after the last group.
 - DPU:
-  - the planes hold integers, so the χ² (about n_good − 2 on average for a linear pixel) and the error × `scale` are rounded to 1;
+  - the planes hold integers, so the χ² (about n_good − 2 on average for a linear pixel) and the squared error × 100 × `scale` are rounded to 1;
   - no test runs the DPU at a gain other than 1;
   - `nispSimulator` writes the three HDUs only when `exposureMode` is written exactly `DPU`, and for a single exposure; otherwise the output is the three-plane cube.
 - The readout-noise model reads every channel in the same direction and has no row or frame overhead.

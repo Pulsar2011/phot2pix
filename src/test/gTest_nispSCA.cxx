@@ -11,11 +11,12 @@
 // checks, (c) persistence, (d) 1/f noise, (e) all three combined as a smoke
 // test, (f) a full 2048x2048 exposure timed for a CPU-cost sanity check,
 // (g) per-exposure parameters (nisp::readout, expose(flux, readout)),
-// (h) full well and non-linearity in every readout mode.
+// (h) full well and non-linearity in every readout mode,
+// (i) photon transfer curve: gain and read noise recovered from CDS exposures.
 //
 // Most tests use the default MACC mode. The readout modes (selected with
 // "exposureMode") are validated on a full detector in gTest_nispReadoutModes.cxx;
-// here only the CDS read-noise budget is checked (ExposeCdsTwoReadsOfReadNoiseAndKtcCancels).
+// here the CDS noise is checked by ExposeCdsTwoReadsOfReadNoiseAndKtcCancels and by (i).
 //
 
 #include <gtest/gtest.h>
@@ -1417,4 +1418,104 @@ TEST(SCA, DpuDoesNotFlagAPlateauBelowTheAdcLimit)
 
     const double expected = std::sqrt((1600.0 * 1600.0 + 900.0 * 900.0) / 3.0);   // 1059.9 ADU, instead of 1600
     EXPECT_NEAR(planeStats(data, 0, kW * kH).first, expected, 0.01 * expected);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  (i) Photon transfer curve to check the gain and the read noise
+// ═══════════════════════════════════════════════════════════════════════════════
+TEST(SCA, PhotonTransferCurveGivesTheGainAndTheReadNoise)
+{
+    // Use of CDS exposures of increasing length, uniform flux, uniform pixels matrixes without correlated noise.
+    // The reset level (baseline + kTC) is canceled in CDS exposure: One obtain
+    //   mean signal \$ \bar{S}= \frac{S}{g} \$ with \$S\$ the signal in e-,   Var = (S + 2·RN²) / g² + 1/12 = mean / g + 2·RN² / g² + 1/12
+    // (factor 1/12come from uint16 rounding). A straight line fitted to Var=f(mean) gives the gain
+    // (slope 1/g) and the read noise as the intercept; the flux, QE and dark value are not used in the PTC estimate.
+    // The exposures are independent, while the reads of one ramp share their shot noise.
+    constexpr size_t W = 256, H = 256;
+    constexpr double n      = static_cast<double>(W * H);
+    constexpr double offset = 500.0;         // ADU: keeps the CDS away from the clamp at 0
+    constexpr double quant  = 1.0 / 12.0;    // uint16 rounding noise, ADU²
+    const auto       flux   = makeUniformFlux(W, H, 100.0);
+
+    for (const double RN : {5.0, 10.0, 13.0, 20.0, 24.0,})   // RN e-1
+    {
+        std::cout<<std::endl;
+        SCOPED_TRACE("read noise " + std::to_string(RN) + " e-");
+        
+        for (const double g : {0.5, 1.0, 1.92, 4.0})
+        {
+            SCOPED_TRACE("gain " + std::to_string(g) + " e-/ADU");
+
+            nisp::SCA sca(W, H);
+            sca.initialize(PixelConfig{
+                {"gain", g}, {"dark", 0.01}, {"readNoise", RN}, {"QE", 0.94},
+                {"KTCnoise", 48.0}, {"baseline", 1000.0}, {"frame_time", 1.0},
+                {"offset", offset}, {"exposureMode", std::string("CDS")},
+                {"detectorOrigin", activeOrigin()}
+            });
+
+            // 94 e- to 18.7 ke-: at most 37.9 kADU (gain 0.5, offset included), below the ADC limit.
+            // Weighted sums of the fit: the error on a variance of n Gaussian pixels is Var·√(2/n).
+            std::vector<double> x, y, weight;
+            double sw = 0.0, swx = 0.0, swxx = 0.0, swy = 0.0, swxy = 0.0;
+            for (const double nFrames : {2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 200.0})
+            {
+                const auto result = sca.expose(flux, nFrames);
+                ASSERT_NE(result, nullptr);
+
+                const auto [mean, var] = planeStats(uint16Data(result), 0, W * H);
+                ASSERT_GT(var, 0.0) << nFrames << " frames";
+
+                const double xi = mean - offset;
+                const double w  = n / (2.0 * var * var);
+                x.push_back(xi);
+                y.push_back(var);
+                weight.push_back(w);
+
+                sw   += w;
+                swx  += w * xi;
+                swxx += w * xi * xi;
+                swy  += w * var;
+                swxy += w * xi * var;
+            }
+
+            // Var = slope·mean + intercept, and the covariance matrix of the fit.
+            const double det       = sw * swxx - swx * swx;
+            const double slope     = (sw * swxy - swx * swy) / det;
+            const double intercept = (swxx * swy - swx * swxy) / det;
+            const double varSlope  = sw / det;
+            const double varInter  = swxx / det;
+            const double covar     = -swx / det;
+
+            // Straight line: 8 points, 6 degrees of freedom (P(chi2 > 40) = 5e-7).
+            double chi2 = 0.0;
+            for (size_t i = 0; i < x.size(); ++i)
+            {
+                const double r = y[i] - slope * x[i] - intercept;
+                chi2 += weight[i] * r * r;
+            }
+            EXPECT_LT(chi2, 40.0) << "the photon transfer curve is not a straight line";
+
+            ASSERT_GT(slope, 0.0);
+            const double gain    = 1.0 / slope;
+            const double gainErr = std::sqrt(varSlope) / (slope * slope);
+
+            const double readVar = intercept - quant;   // 2·RN²/g²
+            ASSERT_GT(readVar, 0.0);
+            const double readNoise    = gain * std::sqrt(readVar / 2.0);
+            const double readNoiseErr = readNoise * std::sqrt(varInter / (4.0 * readVar * readVar)
+                                                              + varSlope / (slope * slope)
+                                                              - covar / (slope * readVar));
+
+            std::cout << "[SCA PTC] gain " << g << " e-/ADU & RN "<<RN<<" e- : " << gain << " +/- " << gainErr
+                      << " e-/ADU, read noise " << readNoise << " +/- " << readNoiseErr << " e-\n";
+
+            EXPECT_NEAR(gain,      g,  kSigma * gainErr)      << "gain (e-/ADU)";
+            EXPECT_NEAR(readNoise, RN, kSigma * readNoiseErr) << "read noise (e-)";
+
+            // The fit must be precise enough for these checks to mean something (0.3 % and 0.5 %).
+            EXPECT_LT(gainErr,      0.005 * g);
+            EXPECT_LT(readNoiseErr, 0.010 * RN);
+        }
+    }
 }

@@ -344,7 +344,7 @@ The tool also warns when no exposure has an `output`. `src/utilities/testcases/n
 - **Static scene.** The flux is constant during an exposure: there is no variable or moving source yet ([§7](#7-todo-scene-generators)).
 - **One delay for every pair of exposures.** The time between two exposures is the persistence `dT`. There is no start time or delay per exposure.
 - **No `FLUXSEC` card.** It is not written for the exposures of a sequence; the single-exposure tool writes it.
-- **One file per saved exposure.** There is no multi-extension output of the whole sequence. A `DPU` exposure is written as its three-plane cube; the `SCI`, `CHI2` and `ERR` HDUs are only written by `nispSimulator` for a single exposure.
+- **One file per saved exposure.** There is no multi-extension output of the whole sequence. A `DPU` exposure is written as its three-plane cube; the `SCI`, `CHI2` and `ERR2` HDUs are only written by `nispSimulator` for a single exposure.
 - **No caching.** A flux file used by several exposures is read again for each of them.
 - **Persistence limits** of the NISP model also apply to sequences: see [NISP example §10](NISP-example#10-known-limitations).
 
