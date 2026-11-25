@@ -22,6 +22,7 @@
 #include <string>
 
 #include <phot2pix/phot2pix.h>
+#include <phot2pix/DetectorEffect.h>
 
 /// @namespace nisp
 /// @brief The Euclid NISP HAWAII-2RG detectors, built on the phot2pix core.
@@ -273,7 +274,8 @@ namespace nisp
 
 // ── NISP SCA ──────────────────────────────────────────────────────────────────
 #pragma region - NISP SCA
-    /// @brief NISP detector (sensor chip assembly): its pixels, readout noise, persistence and readout modes.
+    /// @brief NISP detector (sensor chip assembly): its pixels, inter-pixel capacitance, crosstalk, readout
+    ///        noise, persistence and readout modes.
     /// @details Private inheritance: DetectorSimulator::simulate() is not directly reachable by
     ///          callers. The only public simulation entry point is expose(), which handles
     ///          persistence, reads the charge in the readout mode of the SCA and returns uint16 ADU.
@@ -288,11 +290,24 @@ namespace nisp
         bool   m_enable_persistence = false;   ///< Persistence, on when "persistence" is configured
         bool   m_enable_oneOverF = true;       ///< Readout noise, when m_oneOverFNoise has a component
         bool   m_refPixCorr = true;       ///< DPU reference pixel correction ("refPixCorr": true/false or "ON"/"OFF"; on by default)
+
         nisp::mode m_mode = nisp::mode::MACC;   ///< Readout mode ("exposureMode")
         nonlinearity::functor m_nl;       ///< Non-linearity model of every pixel ("nlModel" or setNonLinearity()); empty: linear
 
+
         std::shared_ptr<persistence::scheduler> persistenceModelling;   ///< Past exposures; null without persistence
         nisp::OneOverFNoise m_oneOverFNoise;                            ///< Readout noise of the output channels
+
+        /// @brief Inter-pixel capacitance ("ipc", see PixelConvolution::initialize()).
+        /// @details Applied before the read noise: from detector characterisation it is not possible to
+        ///          decorrelate IPC from the read noise, which is measured with the IPC effect.
+        phot2pix::PixelConvolution m_ipc;
+
+        /// @brief Crosstalk between the output channels ("crosstalk", see _configureCrosstalk()).
+        /// @details Gives the ghosts alone: static kernel, not normalized, null in its centre.
+        phot2pix::PixelConvolution m_crosstalk;
+        size_t                     m_crosstalkColumns = 0;   ///< Crosstalk: columns per output channel of the kernel
+        std::vector<double>        m_crosstalkCouplings;     ///< Crosstalk: coupling at each distance in channels (1 at 0)
 
         /// @brief Physical detector and placement of this matrix on it ("detectorSize",
         ///        "detectorOrigin", "refBorder"), held by the base class.
@@ -305,7 +320,8 @@ namespace nisp
 
         /// @brief Record the NISP inputs as header cards (setInputCard()).
         /// @details Detector geometry (DETSIZE, REFBORD), reference pixels (REFDARK), full well and
-        ///          non-linearity (PIXFW, NLMODEL, PIXNLn), readout noise (CHANWID, OOF*, BIAS*, PED*)
+        ///          non-linearity (PIXFW, NLMODEL, PIXNLn), readout noise (CHANWID, OOF*, BIAS*, PED*),
+        ///          crosstalk (XTALKCOL, XTALKNCH, XTALKn)
         ///          and persistence (PERDT, PERTRn). The pixel model is recorded by the base, see
         ///          DetectorSimulator::getInputCards(). Called at the end of initialize().
         /// @param cfg Configuration.
@@ -423,9 +439,10 @@ namespace nisp
                           size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg = phot2pix::PixelConfig());
 
         /// @brief Read a full-frame charge map in place (ADU).
-        /// @details Every pixel is read (pixel::read(): full well, non-linearity, read noise), then one
-        ///          independent readout-noise realisation is added when enabled (1/f, bias voltage
-        ///          noise, pedestal drift; generated in electrons and divided by each pixel's gain).
+        /// @details The pixels are first coupled (_couplePixels(): IPC, crosstalk). Every pixel is then read
+        ///          (pixel::read(): full well, non-linearity, read noise), and one independent
+        ///          readout-noise realisation is added when enabled (1/f, bias voltage noise, pedestal
+        ///          drift; generated in electrons and divided by each pixel's gain).
         /// @param charge Accumulated charge (ADU), replaced by the read values.
         /// @param tStart Time since the reset at which this frame's read starts (s), used by the
         ///               pedestal drift.
@@ -438,7 +455,8 @@ namespace nisp
         /// @brief Ramp step: cumul += charge (charge only), and a read when layer is not null.
         /// @details The read is written as layer[i] = uint16(pixel_i.read(cumul[i], m_nl) +
         ///          oneOverF[i] / gain_i): the read noise and readout noise go to that layer only,
-        ///          never into cumul. Threaded over getThreadCount().
+        ///          never into cumul. With IPC or crosstalk (_couplePixels()), a coupled copy of cumul is
+        ///          read instead of cumul, which is never coupled itself. Threaded over getThreadCount().
         /// @param charge   Charge of the step (ADU).
         /// @param cumul    Accumulated charge (ADU), updated.
         /// @param layer    Layer the read is written to; null for dropped frames.
@@ -446,6 +464,41 @@ namespace nisp
         ///                 readout noise is disabled.
         void _accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
                          uint16_t* layer, const std::valarray<double>* oneOverF) const;
+
+        /// @brief True if the read of a pixel depends on other pixels (IPC or crosstalk).
+        bool _pixelsAreCoupled() const { return m_ipc.isEnabled() || m_crosstalk.isEnabled(); }
+
+        /// @brief Effects that couple the pixels during a read, in place: applyIPC(), then applyCrosstalk().
+        /// @param signal Accumulated charge (ADU) of the window, replaced by the signal to read.
+        /// @param c0     Matrix column of the first window pixel.
+        /// @param r0     Matrix row of the first window pixel.
+        /// @param ncols  Window columns.
+        /// @param nrows  Window rows.
+        void _couplePixels(std::valarray<double>& signal, size_t c0, size_t r0, size_t ncols, size_t nrows) const;
+
+        /// @brief Read the channel crosstalk from cfg "crosstalk". Nothing changes if the key is absent.
+        /// @verbatim
+        ///   "crosstalk": [k0, k1, ...]
+        ///   "crosstalk": {"kernel": [k0, k1, ...]}   → the same
+        ///   "crosstalk": []                          → no crosstalk
+        /// @endverbatim
+        /// @details kd is the fraction of the signal of a pixel that is added to the pixel read at the same
+        ///          time in a channel at a distance of d channels: same row, d × colPerChannel columns
+        ///          away on each side (every channel is read in the same direction). The values are >= 0,
+        ///          at most one per channel: the missing ones are 0, so [1, 0.5] only couples a channel with
+        ///          its two neighbours. k0, the fraction of its own signal that a channel keeps, is 1 (no
+        ///          loss). The convolution kernel is built here: 0 between the channels.
+        ///          The channels are those of the instrument: top-level "colPerChannel" / "nChannels", see
+        ///          nisp::Geometry.
+        /// @param cfg Configuration.
+        /// @throws std::invalid_argument if the crosstalk is not valid; it is then unchanged.
+        void _configureCrosstalk(const phot2pix::PixelConfig& cfg);
+
+        /// @brief Build the crosstalk kernel from the couplings and the channels of the geometry.
+        /// @param couplings Coupling at each distance in channels, 1 at distance 0.
+        /// @throws std::invalid_argument if they are more than the channels, or if the channels do not cover
+        ///         the detector; the crosstalk is then unchanged.
+        void _setCrosstalk(const std::vector<double>& couplings);
 
         /// @brief Check a non-linearity model against the full well and the parameters of every pixel.
         /// @details Nothing is checked if f is empty (linear).
@@ -498,19 +551,24 @@ namespace nisp
         };
 
         /// @brief Reference pixel correction, Eq. 3 of arXiv:2507.11326 (from Kubik et al. 2014).
-        /// @details For line y in [4, 2044) of output channel ch (64 columns):
+        /// @details For line y in [b, H − b) of output channel ch, with the detector of H lines, its
+        ///          border of b reference pixels and its nCh channels (NISP: 2048, 4, 32 of 64 columns):
         ///            c_y^(ch) = ½ (T^(ch) + B^(ch)) + ½ (L_y + R_y)
         ///
-        ///          T, B: median of the 4 top / bottom reference lines of the channel (without the
-        ///          left / right reference columns); L_y, R_y: median of the 4 left / right reference
-        ///          columns over lines y−4 … y+4.
-        /// @param ramp Cube of reads (any integer or floating point type).
-        /// @param mode Terms (bitmask: TOP, BOTTOM or TOPnBOTTOM, plus LEFT, RIGHT or RIGHTnLEFT;
-        ///             ALL = Eq. 3).
-        /// @return c of every read k of the cube, in its units: c[(y * 32 + ch) * nReads + k], the reads
-        ///         of one line and channel being contiguous. Lines 0-3 and 2044-2047 hold 0 (not
-        ///         corrected). Empty if mode is NONE or the image is smaller than 2048 × 2048.
-        static std::valarray<double> getReferencePixelCorrection(const std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode = refPixCorrection::ALL);
+        ///          T, B: median of the b top / bottom reference lines of the channel (without the
+        ///          left / right reference columns); L_y, R_y: median of the b left / right reference
+        ///          columns over lines y−4 … y+4 (those of the detector).
+        /// @param ramp     Cube of reads (any integer or floating point type), of the full detector.
+        /// @param mode     Terms (bitmask: TOP, BOTTOM or TOPnBOTTOM, plus LEFT, RIGHT or RIGHTnLEFT;
+        ///                 ALL = Eq. 3).
+        /// @param geometry Detector size, reference border and channels. Default: NISP.
+        /// @return c of every read k of the cube, in its units: c[(y * nCh + ch) * nReads + k], the reads
+        ///         of one line and channel being contiguous. The reference lines hold 0 (not
+        ///         corrected). Empty if mode is NONE, or, with a warning, if it does not apply: image that
+        ///         is not the full detector, no reference border, channels that do not cover the detector
+        ///         or have no column outside the border.
+        static std::valarray<double> getReferencePixelCorrection(const std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode = refPixCorrection::ALL,
+                                                                 const nisp::Geometry& geometry = nisp::Geometry());
 
         /// @brief Apply getReferencePixelCorrection() to a cube in place, e.g. to a MACC ramp from expose().
         /// @details Floating point and signed cubes: v − c (Eq. 3), rounded and clamped for
@@ -519,9 +577,11 @@ namespace nisp
         ///          of the first read. Differences between reads, and so slopes, are those of Eq. 3; the
         ///          level stays the raw one (a single-read unsigned image is therefore left unchanged).
         ///          Saturated reads of unsigned cubes (the type's largest value) are left unchanged.
-        /// @param image Cube of reads, corrected in place.
-        /// @param mode  Terms of the correction.
-        static void referencePixelsCorrection(std::shared_ptr<DSL::FITScube>& image, const refPixCorrection& mode = refPixCorrection::ALL);
+        /// @param image    Cube of reads, corrected in place.
+        /// @param mode     Terms of the correction.
+        /// @param geometry Detector size, reference border and channels. Default: NISP.
+        static void referencePixelsCorrection(std::shared_ptr<DSL::FITScube>& image, const refPixCorrection& mode = refPixCorrection::ALL,
+                                              const nisp::Geometry& geometry = nisp::Geometry());
 
         // ── Selectively re-exported base API ─────────────────────────────────
         using phot2pix::DetectorSimulator<nisp::pixel>::getWidth;
@@ -560,8 +620,8 @@ namespace nisp
 
         // ── Configuration ─────────────────────────────────────────────────────
 
-        /// @brief Configure the detector: geometry, pixels, readout, persistence, readout noise,
-        ///        reference pixels, full well and non-linearity.
+        /// @brief Configure the detector: geometry and output channels, pixels, readout, persistence, readout
+        ///        noise, reference pixels, full well and non-linearity, inter-pixel capacitance, crosstalk.
         /// @details The keys are described in the wiki (NISP example, configuration reference). With
         ///          "persistence", cfg must outlive the SCA: the scheduler keeps a reference to it.
         /// @param cfg Configuration; absent keys leave the current value unchanged.
@@ -586,9 +646,56 @@ namespace nisp
             setInputCard({"NLMODEL", std::string(f ? "custom" : "linear"), "Non-linearity model"});
         }
 
+        // ── Inter-pixel capacitance ───────────────────────────────────────────
+
+        /// @brief True if an IPC kernel is configured ("ipc").
+        bool isIPCEnabled() const { return m_ipc.isEnabled(); }
+        /// @brief True if the IPC kernel depends on the pixel (FITS cube).
+        bool isIPCDynamic() const { return m_ipc.isDynamic(); }
+        /// @brief Static IPC kernel (columns, rows), normalized to 1; 1 × 1 without static kernel.
+        const phot2pix::PixelConvolution::kernel& getIPCKernel() const { return m_ipc.getKernel(); }
+        /// @brief Dynamic IPC kernel, W × H × (n + 1) float cube normalized pixel by pixel; null without dynamic kernel.
+        std::shared_ptr<const DSL::FITScube> getIPCKernelCube() const { return m_ipc.getKernelCube(); }
+
+        /// @brief Apply the IPC to a window of the matrix, in place. Nothing is done without IPC.
+        /// @param image Window, ncols × nrows pixels, row-major.
+        /// @param c0    Matrix column of the first window pixel.
+        /// @param r0    Matrix row of the first window pixel.
+        /// @param ncols Window columns.
+        /// @param nrows Window rows.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if image
+        ///         is smaller than the window.
+        void applyIPC(std::valarray<double>& image, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+        {
+            m_ipc.apply(image, c0, r0, ncols, nrows, getThreadCount());
+        }
+
+        // ── Channel crosstalk ─────────────────────────────────────────────────
+
+        /// @brief True if a crosstalk between the output channels is configured ("crosstalk").
+        bool isCrosstalkEnabled() const { return m_crosstalk.isEnabled(); }
+        /// @brief Crosstalk kernel: one row, the coupling of the channels at their distance in columns, 0
+        ///        elsewhere; 1 × 1 without crosstalk.
+        const phot2pix::PixelConvolution::kernel& getCrosstalkKernel() const { return m_crosstalk.getKernel(); }
+
+        /// @brief Add the crosstalk ghosts to a window of the matrix, in place. Nothing is done without crosstalk.
+        /// @details The ghosts are those of the signal above the baseline that the source pixel outputs,
+        ///          limited by its full well and its non-linearity (as in pixel::read()). The source itself
+        ///          is unchanged. A window has no ghost of the pixels outside of it.
+        /// @param signal Window (ADU), ncols × nrows pixels, row-major.
+        /// @param c0     Matrix column of the first window pixel.
+        /// @param r0     Matrix row of the first window pixel.
+        /// @param ncols  Window columns.
+        /// @param nrows  Window rows.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if signal
+        ///         is smaller than the window.
+        void applyCrosstalk(std::valarray<double>& signal, size_t c0, size_t r0, size_t ncols, size_t nrows) const;
+
         // ── Exposure ─────────────────────────────────────────────────────────
 
         /// @brief Windowed exposure: a single read of a sub-region, whatever the readout mode.
+        /// @details The inter-pixel capacitance and the crosstalk are those of the pixels of the window: what
+        ///          is outside of it gives nothing.
         /// @param fullFlux     Photons/s of every pixel of the matrix, row-major: the whole of it is
         ///                     stored for the persistence of the next exposures.
         /// @param exposureTime Exposure time (s), not rounded to whole frames.

@@ -25,11 +25,13 @@
 | `../phot2pix/Geometry.h` | `phot2pix::Geometry`: the physical detector, the placement of the simulated matrix on it, and the mapping of detector-sized images onto the matrix |
 | `../phot2pix/PixelSimulator.h/.cxx` | `phot2pix::pixsim`: the three stages of a pixel (reset, integration, read) |
 | `../phot2pix/DetectorSimulator.h` | `phot2pix::DetectorSimulator<PixelT>`: the pixel array, its geometry, per-pixel FITS maps, threaded simulation, and the input header cards |
+| `../phot2pix/DetectorEffect.h/.cxx` | `phot2pix::PixelConvolution`: the convolution of an image by a kernel, the same for every pixel or one per pixel. Used for the inter-pixel capacitance and for the crosstalk between channels. This convolution isn't applyed onto `phot2pix.h` and kernel and when to apply this convolution need to be defined in derived model. In this example, `nisp::SCA` apply IPC (Inter Pixel Capacitance) and crosstalk convolution during the readout. |
+| `../phot2pix/DetectorTools.h` | `phot2pix::parallelFor()` and `withCubeData()`: threaded loop and typed access to a FITS cube, shared by the detectors and their effects |
 | `../phot2pix/ScenerySequencer.h/.cxx` | `phot2pix::ScenerySequencer`: a sequence of exposures on one detector ([Sequences of exposures](ScenerySequencer)) |
 | `nispPixel.h/.cxx` | `nisp::pixel`: the H2RG pixel, with its full well and non-linear response. `nisp::nonlinearity`: the models of that response. `nisp::Ramp`: the DPU slope estimator (group co-adding, Kubik slope, Fowler, CDS) |
-| `nispSCA.h/.cxx` | `nisp::SCA`: the detector, its readout modes, the reference pixel correction and its output header. `nisp::macc`: MACC parameters. `nisp::readout`: the parameters of one exposure. `nisp::persistence`: the persistence model (`model`, `pixelArray`, `scheduler`) |
+| `nispSCA.h/.cxx` | `nisp::SCA`: the detector, its readout modes, the inter-pixel capacitance and crosstalk of each read, the reference pixel correction and its output header. `nisp::macc`: MACC parameters. `nisp::readout`: the parameters of one exposure. `nisp::persistence`: the persistence model (`model`, `pixelArray`, `scheduler`) |
 | `nispScenerySequencer.h/.cxx` | `nisp::ScenerySequencer`: a sequence of NISP exposures, each with its own MACC parameters or exposure time and readout mode ([details](ScenerySequencer#3-the-nisp-override)) |
-| `nispGeometry.h` | `nisp::Geometry`: the H2RG layout (2048 × 2048, reference border), derived from `phot2pix::Geometry` |
+| `nispGeometry.h` | `nisp::Geometry`: the H2RG layout (2048 × 2048, reference border, output channels), derived from `phot2pix::Geometry` |
 | `nispOneOverFNoise.h/.cxx` | `nisp::OneOverFNoise`: readout noise of the output channels (1/f noise per channel, bias voltage noise common to all channels, pedestal drift) and its continuous `Stream` over a ramp |
 | `../utilities/nispSimulator.cxx` | Command-line tool driven by a JSON file |
 | `../utilities/*.json` | A default configuration with averaged NISP values, and one test configuration per readout mode |
@@ -40,7 +42,7 @@
 classDiagram
     pixsim <|-- pixel : nisp
     pixsim <|-- model : persistence, private
-    Geometry <|-- NispGeometry : nisp, reference border
+    Geometry <|-- NispGeometry : nisp, reference border, channels
     DetectorSimulator~pixel~ <|-- SCA : private
     DetectorSimulator~model~ <|-- pixelArray
     DetectorSimulator o-- Geometry : placement, maps
@@ -50,6 +52,7 @@ classDiagram
     SCA o-- OneOverFNoise : readout noise
     OneOverFNoise o-- NispGeometry : copy
     OneOverFNoise ..> Stream : beginStream()
+    SCA o-- PixelConvolution : IPC, crosstalk
     SCA o-- functor : non-linearity model
     pixel ..> functor : read(charge, nl)
     SCA o-- scheduler : persistence
@@ -63,7 +66,7 @@ How the layers map onto the [philosophy](Philosophy):
 
 - **Pixel:** `nisp::pixel` uses the reset and integration stages of `pixsim` unchanged, and adds the full well and the non-linear response to the read: `read(charge, nl)`. Other NISP-specific pixel physics would go there too, by overriding a stage.
 - **Detector:** `nisp::SCA` inherits `DetectorSimulator<nisp::pixel>` **privately** and gives it a `nisp::Geometry`. Its simulation engines produce **charge only** (`resetLevel() + integrate()`), never a complete read. The geometry, the per-pixel maps and the cards that describe them come from the base class.
-- **Instrument:** `nisp::SCA` marks the reference pixels, sequences the reads of each readout mode, adds the read noise (through `pixel::read()`) and the readout noise of the output channels at each read, runs the DPU processing (reference pixel correction, then slope) and writes the output header. Its only public simulation entry point is `expose()`; the reference pixel correction is also public, as two static functions ([§5](#reference-pixel-correction-of-a-ramp)).
+- **Instrument:** `nisp::SCA` marks the reference pixels, sequences the reads of each readout mode, applies the inter-pixel capacitance and the crosstalk between channels, adds the read noise (through `pixel::read()`) and the readout noise of the output channels at each read, runs the DPU processing (reference pixel correction, then slope) and writes the output header. Its only public simulation entry point is `expose()`. The reference pixel correction is also public, as two static functions ([§5](#reference-pixel-correction-of-a-ramp)), and so are the inter-pixel capacitance and the crosstalk of an image ([§5](#inter-pixel-capacitance-and-crosstalk-of-an-image)).
 
 ### 2.3 The pipeline
 
@@ -73,15 +76,16 @@ flowchart TD
 
     subgraph INIT ["SCA::initialize(cfg)"]
         direction TB
-        I1["① geometry, in DetectorSimulator::initialize<br/>detectorSize, detectorOrigin, refBorder<br/>place the W × H matrix on the detector (throws if it does not fit)"]
+        I1["① geometry, in DetectorSimulator::initialize<br/>detectorSize, detectorOrigin, refBorder, colPerChannel, nChannels<br/>place the W × H matrix on the detector (throws if it does not fit)"]
         I2["② pixel model, in DetectorSimulator::initialize<br/>gain, dark, readNoise, QE, KTCnoise, baseline<br/>numbers, or FITS maps of matrix or detector size → PIX* cards"]
         I3["③ readout and DPU settings<br/>exposureMode, frame_time, offset, scale, dpu_gain, dpu_noise"]
         I4["④ persistence scheduler<br/>persistence traps"]
         I5["⑤ readout noise, OneOverFNoise<br/>oneOverF, bias_voltage_noise, pedestal_drift<br/>channel layout checked against the detector"]
         I6["⑥ reference pixels<br/>QE = 0, refDark"]
         I7["⑦ full well and non-linearity<br/>fullWell, nlModel, nl0, nl1, nl2: numbers or FITS maps<br/>model checked to increase up to the full well of every pixel"]
-        I8["⑧ input cards<br/>DETSIZE, REFBORD, REFDARK, full well, non-linearity, readout noise, persistence"]
-        I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7 --> I8
+        I8["⑧ coupling of the pixels, PixelConvolution<br/>ipc: kernel, or FITS cube of kernels<br/>crosstalk: couplings between the channels of the geometry"]
+        I9["⑨ input cards<br/>DETSIZE, REFBORD, REFDARK, full well, non-linearity, crosstalk, readout noise, persistence"]
+        I1 --> I2 --> I3 --> I4 --> I5 --> I6 --> I7 --> I8 --> I9
     end
 
     CFG --> INIT
@@ -89,7 +93,7 @@ flowchart TD
     INIT --> EXP["SCA::expose(flux, macc) or expose(flux, T)"]
 
     EXP --> MODE{"exposureMode"}
-    MODE -->|"MACC, UTR"| RAMP["ramp: one charge step per frame,<br/>reads kept per group<br/>read noise + readout noise per read"]
+    MODE -->|"MACC, UTR"| RAMP["ramp: one charge step per frame,<br/>reads kept per group<br/>IPC, crosstalk, read noise, readout noise per read"]
     MODE -->|"DPU"| RAMP2["ramp, reference pixel correction,<br/>then Kubik slope per pixel"]
     MODE -->|"CDS"| CDS["read N − read 1"]
     MODE -->|"FLUX"| ONE["single read"]
@@ -102,7 +106,7 @@ flowchart TD
 ```
 
 1. **Configuration.** Every parameter lives in one `PixelConfig`, normally read from a JSON file ([§4](#4-configuration-reference)). The library reads all the detector keys; `nispSimulator` reads only the matrix size, the flux and the readout pattern.
-2. **Initialisation** (`SCA::initialize`, in the order of the diagram). The base class configures the geometry first, so that the FITS maps are cropped at the right place, then applies the pixel model. The SCA then reads its own settings, creates the persistence scheduler, configures the readout noise (and fails if the channel layout does not fit the detector), sets the reference pixels, then the full well and the non-linearity, and records every input as a header card.
+2. **Initialisation** (`SCA::initialize`, in the order of the diagram). The base class configures the geometry first, so that the FITS maps are cropped at the right place, then applies the pixel model. The SCA then reads its own settings, creates the persistence scheduler, configures the readout noise (and fails if the channel layout does not fit the detector), sets the reference pixels, then the full well and the non-linearity, then the inter-pixel capacitance and the crosstalk, and records the inputs as header cards.
 3. **Exposure** (`SCA::expose`). The charge of every pixel is simulated step by step and read according to `exposureMode` ([§3.3](#33-the-algorithm), [§5](#5-readout-modes)).
 4. **Output.** A `uint16` image or cube, whose header holds the readout description and every input of the model ([§6](#6-output-header)).
 
@@ -194,8 +198,9 @@ The last relation is the CDS: the reset level *R* and its kTC noise cancel. Thes
 
 ### 3.2 The full array
 
-Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}, Q_{\mathrm{FW},i}, c_{2,i}, c_{3,i}`$. Pixels remain independent, except through two terms that the SCA adds on top of the pixel model:
+Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}, Q_{\mathrm{FW},i}, c_{2,i}, c_{3,i}`$. Pixels remain independent, except through the terms that the SCA adds on top of the pixel model:
 
+- the **inter-pixel capacitance** (IPC) and the **crosstalk** between output channels, which couple the pixels at each read and leave the charge unchanged;
 - the **readout noise** $`\mathcal{R}`$, in electrons, added at each read: the 1/f noise of each output channel, the bias voltage noise shared by all channels and the pedestal drift of each channel;
 - the **persistence** *P*, which depends on the previous exposures and is added to the charge.
 
@@ -227,6 +232,30 @@ Q_i[m] = R_i + \sum_{m'=1}^{m} \Big( I_i(\Delta t_{m'}) + P_i[m'] \Big)
 
 $`R_i`$ is drawn at the first step only; the later steps are run with `baseline = "off"`.
 
+#### Inter-pixel capacitance and crosstalk
+
+Both act on the signal at each read, in every readout mode, and never on the charge *Q* that the pixels hold. They are off by default.
+
+The **inter-pixel capacitance** shares the signal of a pixel with its neighbours. $`K_j(\delta)`$ is the fraction of the signal of pixel *j* that appears at the position j + δ, with $`\sum_\delta K_j(\delta) = 1`$. The kernel is either the same for every pixel or one per pixel:
+
+```math
+V_i = \sum_\delta K_{i-\delta}(\delta)\; Q_{i-\delta}
+```
+
+Each neighbour gives its signal with **its own** kernel. A pixel at the border of the image misses neighbours: its sum is divided by the sum of the weights it has, so that the level of a uniform baseline is kept.
+
+The **crosstalk** adds, to the pixels read at the same time in the other channels, a fraction $`\kappa_d`$ of the signal above the baseline that a pixel outputs. These pixels are on the same row, a multiple of the channel width *w* away, since every channel is read in the same direction. *d* is the distance between the channels:
+
+```math
+\tilde Q_i = V_i + \sum_{d \ge 1} \kappa_d\,\big(s_{i - d\,w} + s_{i + d\,w}\big),
+\qquad
+s_j = \frac{P_j\big(\min(g_j\,(V_j - B_j),\ Q_{\mathrm{FW},j})\big)}{g_j}
+```
+
+The source keeps its own signal (no loss), and a saturated pixel cannot give more than its full well. $`P_j`$ is the non-linear response of §3.1, not the persistence. Positions outside the image give nothing.
+
+The read is then that of the coupled signal: **everywhere below, $`M_i(Q_i)`$ stands for $`M_i(\tilde Q_i)`$.**
+
 #### MACC and UTR: one layer of the output cube
 
 ```math
@@ -237,7 +266,7 @@ where $`M_i`$ is the read of §3.1 (full well, non-linearity, read noise) and $`
 
 #### Physical detector and placement of the matrix
 
-The readout noise and the reference pixels are defined on the **physical detector** (`nisp::Geometry`), not on the simulated matrix: $`W_d \times H_d`$ = 2048 × 2048 pixels (`detectorSize`), a border of b = 4 reference pixels (`refBorder`), and channels of w = 64 columns (`colPerChannel`), channel *c* covering the physical columns [c·w, (c+1)·w). The W × H matrix is a part of that detector, placed at (x₀, y₀) (`detectorOrigin`, [0, 0] by default: the first matrix pixel is the first detector pixel):
+The readout noise, the crosstalk and the reference pixels are defined on the **physical detector** (`nisp::Geometry`), not on the simulated matrix: $`W_d \times H_d`$ = 2048 × 2048 pixels (`detectorSize`), a border of b = 4 reference pixels (`refBorder`), and $`W_d / w`$ = 32 channels (`nChannels`) of w = 64 columns (`colPerChannel`), channel *c* covering the physical columns [c·w, (c+1)·w). The W × H matrix is a part of that detector, placed at (x₀, y₀) (`detectorOrigin`, [0, 0] by default: the first matrix pixel is the first detector pixel):
 
 ```math
 X_i = x_0 + x, \qquad Y_i = y_0 + y
@@ -346,7 +375,9 @@ $`M_i`$ is the read of §3.1 with the parameters of pixel *i*. Each call draws a
 
 #### Reference pixel correction
 
-It works on a full 2048 × 2048 matrix (the whole detector), one read at a time. Write $`Y[\ell](x, y)`$ for read ℓ at column *x* and line *y*. For output channel ch, which covers the columns [64·ch, 64·ch + 64), and for a line y ∈ [4, 2044), the correction is Eq. 3 of Euclid Collaboration (arXiv:2507.11326), from Kubik et al. (2014):
+It works on the full detector, one read at a time. The numbers below are those of NISP: 2048 × 2048 pixels, a border of 4 reference pixels, 32 channels of 64 columns. With other values of `detectorSize`, `refBorder` and `colPerChannel`, the same formula is used with them; only the sliding window of ± 4 lines is fixed (it stops at the edge of the detector).
+
+Write $`Y[\ell](x, y)`$ for read ℓ at column *x* and line *y*. For output channel ch, which covers the columns [64·ch, 64·ch + 64), and for a line y ∈ [4, 2044), the correction is Eq. 3 of Euclid Collaboration (arXiv:2507.11326), from Kubik et al. (2014):
 
 ```math
 c_y^{(\mathrm{ch})}[\ell] = \tfrac12\big(T^{(\mathrm{ch})}[\ell] + B^{(\mathrm{ch})}[\ell]\big) + \tfrac12\big(L_y[\ell] + R_y[\ell]\big)
@@ -377,7 +408,7 @@ The DPU starts from the MACC layers $`Y_i[\ell]`$. Let $`n_{\mathrm{good}}`$ be 
 Y'_i[\ell] = Y_i[\ell] - c_{y(i)}^{(\mathrm{ch}(i))}[\ell]
 ```
 
-On a matrix smaller than 2048 × 2048, $`Y'_i = Y_i`$. Then
+On a matrix that is not the full detector, $`Y'_i = Y_i`$. Then
 
 ```math
 G_g = \frac{1}{n_r} \sum_{r=0}^{n_r-1} Y'_i[g\,n_r + r],
@@ -451,7 +482,7 @@ flowchart TD
 
 #### Full array: one exposure
 
-`nisp::SCA::expose()` dispatches on `exposureMode`. In the ramp loop, each step runs three tasks concurrently and then makes one threaded pass over memory.
+`nisp::SCA::expose()` dispatches on `exposureMode`. In the ramp loop, each step runs three tasks concurrently and then makes one threaded pass over memory (with IPC or crosstalk, a second one for the reads).
 
 ```mermaid
 flowchart TD
@@ -472,7 +503,7 @@ flowchart TD
             A3["persistence scheduler<br/>$$P_i[m]$$ over the past exposures $$j$$<br/>other half of the threads"]
         end
         SUM["$$\mathrm{frame}_i = \mathrm{charge}_i + P_i[m]$$"]
-        ACC["_accumulate, threaded<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$<br/>$$Y_i[\ell] = \mathcal{Q}\big(M_i(\mathrm{cumul}_i) + \mathcal{R}_i/g_i\big)$$"]
+        ACC["_accumulate, threaded<br/>$$\mathrm{cumul}_i \leftarrow \mathrm{cumul}_i + \mathrm{frame}_i$$<br/>IPC and crosstalk, if any, on a copy of cumul<br/>$$Y_i[\ell] = \mathcal{Q}\big(M_i(\mathrm{cumul}_i) + \mathcal{R}_i/g_i\big)$$"]
         PAR --> SUM --> ACC
     end
 
@@ -492,8 +523,8 @@ flowchart TD
 
 Two invariants hold throughout the loop:
 
-- `cumul` contains **charge only**: R_i, the integrated signal and dark, and the persistence. The read noise and the readout noise are added to the layer that is written and never fed back, so read noise does not accumulate along the ramp.
-- Pixels are independent within a step, so the charge pass needs no synchronisation. The only coupling between pixels is the readout-noise stream, generated per channel (plus the bias voltage series shared by all channels). The only coupling in time, apart from `cumul`, is the persistence history.
+- `cumul` contains **charge only**: R_i, the integrated signal and dark, and the persistence. The IPC, the crosstalk, the read noise and the readout noise go to the layer that is written and are never fed back: the read noise does not accumulate along the ramp, and each read applies the IPC and the crosstalk once, to the whole accumulated signal.
+- Pixels are independent within a step, so the charge pass needs no synchronisation. With IPC or crosstalk, a read needs the charge of other pixels: all the pixels are accumulated first, then read in a second pass. The other coupling between pixels is the readout-noise stream, generated per channel (plus the bias voltage series shared by all channels). The only coupling in time, apart from `cumul`, is the persistence history.
 
 ---
 
@@ -504,7 +535,7 @@ Two invariants hold throughout the loop:
 - One JSON object, read into a `PixelConfig`. Keys are case-sensitive; numbers can be written as integers or reals.
 - **Units:** charges and noises in **electrons** (e⁻), levels and offsets in **ADU**, times in **seconds**, flux in **photons s⁻¹ pixel⁻¹** (before QE), sizes and positions in **pixels**. Every noise given in electrons is converted to ADU with the gain of the pixel it is added to.
 - A FITS image given as input (a per-pixel map, the flux) is either the size of the matrix, used as is, or the size of the detector, cropped at `detectorOrigin`.
-- A key that is absent keeps its default. The objects of `bias_voltage_noise` and `pedestal_drift` reject unknown keys, so a typo throws instead of being ignored.
+- A key that is absent keeps its default. The objects of `bias_voltage_noise`, `pedestal_drift`, `crosstalk` and `ipc` (kernel form) reject unknown keys, so a typo throws instead of being ignored.
 - Every input is copied into the output header ([§6](#6-output-header)).
 
 ### 4.2 Matrix, flux and readout pattern (`nispSimulator`)
@@ -525,6 +556,8 @@ These keys are read by the tool, not by the library; a program using `nisp::SCA`
 |---|---|---|---|
 | `detectorSize` | `[pix, pix]` | `[2048, 2048]` | Width and height of the physical detector. Defines the reference border, the output channels (its width must be a multiple of `colPerChannel`), the frame length of the readout noise and the size of a detector-sized map. Change it only for a detector other than the H2RG |
 | `detectorOrigin` | `[pix, pix]` | `[0, 0]` | Physical column and row (0-based) of matrix pixel (0, 0). At the default, a small matrix starts in the corner of the detector and keeps its 4 reference columns on the left and 4 reference rows at the bottom. `[4, 4]` with 2040 × 2040 is the active area; ((2048 − W)/2, (2048 − H)/2) centres any matrix. The matrix must fit on the detector, otherwise `initialize()` throws |
+| `colPerChannel` | pix | 64 | Columns read by one output channel. It fixes the channel boundaries and the readout order, and is used by the readout noise (frame length L = H_d · `colPerChannel` samples), the crosstalk, the reference pixel correction and the DPU. Must divide the detector width |
+| `nChannels` | — | 32 | Number of output channels. `colPerChannel` × `nChannels` is the detector width, so one of the two keys is enough; `initialize()` throws if both are given and do not match. These two keys are the only ones that set the channels: they are refused inside `oneOverF` and `crosstalk` |
 | `refBorder` | pix | 4 | Reference pixels on each side of the physical detector; 0 disables them. Every matrix pixel whose physical position is within the border gets QE = 0 |
 | `refDark` | e⁻ s⁻¹ | value of `dark` | Dark current of the reference pixels. They have no photodiode, so their residual signal comes from the readout circuit; measure it on the border of dark ramps |
 
@@ -560,16 +593,16 @@ Each key is either a number, applied to every pixel, or a per-pixel FITS map, ma
 | `scale` (or `dpu_scale`) | — | 1 | Multiplies the value before the conversion. For DPU, NISP uses SFACTOR = ng − 1, so DN − OFFSET is the signal integrated over `INTTIME` |
 | `dpu_gain` | e⁻ ADU⁻¹ | mean pixel `gain` | Gain the DPU slope estimator assumes (header `GAIN`). Set it to simulate a DPU calibrated differently from the detector |
 | `dpu_noise` | e⁻ | mean pixel `readNoise` | Read noise per read the estimator assumes (header `RN`). It does not include the readout noise: when the readout noise is large, set it to the total noise of one read |
-| `refPixCorr` | — | `ON` | Reference pixel correction of the DPU (Eq. 3, mode `ALL`, [§3.2](#reference-pixel-correction)): `true`/`false`, or `"ON"`/`"OFF"` (any case). Applied only on a full 2048 × 2048 matrix (header `REFCORR`) |
+| `refPixCorr` | — | `ON` | Reference pixel correction of the DPU (Eq. 3, mode `ALL`, [§3.2](#reference-pixel-correction)): `true`/`false`, or `"ON"`/`"OFF"` (any case). Applied only when the matrix is the full detector (header `REFCORR`) |
 
 ### 4.7 Readout noise
 
-The three components are added at each read, to the reference pixels as to the active ones, and converted to ADU with the pixel gain. They are defined on the physical channels ([§3.2](#physical-detector-and-placement-of-the-matrix)), so they do not depend on the size of the matrix. All are off by default.
+The three components are added at each read, to the reference pixels as to the active ones, and converted to ADU with the pixel gain. They are defined on the physical channels ([§3.2](#physical-detector-and-placement-of-the-matrix)), set by `colPerChannel` or `nChannels` ([§4.3](#43-physical-detector-and-reference-pixels)), so they do not depend on the size of the matrix. All are off by default.
 
 #### `oneOverF`: 1/f noise of each output channel
 
 ```json
-"oneOverF": { "amplitude": 15.0, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 }
+"oneOverF": { "amplitude": 15.0, "slope": 1.0, "nPoles": 16 }
 ```
 
 The 1/f (flicker) noise of the preamplifier of each channel. The channels are independent. A number, `"oneOverF": 15.0`, sets the amplitude only.
@@ -578,8 +611,6 @@ The 1/f (flicker) noise of the preamplifier of each channel. The channels are in
 |---|---|---|---|
 | `amplitude` | e⁻ RMS | 0 (off) | Total RMS of the channel noise in one read, over the whole band: what one pixel sees, in electrons. Over a ramp, the noise is continuous in time |
 | `slope` | — | 1 | Spectral index *a*, PSD ∝ 1/ν^a. It decides how the variance is spread between pixel-scale noise and slow drifts (table below). 1 is pink noise |
-| `nChannels` | — | 0 | Number of output channels. 0 derives it, `detectorSize` width / `colPerChannel` (32); any other value must equal it. A consistency check, it does not change the layout |
-| `colPerChannel` | pix | 64 | Columns read by one output amplifier. Must divide the detector width. It fixes the channel boundaries and the readout order for **all three** components, and the frame length L = H_d · `colPerChannel` samples |
 | `nPoles` | — | 16 | Number of AR(1) processes that approximate the spectrum over its 5.1 decades. It does not change the total variance; fewer poles give a lumpier spectrum, 1 pole a single Lorentzian whatever the slope. About 3 per decade is enough: 16. The cost grows linearly with it (one random draw per pole and per pixel) |
 
 The spectrum spans the pixel-clock frequencies from ν_min = 1/(2L) to 0.5 cycles per sample. With the NISP timing, each scale of the image corresponds to a frequency:
@@ -660,7 +691,52 @@ Charge trapped during an exposure and released during the following ones. After 
 
 Keep the `PixelConfig` object alive as long as the `SCA` when it contains `persistence`: the persistence scheduler keeps a reference to it.
 
-### 4.9 A complete example
+### 4.9 Inter-pixel capacitance and crosstalk
+
+Both couple the pixels at each read ([§3.2](#inter-pixel-capacitance-and-crosstalk)) and are off by default. The values below are examples, not NISP measurements.
+
+#### `ipc`: inter-pixel capacitance
+
+```json
+"ipc": [0.0, 0.01, 0.0,  0.01, 0.96, 0.01,  0.0, 0.01, 0.0]
+"ipc": {"kernel": [0.01, 0.97, 0.02], "width": 3, "height": 1}
+"ipc": "ipc.fits"
+"ipc": {"file": "ipc.fits", "hdu": "IPC"}
+"ipc": []
+```
+
+| Form | Kernel |
+|---|---|
+| Array | The same for every pixel, square: n × n weights |
+| `kernel`, `width`, `height` | The same for every pixel, `width` columns × `height` rows |
+| FITS cube (path, or `file` and `hdu`, or `"ipc"` + `"ipc.hdu"`) | One kernel per pixel |
+| Empty array | No IPC |
+
+- **Weights:** row by row, columns first, starting with the row below the pixel (y − 1). A kernel is the response to a signal in its central pixel: the first weight goes to the neighbour (x − 1, y − 1), the last one to (x + 1, y + 1). It has odd numbers of columns and rows.
+- **Normalization:** the weights are divided by their sum, so a kernel can be given in any unit. A kernel given in the configuration must have weights ≥ 0.
+- **FITS cube:** one layer per weight, in the same order, for a square kernel: 9 layers for 3 × 3, 25 for 5 × 5. The middle layer is the fraction that the pixel keeps. The cube is matrix-sized or detector-sized (cropped at `detectorOrigin`) and is normalized pixel by pixel. The layers of a pixel should not sum to more than 1: measurement errors can make them do so, and a warning then gives the number of pixels concerned. A pixel whose sum is not finite and positive is an error.
+- **Memory:** the cube is kept in single precision, 189 MB for 2048 × 2048 pixels and 9 layers (values and FITS mask).
+
+#### `crosstalk`: crosstalk between the output channels
+
+```json
+"crosstalk": [1, 1e-3, 5e-4]
+"crosstalk": {"kernel": [1, 1e-3, 5e-4]}
+"crosstalk": []
+```
+
+The index of a value is a **distance between channels**. A signal above the baseline in one channel adds a ghost to the pixels read at the same time in the others: here, 10⁻³ of it in the two neighbouring channels and 5 × 10⁻⁴ in the next two. With channels of 64 columns, the ghosts of column *x* are in columns x ± 64 and x ± 128 of the same row.
+
+| Value | Meaning |
+|---|---|
+| First (distance 0) | 1: the source keeps its signal, the ghosts are added (no loss). Any other value throws |
+| Next ones | Fraction of the signal added at that distance, on both sides; ≥ 0 |
+
+- From 1 to `nChannels` values. The distances that are not given have no ghost, so `[1]` is no crosstalk.
+- The channels are those of the instrument (`colPerChannel`, `nChannels`, [§4.3](#43-physical-detector-and-reference-pixels)). If they change without a new `crosstalk` key, the couplings are kept and applied to the new channels.
+- There is no FITS form: the couplings are the same for every pixel.
+
+### 4.10 A complete example
 
 The NISP averages of `src/utilities/nispSimulator_default.json` (Euclid Collaboration 2025, arXiv:2507.11326), with the readout noise set to visible levels:
 
@@ -679,9 +755,9 @@ The NISP averages of `src/utilities/nispSimulator_default.json` (Euclid Collabor
     "gain": 1.92, "dark": 0.01, "readNoise": 13.0,
     "QE": 0.94, "KTCnoise": 48.0, "baseline": 10000.0,
     "fullWell": 130000.0, "nlModel": "polynomial", "nl0": -6.25e-7, "nl1": 0.0,
-    "refBorder": 4,
+    "refBorder": 4, "colPerChannel": 64,
 
-    "oneOverF":           { "amplitude": 15.0, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "oneOverF":           { "amplitude": 15.0, "slope": 1.0, "nPoles": 16 },
     "bias_voltage_noise": { "amplitude": 10.0, "slope": 1.0, "nPoles": 16 },
     "pedestal_drift":     { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [0.0, 0.05] } }
 }
@@ -731,11 +807,12 @@ read  : R  R ··· R  │  · · · · │ R  R ··· R   │  · · · · │
 1. One array `cumul` holds the **charge** of every pixel, in ADU.
 2. For each frame that is read:
    - `cumul += resetLevel() + integrate()` on the first frame, `cumul += integrate()` afterwards;
-   - then the layer is written as `uint16( pixel.read(cumul, nl) + readout noise / gain )`, the read applying the full well, the non-linearity and the read noise. `cumul` itself stays linear.
+   - with IPC or crosstalk, they are applied to a copy of `cumul`, which is then the one that is read;
+   - then the layer is written as `uint16( pixel.read(cumul, nl) + readout noise / gain )`, the read applying the full well, the non-linearity and the read noise. `cumul` itself stays linear and uncoupled.
 3. For dropped frames: `cumul += integrate()` over nd frames; nothing is read or stored, but the readout-noise stream advances by nd frames.
 4. Read noise and readout noise are added to the layer **only**, never to `cumul`. Every read has RN², and two consecutive reads differ by 2·RN², as on the real detector.
 
-The output cube is allocated once at its final size. Each ramp step (accumulate, read, convert) is a single threaded pass over memory.
+The output cube is allocated once at its final size. Each ramp step (accumulate, read, convert) is a single threaded pass over memory, or two with IPC or crosstalk, plus the convolutions.
 
 ### CDS
 
@@ -755,7 +832,7 @@ A single read after the whole exposure: reset level + integration over *t* + one
 
 ### DPU: the onboard slope
 
-The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::getReferencePixelCorrection(ramp)` then computes the reference pixel correction $`c_y^{(\mathrm{ch})}`$ of every read, with mode `ALL` ([§3.2](#reference-pixel-correction)). On a matrix smaller than 2048 × 2048 there is no correction, and a warning is printed. The header keyword `REFCORR` records whether the correction was applied. Then, for each pixel (threaded, with no allocation per pixel):
+The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::getReferencePixelCorrection(ramp)` then computes the reference pixel correction $`c_y^{(\mathrm{ch})}`$ of every read, with mode `ALL` ([§3.2](#reference-pixel-correction)). It uses the size, the border and the channels of the geometry. When the matrix is not the full detector there is no correction, and a warning is printed. The header keyword `REFCORR` records whether the correction was applied. Then, for each pixel (threaded, with no allocation per pixel):
 
 1. **Saturation:** the reads are copied group by group, up to the first group that contains a saturated read (65535). Only the groups before it are used. With fewer than 2 good groups, the pixel is set to 65535. As on the flight DPU, 65535 is the only test: a pixel whose full well is reached below the ADC limit is not flagged, and its plateau is fitted as signal.
 2. **Reference pixel correction** (when on): while the reads are copied, the pixel's correction is subtracted in double. The `uint16` ramp itself is never modified, so nothing wraps around below 0, and the saturation test sees the raw reads.
@@ -807,8 +884,10 @@ double c_yk = c[(y * 32 + ch) * nReads + k];                // line y, channel c
 
 | Function | Result |
 |---|---|
-| `getReferencePixelCorrection(ramp, mode)` | $`c_y^{(\mathrm{ch})}`$ of every read *k*, in the units of the cube, at `c[(y * 32 + ch) * nReads + k]` (the reads of one line and channel are contiguous). Lines 0–3 and 2044–2047 hold 0. Empty when `mode` is `NONE` or the image is smaller than 2048 × 2048 |
-| `referencePixelsCorrection(ramp, mode)` | Subtracts that correction from the cube, in place |
+| `getReferencePixelCorrection(ramp, mode, geometry)` | $`c_y^{(\mathrm{ch})}`$ of every read *k*, in the units of the cube, at `c[(y * nCh + ch) * nReads + k]`, nCh being the number of channels (the reads of one line and channel are contiguous). The top and bottom reference lines hold 0. Empty when `mode` is `NONE`, or, with a warning, when the correction does not apply: the image is not the full detector, there is no reference border, or the channels do not cover the detector or have no column outside the border |
+| `referencePixelsCorrection(ramp, mode, geometry)` | Subtracts that correction from the cube, in place |
+
+`geometry` is a `nisp::Geometry`: detector size, reference border and channels. By default it is the NISP one (2048 × 2048, 4, 32 channels of 64 columns), as in the example above. For another instrument, pass the one of the detector: `static_cast<const nisp::Geometry&>(sca.getGeometry())`.
 
 `mode` is a `nisp::SCA::refPixCorrection` bitmask, `ALL` by default ([§3.2](#reference-pixel-correction)):
 
@@ -828,6 +907,27 @@ What the in-place correction stores depends on the type of the cube:
 
 Both functions accept 2D (one read) and 3D cubes of any integer or floating-point type, and run on all hardware threads.
 
+### Inter-pixel capacitance and crosstalk of an image
+
+`expose()` applies both at each read. They can also be applied to any image, in double precision and in place, for example to look at their effect without noise:
+
+```cpp
+std::valarray<double> image(0.0, sca.size());           // ADU, row-major
+image[1000 * sca.getWidth() + 500] = 1000.0;            // one source, baseline 0
+
+sca.applyIPC(image, 0, 0, sca.getWidth(), sca.getHeight());
+sca.applyCrosstalk(image, 0, 0, sca.getWidth(), sca.getHeight());
+```
+
+| Function | Result |
+|---|---|
+| `applyIPC(image, c0, r0, nc, nr)` | IPC of the window [c0, c0 + nc) × [r0, r0 + nr) of the matrix. Nothing without `ipc` |
+| `applyCrosstalk(image, c0, r0, nc, nr)` | Adds the ghosts of the window. The image includes the `baseline` of the pixels, which gives no ghost. Nothing without `crosstalk` |
+| `isIPCEnabled()`, `isIPCDynamic()`, `getIPCKernel()`, `getIPCKernelCube()` | The IPC that is configured: on or off, one kernel per pixel or not, the kernel, the cube of kernels |
+| `isCrosstalkEnabled()`, `getCrosstalkKernel()` | The crosstalk that is configured, and its convolution kernel: one row, the couplings at ± *d* channels, 0 elsewhere and in the centre (it gives the ghosts alone) |
+
+Both throw `std::out_of_range` when the window exceeds the matrix, and `std::invalid_argument` when the image is smaller than the window, if the effect is on.
+
 ---
 
 ## 6. Output header
@@ -840,7 +940,7 @@ Every comment starts with the unit in square brackets (FITS convention), e.g. `G
 |---|---|
 | `MODE` | Readout mode |
 | `NG`, `NR`, `ND` | MACC parameters (MACC, DPU) |
-| `REFCORR` | `ON` when the DPU applied the reference pixel correction, `OFF` when `refPixCorr` is off or the matrix is smaller than 2048 × 2048 (DPU) |
+| `REFCORR` | `ON` when the DPU applied the reference pixel correction, `OFF` when `refPixCorr` is off or the matrix is not the full detector (DPU) |
 | `INTTIME`, `EXPTIME` | Integration and exposure times, s. For DPU, `INTTIME` = (ng − 1)(nr + nd)·t_frame, the span from the first to the last group (87.2 s for MACC(4,16,4)) |
 | `FRTIME` | Frame time, s |
 | `GAIN`, `RN` | Gain (e⁻/ADU) and read noise (e⁻) used by the DPU |
@@ -856,7 +956,8 @@ Every comment starts with the unit in square brackets (FITS convention), e.g. `G
 | `DETSIZE`, `DETSEC` | Physical detector size, and the section of it covered by this image (`'[1:2048,1:2048]'`, 1-based) |
 | `REFBORD`, `REFDARK` | Reference border (pix) and reference-pixel dark current (e⁻/s, when `refDark` is given) |
 | `PIXFW`, `NLMODEL`, `PIXNL0` – `PIXNL2` | Full well (e⁻), non-linearity model and its parameters, for the keys that are given (value or map file). `NLMODEL` is `custom` after `setNonLinearity()`, `linear` if the functor is empty |
-| `CHANWID` | Columns per output channel |
+| `XTALKCOL`, `XTALKNCH`, `XTALKn` | Crosstalk: columns per output channel, number of channels, and coupling at a distance of *n* channels (those that are not 0) |
+| `CHANWID` | Columns per output channel (readout noise) |
 | `OOFAMP`, `OOFSLOPE`, `OOFPOLES` | `oneOverF` |
 | `BIASAMP`, `BIASSLOP`, `BIASPOLE` | `bias_voltage_noise` |
 | `PEDSIGMA`, `PEDT0`, `PEDPOLY`, `PEDEXPn`, `PEDSINn` | `pedestal_drift`: σ, t₀, then the drift terms (`'0, 0.05'`, `'A=20 tau=30'`, `'B=2 P=300 phi=0'`) |
@@ -875,6 +976,8 @@ A file is recorded by its name only (a FITS string holds at most 68 characters).
 | Reset (kTC) noise, baseline | `pixsim::resetLevel()` | Drawn once per ramp, at the first frame | `KTCnoise`, `baseline` |
 | Full well | `nisp::pixel::read()` | Charge limited at each read, per pixel | `fullWell` |
 | Non-linearity | `nisp::pixel::read()` | Response model applied to the limited charge, before the read noise | `nlModel`, `nl0` – `nl2`, or `SCA::setNonLinearity()` |
+| Inter-pixel capacitance | `nisp::SCA`, `phot2pix::PixelConvolution` | Signal shared with the neighbours at each read, by one kernel or one kernel per pixel; the charge is unchanged | `ipc` |
+| Crosstalk | `nisp::SCA`, `phot2pix::PixelConvolution` | Ghosts added at each read to the same position in the other channels; limited by the full well of the source | `crosstalk`, `colPerChannel`, `nChannels` |
 | Read noise | `pixsim::read()` | Independent at each read | `readNoise` |
 | 1/f noise | `nisp::OneOverFNoise` | Per output channel, independent between channels, continuous in time over a ramp | `oneOverF` |
 | Bias voltage noise | `nisp::OneOverFNoise` | 1/f series common to all channels, at the same pixel clock | `bias_voltage_noise` |
@@ -893,6 +996,13 @@ The reference pixels are read through the same channels as the active pixels, so
 - **`oneOverF`**: independent in each channel. Only its slow part is seen by the reference rows; the rest stays in the data, as on the real detector.
 
 The reference pixel correction ([§3.2](#reference-pixel-correction)) uses exactly these two measurements. T and B of each channel remove the pedestal, and $`L_y`$ and $`R_y`$ remove the bias voltage noise line by line.
+
+### Inter-pixel capacitance, crosstalk and the noise
+
+Both act on the signal before the read noise, which is measured with the IPC on a real detector and is therefore not smoothed again. They do act on the shot noise, whose statistics change:
+
+- **IPC** correlates neighbouring pixels and lowers the variance of a uniform image by ΣK². With 1 % to each of the 4 neighbours, the variance is 0.92 of the Poisson one, so a photon transfer curve overestimates the gain by about 8 %.
+- **Crosstalk** adds ghosts, and a ghost of the shot noise of its source, at the level of the couplings.
 
 ### Persistence
 
@@ -959,6 +1069,20 @@ Ready-made configurations:
 
 `src/test/gTest_nispOneOverFNoise.cxx` checks the readout-noise components on their own: configuration parsing and errors, the placement of the matrix on the physical detector (partial channels line up with the physical ones), the spectral index set by `slope`, bias voltage noise shared by all channels (including the pixel-clock offset of a 2040-wide frame), one pedestal offset per channel and per frame with RMS σ, and the drift equation evaluated at the read time of each physical row, in windows and along a stream.
 
+Three suites check the coupling of the pixels. The expected images come from a separate calculation, which spreads the signal of each pixel instead of collecting it:
+
+- `src/test/gTest_pixelConvolution.cxx`: `phot2pix::PixelConvolution` alone, with cubes made in memory. Kernel forms, normalization, warning and errors; one kernel or one per pixel; borders, windows smaller than the kernel, number of threads; kernels that are not normalized.
+- `src/test/gTest_nispIPC.cxx`: the `ipc` key (arrays, FITS cubes with sums below and above 1, matrix and detector sizes) and the IPC of a 2048 × 2048 image holding one lit pixel out of 64 along each axis, full frame and windows, with one kernel and with one per pixel.
+- `src/test/gTest_nispCrosstalk.cxx`: the `crosstalk` key and the channels, the ghosts of sources placed so that they never overlap, and of a large Gaussian source, for several channel widths; the baseline and the full well of the source; the ghosts in MACC, FLUX, CDS and windowed exposures.
+
+Set the environment variable `NISP_IPC_OUTPUT` to a directory to save the input and output images of the last two suites:
+
+```bash
+NISP_IPC_OUTPUT=images ./gTest_nispCrosstalk --gtest_filter='SCACrosstalk.*'
+```
+
+`gTest_nispSCA.cxx` also checks that `colPerChannel` and `nChannels` are read at the top level of the configuration only.
+
 `src/test/gTest_detector.cxx` checks `phot2pix::Geometry` (placement, extraction of a matrix-sized or detector-sized map, derived geometries); `gTest_pixelconfig.cxx` checks `PixelConfig::card()` for every input form; `gTest_nispPixel.cxx` checks the pixel stages, the full well and the non-linearity of one read, and the `Ramp` estimator.
 
 ---
@@ -970,7 +1094,14 @@ Ready-made configurations:
   - the planes hold integers, so the χ² (about n_good − 2 on average for a linear pixel) and the squared error × 100 × `scale` are rounded to 1;
   - no test runs the DPU at a gain other than 1;
   - `nispSimulator` writes the three HDUs only when `exposureMode` is written exactly `DPU`, and for a single exposure; otherwise the output is the three-plane cube.
-- The readout-noise model reads every channel in the same direction and has no row or frame overhead.
+- The readout-noise model and the crosstalk read every channel in the same direction, and the readout noise has no row or frame overhead.
+- Inter-pixel capacitance and crosstalk:
+  - the IPC is applied before the full well. A saturated pixel gives its neighbours a part of all the charge it collected, and in a ramp they keep rising after it saturates. The crosstalk is limited by the full well;
+  - a window only contains the signal of its own pixels: its border misses the IPC of the pixels around it, and it has no ghost of the sources outside of it (none at all if it is not wider than a channel);
+  - the IPC is not recorded in the output header;
+  - the couplings of the crosstalk are ≥ 0 and depend only on the distance between the channels: no negative ghost, and no difference between the two sides or between pairs of channels;
+  - the crosstalk only gives ghosts of the first order: a ghost gives none;
+  - each read is convolved, which costs time: the more weights in the kernel, the longer. A short crosstalk kernel is faster than 32 values.
 - Persistence:
   - the charge stored after a MACC ramp uses the last integration interval instead of the total exposure;
   - the released charge, in electrons, is added to the charge in ADU without division by the gain;
@@ -980,11 +1111,13 @@ Ready-made configurations:
   - `pixelresponse()` of a lone `nisp::pixel` is linear and has no full well: it calls `read(charge)` without the model. The SCA never uses it;
   - there is no count-rate non-linearity, no brighter-fatter effect and no blooming.
 - Reference pixel correction:
-  - it needs a full 2048 × 2048 matrix. A smaller one, such as the 2040 × 2040 active area used by `gTest_nispReadoutModes`, is not corrected, and a warning is printed;
+  - it needs the full detector. A smaller matrix, such as the 2040 × 2040 active area used by `gTest_nispReadoutModes`, is not corrected, and a warning is printed;
   - in the DPU, `refPixCorr` only switches the correction on or off. The mode is always `ALL`;
-  - no test covers the correction yet.
+  - no test covers the correction yet, nor the DPU with another number of channels than 32.
 
 ---
+
+*The Phot2Pix logo has been generated by OpenAI's ChatGPT Image Generation tool (ImageGen).*
 
 *This wiki page has been generated by AI (Claude Opus 5.5) by reading the code itself.*
 

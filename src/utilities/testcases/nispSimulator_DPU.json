@@ -27,7 +27,7 @@
     "nl0"          : -6.25e-7,
     "nl1"          : -3.1e-13,
 
-    "oneOverF"           : { "amplitude": 22.3, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "oneOverF"           : { "amplitude": 22.3, "slope": 1.0, "nPoles": 16 },
     "bias_voltage_noise" : { "amplitude": 22.3, "slope": 2.0, "nPoles": 16 },
     "pedestal_drift"     : { "sigma": 2.3, "t0": 0.0, "drift": { "poly": [0.0,0.005] } }
 }

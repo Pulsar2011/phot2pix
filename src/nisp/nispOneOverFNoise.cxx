@@ -153,11 +153,15 @@ namespace nisp
             {
                 const auto& j = cfg.getJson("oneOverF");
 
-                if (j.contains("amplitude"))     m_amplitude    = j.at("amplitude").get<double>();
-                if (j.contains("slope"))         m_slope        = j.at("slope").get<double>();
-                if (j.contains("nChannels"))     m_nChannels    = j.at("nChannels").get<size_t>();
-                if (j.contains("colPerChannel")) m_colPerChannel = j.at("colPerChannel").get<size_t>();
-                if (j.contains("nPoles"))        m_nPoles       = j.at("nPoles").get<size_t>();
+                // The channels are those of the instrument (nisp::Geometry).
+                for (const char* key : {"nChannels", "colPerChannel"})
+                    if (j.contains(key))
+                        throw std::invalid_argument(std::string("OneOverFNoise: '") + key + "' is not a key of oneOverF: "
+                                                    "set it at the top level of the configuration.");
+
+                if (j.contains("amplitude")) m_amplitude = j.at("amplitude").get<double>();
+                if (j.contains("slope"))     m_slope     = j.at("slope").get<double>();
+                if (j.contains("nPoles"))    m_nPoles    = j.at("nPoles").get<size_t>();
             }
 
             if (m_amplitude < 0.0)

@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="by-nc.png" alt="DeepSkySys" width="120">
+</p>
+
+
 # License
 
 This is the Photon to Pixel simulator library (Phot2Pix).
