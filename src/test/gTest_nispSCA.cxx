@@ -651,13 +651,13 @@ TEST(SCA, OneOverFNoisePerChannelColumnMeanVarianceElevated)
 
 TEST(SCA, OneOverFNoiseHDUAndPersistenceIndependentFlags)
 {
-    // Object form with a non-default colPerChannel (4 divides the 2048-wide
-    // detector: 512 channels); the 4 × 4 matrix is on its active area.
+    // Object form, with a non-default colPerChannel of the instrument (4 divides the
+    // 2048-wide detector: 512 channels); the 4 × 4 matrix is on its active area.
     PixelConfig cfg = makeQuietPixelCfg();
     nlohmann::json oneOverF;
-    oneOverF["amplitude"]     = 5.0;
-    oneOverF["colPerChannel"] = 4;
+    oneOverF["amplitude"] = 5.0;
     cfg.set("oneOverF", oneOverF); // no "persistence" key
+    cfg.set("colPerChannel", 4);
 
     nisp::SCA sca(4, 4);
     sca.initialize(cfg);
@@ -859,13 +859,70 @@ TEST(SCA, ChannelLayoutIsCheckedAtInitialize)
 {
     // colPerChannel 100 does not divide the 2048-wide detector.
     PixelConfig cfg = makeQuietPixelCfg();
-    nlohmann::json oneOverF;
-    oneOverF["amplitude"]     = 5.0;
-    oneOverF["colPerChannel"] = 100;
-    cfg.set("oneOverF", oneOverF);
+    cfg.set("colPerChannel", 100);
 
     nisp::SCA sca(128, 8);
     EXPECT_THROW(sca.initialize(cfg), std::invalid_argument);
+}
+
+TEST(SCA, ChannelsAreSetAtTheTopLevel)
+{
+    const auto geometry = [](const nisp::SCA& sca) -> const nisp::Geometry&
+    {
+        return static_cast<const nisp::Geometry&>(sca.getGeometry());
+    };
+
+    // NISP: 32 channels of 64 columns.
+    nisp::SCA sca(128, 8);
+    sca.initialize(makeQuietPixelCfg());
+    EXPECT_EQ(geometry(sca).colPerChannel, 64u);
+    EXPECT_EQ(geometry(sca).nChannels(),   32u);
+
+    // One of the two keys is enough; both must cover the detector.
+    PixelConfig columns = makeQuietPixelCfg();
+    columns.set("colPerChannel", 128);
+    sca.initialize(columns);
+    EXPECT_EQ(geometry(sca).colPerChannel, 128u);
+    EXPECT_EQ(geometry(sca).nChannels(),   16u);
+
+    PixelConfig channels = makeQuietPixelCfg();
+    channels.set("nChannels", 4);
+    sca.initialize(channels);
+    EXPECT_EQ(geometry(sca).colPerChannel, 512u);
+    EXPECT_EQ(geometry(sca).nChannels(),   4u);
+
+    PixelConfig both = makeQuietPixelCfg();
+    both.set("nChannels",     64);
+    both.set("colPerChannel", 32);
+    sca.initialize(both);
+    EXPECT_EQ(geometry(sca).colPerChannel, 32u);
+    EXPECT_EQ(geometry(sca).nChannels(),   64u);
+
+    // Invalid: the geometry is unchanged.
+    for (const auto& [n, w] : std::vector<std::pair<double, double>>{{32, 32}, {0, 64}, {32, 0}, {-32, -64}, {32, 64.5}, {4096, 1}})
+    {
+        PixelConfig bad = makeQuietPixelCfg();
+        bad.set("nChannels",     n);
+        bad.set("colPerChannel", w);
+        EXPECT_THROW(sca.initialize(bad), std::invalid_argument) << n << " channels of " << w << " columns";
+        EXPECT_EQ(geometry(sca).colPerChannel, 32u);
+    }
+
+    // Not in the object of an effect.
+    for (const char* effect : {"oneOverF", "crosstalk"})
+        for (const char* key : {"nChannels", "colPerChannel"})
+        {
+            nlohmann::json object;
+            object["amplitude"] = 5.0;
+            if (std::string(effect) == "crosstalk")
+                object = {{"kernel", {1.0, 0.5}}};
+            object[key] = 32;
+
+            PixelConfig bad = makeQuietPixelCfg();
+            bad.set(effect, object);
+            nisp::SCA other(128, 8);
+            EXPECT_THROW(other.initialize(bad), std::invalid_argument) << effect << "." << key;
+        }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1418,6 +1475,60 @@ TEST(SCA, DpuDoesNotFlagAPlateauBelowTheAdcLimit)
 
     const double expected = std::sqrt((1600.0 * 1600.0 + 900.0 * 900.0) / 3.0);   // 1059.9 ADU, instead of 1600
     EXPECT_NEAR(planeStats(data, 0, kW * kH).first, expected, 0.01 * expected);
+}
+
+TEST(SCA, FullFrameAndWindowReadTheSamePixels)
+{
+    // Saturated pixels, no read noise: a read is exactly baseline + (full well + drift) / gain,
+    // with the full well and the gain of its own pixel. Drift −2 + 8192 t, frame time 1 s:
+    // 8192 tStart + 4 Y electrons on physical row Y.
+    constexpr size_t W = 96, H = 64;
+    auto gain     = [](size_t x, size_t y) { return static_cast<double>(1u << ((x + 2 * y) % 3)); };   // 1, 2, 4
+    auto fullWell = [](size_t x, size_t y) { return 2000.0 + 4.0 * static_cast<double>(x + W * y); };
+    const std::string gainPath = writeTestMap("sca_gain_96x64.fits", W, H, gain);
+    const std::string wellPath = writeTestMap("sca_fw_96x64.fits",   W, H, fullWell);
+
+    nlohmann::json ped;
+    ped["drift"]["poly"] = nlohmann::json::array({-2.0, 8192.0});
+
+    PixelConfig cfg = makeQuietPixelCfg();   // detector origin (4, 4)
+    cfg.set("gain",           gainPath);
+    cfg.set("fullWell",       wellPath);
+    cfg.set("baseline",       kBase);
+    cfg.set("frame_time",     1.0);
+    cfg.set("pedestal_drift", ped);
+    nisp::SCA sca(W, H);
+    sca.initialize(cfg);
+    const auto flux = makeUniformFlux(W, H, 1.0e5);
+
+    // 3 s: the read starts at tStart = 2 s.
+    auto expected = [&](size_t x, size_t y)
+    {
+        const double drift = 8192.0 * 2.0 + 4.0 * static_cast<double>(4 + y);
+        return static_cast<uint16_t>(kBase + (fullWell(x, y) + drift) / gain(x, y));
+    };
+
+    const auto single = sca.expose(flux, nisp::readout{nisp::mode::FLUX, std::nullopt, 3.0});
+    const auto cds    = sca.expose(flux, nisp::readout{nisp::mode::CDS,  std::nullopt, 3.0});
+    const auto whole  = sca.expose(flux, 3.0, 0, 0, W, H);
+    for (size_t y = 0; y < H; ++y)
+        for (size_t x = 0; x < W; ++x)
+        {
+            const size_t i = y * W + x;
+            ASSERT_EQ(uint16Data(single)[i], expected(x, y)) << "FLUX, x = " << x << ", y = " << y;
+            ASSERT_EQ(uint16Data(whole)[i],  expected(x, y)) << "whole window, x = " << x << ", y = " << y;
+            // Full well and row cancel: drift between the two reads only (2 s).
+            ASSERT_EQ(uint16Data(cds)[i], static_cast<uint16_t>(16384.0 / gain(x, y))) << "CDS, x = " << x << ", y = " << y;
+        }
+
+    constexpr size_t c0 = 33, r0 = 17, w = 48, h = 30;
+    const auto window = sca.expose(flux, 3.0, c0, r0, w, h);
+    for (size_t y = 0; y < h; ++y)
+        for (size_t x = 0; x < w; ++x)
+            ASSERT_EQ(uint16Data(window)[y * w + x], expected(c0 + x, r0 + y)) << "window, x = " << x << ", y = " << y;
+
+    std::filesystem::remove(gainPath);
+    std::filesystem::remove(wellPath);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

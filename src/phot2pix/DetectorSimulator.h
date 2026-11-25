@@ -432,7 +432,7 @@ namespace phot2pix
         // ── Virtual physics hooks ────────────────────────────────────────────
         //
         // Derived classes override _engine() to add detector-level effects
-        // (cross-talk, charge diffusion, persistence, column glow, …).
+        // (persistence, column glow, …).
         //
         // Per-pixel physics (noise, dark current, QE, gain, …) belong in
         // pixsim::pixelresponse() — NOT here.

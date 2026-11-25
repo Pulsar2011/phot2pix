@@ -10,6 +10,8 @@
 #include "nispSCA.h"
 #include "nispPixel.h"
 
+#include <phot2pix/DetectorTools.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cctype>
@@ -425,44 +427,9 @@ namespace nisp
             return 0.5 * (static_cast<double>(*mid) + static_cast<double>(*std::max_element(first, mid)));
         }
 
-        // Run work(begin, end) over [0, n), split into contiguous chunks on nThreads
-        // std::threads (so the compiler can vectorise each loop); a single call when the
-        // job is too small to be worth threading.
-        template <typename Work>
-        void parallelFor(size_t n, size_t nThreads, const Work& work)
-        {
-            if (nThreads <= 1 || n < 100 * nThreads)
-            {
-                work(size_t(0), n);
-                return;
-            }
-
-            const size_t chunk = (n + nThreads - 1) / nThreads;
-            std::vector<std::thread> workers;
-            workers.reserve(nThreads);
-            for (size_t b = 0; b < n; b += chunk)
-                workers.emplace_back(work, b, std::min(n, b + chunk));
-            for (auto& w : workers)
-                w.join();
-        }
-
-        // Call f with the cube's data, as the std::valarray<T>& of the type the cube is
-        // stored in (8- to 64-bit integers, float, double). False if it is none of them.
-        template <typename F>
-        bool withCubeData(DSL::FITScube& cube, F&& f)
-        {
-            if (auto* d = cube.GetData<uint8_t>())  { f(*d); return true; }
-            if (auto* d = cube.GetData<uint16_t>()) { f(*d); return true; }
-            if (auto* d = cube.GetData<uint32_t>()) { f(*d); return true; }
-            if (auto* d = cube.GetData<uint64_t>()) { f(*d); return true; }
-            if (auto* d = cube.GetData<int8_t>())   { f(*d); return true; }
-            if (auto* d = cube.GetData<int16_t>())  { f(*d); return true; }
-            if (auto* d = cube.GetData<int32_t>())  { f(*d); return true; }
-            if (auto* d = cube.GetData<int64_t>())  { f(*d); return true; }
-            if (auto* d = cube.GetData<float>())    { f(*d); return true; }
-            if (auto* d = cube.GetData<double>())   { f(*d); return true; }
-            return false;
-        }
+        // Shared with the detector effects (DetectorTools.h).
+        using phot2pix::parallelFor;
+        using phot2pix::withCubeData;
 
         // v − ref stored in v's type: as is for floating point; for integer types rounded
         // to the nearest value (not truncated) and clamped to the type's range. The largest
@@ -515,59 +482,97 @@ namespace nisp
     // temporaries for the double → uint16 conversion and run on a single thread.
     // The readout noise map is in electrons: it is converted with each pixel's gain,
     // like the read noise in pixel::read().
+    // With IPC or crosstalk, a pixel needs the charge of others: all the pixels are accumulated
+    // first, and read in a second pass.
     void SCA::_accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
                           uint16_t* layer, const std::valarray<double>* oneOverF) const
     {
-        parallelFor(cumul.size(), getThreadCount(),
-            [this, &charge, &cumul, layer, oneOverF](size_t begin, size_t end)
+        // Measured value of pixel i for the given signal (ADU).
+        const auto readPixel = [this, oneOverF](size_t i, double signal)
+        {
+            const double value = m_pixels[i].read(signal, m_nl);
+            return toUint16(oneOverF ? value + (*oneOverF)[i] / m_pixels[i].getGain() : value);   // e- → ADU
+        };
+
+        const bool coupled = layer && _pixelsAreCoupled();
+
+        parallelFor(cumul.size(), getThreadCount(), [&](size_t begin, size_t end)
+        {
+            if (!layer || coupled)          // dropped frames, or read below: charge only
+                for (size_t i = begin; i < end; ++i)
+                    cumul[i] += charge[i];
+            else
+                for (size_t i = begin; i < end; ++i)
+                {
+                    cumul[i] += charge[i];
+                    layer[i]  = readPixel(i, cumul[i]);
+                }
+        });
+
+        if (!coupled)
+            return;
+
+        // IPC and crosstalk act on a copy, at each read: the charge in the pixels is not affected.
+        std::valarray<double> signal = cumul;
+        _couplePixels(signal, 0, 0, getWidth(), getHeight());
+
+        parallelFor(signal.size(), getThreadCount(), [&](size_t begin, size_t end)
+        {
+            for (size_t i = begin; i < end; ++i)
+                layer[i] = readPixel(i, signal[i]);
+        });
+    }
+
+    void SCA::_couplePixels(std::valarray<double>& signal, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+    {
+        applyIPC(signal, c0, r0, ncols, nrows);
+        applyCrosstalk(signal, c0, r0, ncols, nrows);
+    }
+
+    void SCA::applyCrosstalk(std::valarray<double>& signal, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+    {
+        if (!m_crosstalk.isEnabled())
+            return;
+
+        if (c0 + ncols > getWidth() || r0 + nrows > getHeight())
+            throw std::out_of_range("SCA::applyCrosstalk: the window exceeds the matrix.");
+        if (signal.size() < ncols * nrows)
+            throw std::invalid_argument("SCA::applyCrosstalk: the image is smaller than the window.");
+
+        // Signal above the baseline output by every pixel (ADU), then the ghosts it gives. The
+        // baseline is removed: it would add an offset that depends on the channel. Full well and
+        // non-linearity as in pixel::read(): a saturated pixel cannot give more than its full well.
+        const size_t width = getWidth();
+        std::valarray<double> ghosts(0.0, ncols * nrows);
+        parallelFor(ncols * nrows, getThreadCount(), [&](size_t begin, size_t end)
+        {
+            for (size_t i = begin; i < end; ++i)
             {
-                if (!layer)                 // dropped frames: charge only
-                    for (size_t i = begin; i < end; ++i)
-                        cumul[i] += charge[i];
-                else if (!oneOverF)
-                    for (size_t i = begin; i < end; ++i)
-                    {
-                        cumul[i] += charge[i];
-                        layer[i]  = toUint16(m_pixels[i].read(cumul[i], m_nl));
-                    }
-                else
-                    for (size_t i = begin; i < end; ++i)
-                    {
-                        cumul[i] += charge[i];
-                        layer[i]  = toUint16(m_pixels[i].read(cumul[i], m_nl) + (*oneOverF)[i] / m_pixels[i].getGain());   // e- → ADU
-                    }
-            });
+                const nisp::pixel& px = m_pixels[(r0 + i / ncols) * width + c0 + i % ncols];
+                const double       Q  = px.storedCharge((signal[i] - px.getBaseline()) * px.getGain());   // ADU → e-
+                ghosts[i] = px.nlResponse(Q, m_nl) / px.getGain();                                        // e- → ADU
+            }
+        });
+
+        m_crosstalk.apply(ghosts, c0, r0, ncols, nrows, getThreadCount());
+
+        parallelFor(ncols * nrows, getThreadCount(), [&](size_t begin, size_t end)
+        {
+            for (size_t i = begin; i < end; ++i)
+                signal[i] += ghosts[i];
+        });
     }
 
     void SCA::_read(std::valarray<double>& charge, double tStart) const
     {
-        // Readout noise (1/f, bias voltage, pedestal) generated concurrently with the pixel read noise.
-        std::future<std::valarray<double>> oneOverF;
-        if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
-            oneOverF = std::async(std::launch::async,
-                [this, tStart]() { return m_oneOverFNoise.generate(getWidth(), getHeight(), tStart); });
-
-        parallelFor(size(), getThreadCount(),
-            [this, &charge](size_t begin, size_t end)
-            {
-                for (size_t i = begin; i < end; ++i)
-                    charge[i] = m_pixels[i].read(charge[i], m_nl);
-            });
-
-        if (oneOverF.valid())
-        {
-            const std::valarray<double> noiseMap = oneOverF.get();   // W × H, electrons
-            parallelFor(size(), getThreadCount(),
-                [this, &charge, &noiseMap](size_t begin, size_t end)
-                {
-                    for (size_t i = begin; i < end; ++i)
-                        charge[i] += noiseMap[i] / m_pixels[i].getGain();   // e- → ADU
-                });
-        }
+        // The full frame is the window covering the whole matrix.
+        _read(charge, 0, 0, getWidth(), getHeight(), tStart);
     }
 
     void SCA::_read(std::valarray<double>& charge, size_t c0, size_t r0, size_t ncols, size_t nrows, double tStart) const
     {
+        _couplePixels(charge, c0, r0, ncols, nrows);
+
         // The windowed generate() still computes the full channel time series for each
         // overlapping channel (AR(1) correlation from frame start), but only returns
         // the ncols × nrows window portion.
@@ -576,27 +581,29 @@ namespace nisp
             oneOverF = std::async(std::launch::async,
                 [this, c0, r0, ncols, nrows, tStart]() { return m_oneOverFNoise.generate(getWidth(), getHeight(), c0, r0, ncols, nrows, tStart); });
 
+        // Split by pixel, not by row: parallelFor() would run a window (or a frame) of few
+        // rows on a single thread. i: pixel of the window, row-major.
         const size_t width = getWidth();
-        parallelFor(nrows, getThreadCount(),
-            [this, &charge, c0, r0, ncols, width](size_t rowBegin, size_t rowEnd)
+        parallelFor(ncols * nrows, getThreadCount(),
+            [this, &charge, c0, r0, ncols, width](size_t begin, size_t end)
             {
-                for (size_t r = rowBegin; r < rowEnd; ++r)
-                    for (size_t c = 0; c < ncols; ++c)
-                        charge[r * ncols + c] = m_pixels[(r0 + r) * width + c0 + c].read(charge[r * ncols + c], m_nl);
+                for (size_t i = begin; i < end; ++i)
+                    charge[i] = m_pixels[(r0 + i / ncols) * width + c0 + i % ncols].read(charge[i], m_nl);
             });
 
         if (oneOverF.valid())
         {
             const std::valarray<double> noiseMap = oneOverF.get();   // ncols × nrows, electrons
-            parallelFor(nrows, getThreadCount(),
-                [this, &charge, &noiseMap, c0, r0, ncols, width](size_t rowBegin, size_t rowEnd)
+            parallelFor(ncols * nrows, getThreadCount(),
+                [this, &charge, &noiseMap, c0, r0, ncols, width](size_t begin, size_t end)
                 {
-                    for (size_t r = rowBegin; r < rowEnd; ++r)
-                        for (size_t c = 0; c < ncols; ++c)
-                            charge[r * ncols + c] += noiseMap[r * ncols + c] / m_pixels[(r0 + r) * width + c0 + c].getGain();   // e- → ADU
+                    for (size_t i = begin; i < end; ++i)
+                        charge[i] += noiseMap[i] / m_pixels[(r0 + i / ncols) * width + c0 + i % ncols].getGain();   // e- → ADU
                 });
         }
     }
+
+
 
     void SCA::_checkResponse(const nonlinearity::functor& f) const
     {
@@ -633,12 +640,13 @@ namespace nisp
     void SCA::initialize(const phot2pix::PixelConfig& cfg)
     {
         // Also configures the geometry (nisp::Geometry: "detectorSize", "detectorOrigin",
-        // "refBorder") before loading the maps, and throws if the matrix does not fit.
+        // "refBorder", "colPerChannel") before loading the maps, and throws if the matrix does not fit.
         phot2pix::DetectorSimulator<nisp::pixel>::initialize(cfg);
 
-        // Placement of this matrix on the physical detector ((0, 0) by default).
+        // Placement of this matrix on the physical detector ((0, 0) by default), and output channels.
         const auto [x0, y0] = getOrigin();
         m_oneOverFNoise.setGeometry(_geometry());
+        m_oneOverFNoise.setColPerChannel(_geometry().colPerChannel);
 
         // DPU flux-estimation parameters, written as GAIN / RN in the output header:
         // explicit "dpu_gain" (e-/ADU) / "dpu_noise" (e-) if given, otherwise the mean
@@ -758,7 +766,102 @@ namespace nisp
                 _checkResponse(m_nl);   // a model already set, with the new values
         }
 
+        // Inter-pixel capacitance kernel "ipc": none by default.
+        m_ipc.initialize(cfg, getGeometry(), getWidth(), getHeight(), [this, &cfg]() { return loadImage(cfg, "ipc"); });
+
+        // Crosstalk between the output channels "crosstalk": none by default.
+        _configureCrosstalk(cfg);
+
         _recordInputs(cfg);
+    }
+
+    void SCA::_configureCrosstalk(const phot2pix::PixelConfig& cfg)
+    {
+        if (!cfg.has("crosstalk"))
+        {
+            // "colPerChannel" may have changed: same couplings, with the new channels.
+            if (m_crosstalk.isEnabled() && m_crosstalkColumns != _geometry().colPerChannel)
+                _setCrosstalk(m_crosstalkCouplings);
+            return;
+        }
+
+        const std::string what = "SCA::initialize: 'crosstalk'";
+
+        const phot2pix::json* node = nullptr;
+        try                                { node = &cfg.getJson("crosstalk"); }
+        catch (const std::invalid_argument&) {}   // not a JSON value
+        if (!node || !(node->is_array() || (node->is_object() && node->contains("kernel"))))
+            throw std::invalid_argument(what + " must be an array of couplings, or {\"kernel\": [...]}.");
+
+        // ── No crosstalk: [] ──
+        if (node->is_array() && node->empty())
+        {
+            m_crosstalk        = phot2pix::PixelConvolution();
+            m_crosstalkColumns = 0;
+            m_crosstalkCouplings.clear();
+            return;
+        }
+
+        if (node->is_object())
+        {
+            for (auto it = node->begin(); it != node->end(); ++it)
+            {
+                if (it.key() == "nChannels" || it.key() == "colPerChannel")
+                    throw std::invalid_argument(what + ": '" + it.key() + "' is not a key of crosstalk: "
+                                                "set it at the top level of the configuration.");
+                if (it.key() != "kernel")
+                    throw std::invalid_argument(what + ": unknown key '" + it.key() + "'.");
+            }
+        }
+
+        // ── Couplings, one per distance between channels ──
+        const phot2pix::json& values = node->is_object() ? node->at("kernel") : *node;
+        if (!values.is_array() || values.empty())
+            throw std::invalid_argument(what + ": the kernel must be an array of 1 to " + std::to_string(_geometry().nChannels()) +
+                                        " couplings (at most one per channel).");
+
+        std::vector<double> couplings;
+        for (size_t d = 0; d < values.size(); ++d)
+        {
+            const double k = values[d].is_number() ? values[d].get<double>() : -1.0;
+            if (!(k >= 0.0) || !std::isfinite(k))
+                throw std::invalid_argument(what + ": coupling " + std::to_string(d) + " must be a finite number >= 0.");
+            if (d == 0 && k != 1.0)
+                throw std::invalid_argument(what + ": coupling 0, the fraction of its signal that a channel keeps, must be 1 (no loss).");
+            couplings.push_back(k);
+        }
+
+        _setCrosstalk(couplings);
+    }
+
+    void SCA::_setCrosstalk(const std::vector<double>& couplings)
+    {
+        const std::string what    = "SCA::initialize: 'crosstalk'";
+        const size_t      columns = _geometry().colPerChannel, channels = _geometry().nChannels();
+        if (channels * columns != _geometry().width)
+            throw std::invalid_argument(what + ": " + std::to_string(channels) + " channels of " + std::to_string(columns) +
+                                        " columns do not cover the " + std::to_string(_geometry().width) + " columns of the detector.");
+        if (couplings.size() > channels)
+            throw std::invalid_argument(what + ": " + std::to_string(couplings.size()) + " couplings for " +
+                                        std::to_string(channels) + " channels.");
+
+        // Kernel of the ghosts: one row, coupling d at ± d channels from the centre, 0 elsewhere
+        // (and in the centre: the source keeps its signal, the ghosts are added to it). The
+        // couplings that are not given, at larger distances, are 0.
+        const size_t centre = (couplings.size() - 1) * columns;
+        std::valarray<double> weights(0.0, 2 * centre + 1);
+        for (size_t d = 1; d < couplings.size(); ++d)
+        {
+            weights[centre - d * columns] = couplings[d];
+            weights[centre + d * columns] = couplings[d];
+        }
+
+        if (weights.max() > 0.0)
+            m_crosstalk.setKernel(weights, weights.size(), 1, getWidth(), getHeight(), false);   // ghosts only: not normalized
+        else
+            m_crosstalk = phot2pix::PixelConvolution();   // every coupling is 0: no crosstalk
+        m_crosstalkColumns   = columns;
+        m_crosstalkCouplings = couplings;
     }
 
     void SCA::_recordInputs(const phot2pix::PixelConfig& cfg)
@@ -778,6 +881,20 @@ namespace nisp
         for (size_t k = 0; k < nonlinearity::nParam; ++k)
             if (const auto value = cfg.card("nl" + std::to_string(k)))
                 setInputCard({"PIXNL" + std::to_string(k), *value, "Parameter of the non-linearity model"});
+
+        // ── Channel crosstalk: the couplings that are not 0 ──
+        removeInputCards("XTALK");
+        if (m_crosstalk.isEnabled())
+        {
+            const std::valarray<double>& weights = m_crosstalk.getKernel().data();
+            const size_t centre      = weights.size() / 2;
+            const size_t maxDistance = centre / m_crosstalkColumns;   // in channels
+            setInputCard({"XTALKCOL", m_crosstalkColumns,                  "[pix] Crosstalk: columns per output channel"});
+            setInputCard({"XTALKNCH", geometry.width / m_crosstalkColumns, "Crosstalk: output channels"});
+            for (size_t d = 1; d <= maxDistance; ++d)
+                if (const double k = weights[centre + d * m_crosstalkColumns]; k > 0.0)
+                    setInputCard({"XTALK" + std::to_string(d), k, "Crosstalk: coupling at this distance in channels"});
+        }
 
         // ── Readout noise: the components that are on ──
         for (const char* prefix : {"CHANWID", "OOF", "BIAS", "PED"})
@@ -1225,7 +1342,8 @@ namespace nisp
         return result;
     }
 
-    std::valarray<double> SCA::getReferencePixelCorrection(const std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode)
+    std::valarray<double> SCA::getReferencePixelCorrection(const std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode,
+                                                           const nisp::Geometry& geometry)
     {
         if(!ramp)
             throw std::invalid_argument("SCA::getReferencePixelCorrection: ramp is null.");
@@ -1233,66 +1351,88 @@ namespace nisp
         if(mode == refPixCorrection::NONE)
             return {};
 
-        if(ramp->Size(1) < 2048 || ramp->Size(2) < 2048)
+        // Detector of W × H pixels, border of b reference pixels, nCh channels of w columns.
+        const size_t W = geometry.width, H = geometry.height, b = geometry.refBorder;
+        const size_t w = geometry.colPerChannel, nCh = geometry.nChannels();
+
+        if(ramp->Size(1) != W || ramp->Size(2) != H)
         {
-            std::cerr << "SCA::getReferencePixelCorrection: warning: reference pixel correction is not applied to subarrays smaller than 2048x2048." << std::endl;
+            std::cerr << "SCA::getReferencePixelCorrection: warning: reference pixel correction is only applied to the full "
+                      << W << "x" << H << " detector." << std::endl;
             return {};
         }
 
-        const size_t W        = ramp->Size(1);
-        const size_t nPix     = W * ramp->Size(2);
+        // Every channel needs columns outside the left / right border (both in a single channel).
+        if(b == 0 || nCh * w != W || w <= (nCh == 1 ? 2 * b : b) || H <= 2 * b)
+        {
+            std::cerr << "SCA::getReferencePixelCorrection: warning: reference pixel correction is not applied with a border of "
+                      << b << " reference pixels and channels of " << w << " columns." << std::endl;
+            return {};
+        }
+
+        const size_t nPix     = W * H;
+        const size_t nLines   = H - 2 * b;   // lines that are corrected: [b, H − b)
         const size_t nReads   = (ramp->GetDimension() >= 3) ? ramp->Size(3) : 1;
         const size_t nThreads = std::thread::hardware_concurrency();
 
-        // c[(y * 32 + ch) * nReads + k]: the reads of one line and channel are contiguous.
-        // Lines 0-3 and 2044-2047 keep 0 (not corrected).
-        std::valarray<double> c(0.0, 2048 * 32 * nReads);
+        // c[(y * nCh + ch) * nReads + k]: the reads of one line and channel are contiguous.
+        // The b first and last lines keep 0 (not corrected).
+        std::valarray<double> c(0.0, H * nCh * nReads);
 
         const bool known = withCubeData(*ramp, [&](const auto& data)
         {
             using T = typename std::decay_t<decltype(data)>::value_type;
 
-            // T^(ch), B^(ch) of every read k, at [k * 32 + ch]: median of the 4 top / bottom
+            // T^(ch), B^(ch) of every read k, at [k * nCh + ch]: median of the b top / bottom
             // reference lines of the channel, without the left / right reference columns
-            // (channels 0 and 31: 60 columns).
-            std::valarray<double> topRef(0.0, 32 * nReads);
-            std::valarray<double> bottomRef(0.0, 32 * nReads);
+            // (NISP, channels 0 and 31: 60 columns).
+            std::valarray<double> topRef(0.0, nCh * nReads);
+            std::valarray<double> bottomRef(0.0, nCh * nReads);
 
-            parallelFor(32 * nReads, nThreads, [&](size_t begin, size_t end)
+            parallelFor(nCh * nReads, nThreads, [&](size_t begin, size_t end)
             {
                 for(size_t j = begin; j < end; ++j)
                 {
-                    const size_t k  = j / 32;
-                    const size_t ch = j % 32;
+                    const size_t k  = j / nCh;
+                    const size_t ch = j % nCh;
                     const size_t L0 = k * nPix;   // first pixel of read k
 
-                    size_t size = 64;
-                    size_t x0   = (ch == 0) ? 4 : ch * 64;
-                    if(ch == 0 || ch == 31)
-                        size -= 4;
+                    size_t size = w;
+                    size_t x0   = ch * w;
+                    if(ch == 0)
+                    {
+                        x0   += b;
+                        size -= b;
+                    }
+                    if(ch + 1 == nCh)
+                        size -= b;
 
-                    bottomRef[j] = median(std::valarray<T>(data[std::gslice(L0 + x0,            {size, 4}, {1, W})]));
-                    topRef[j]    = median(std::valarray<T>(data[std::gslice(L0 + x0 + 2044 * W, {size, 4}, {1, W})]));
+                    bottomRef[j] = median(std::valarray<T>(data[std::gslice(L0 + x0,               {size, b}, {1, W})]));
+                    topRef[j]    = median(std::valarray<T>(data[std::gslice(L0 + x0 + (H - b) * W, {size, b}, {1, W})]));
                 }
             });
 
-            // For every read k and line y in [4, 2044): L_y, R_y, median of the 4 left / right
-            // reference columns over lines y−4 … y+4, then c_y^(ch) of the 32 channels (Eq. 3).
-            parallelFor(2040 * nReads, nThreads, [&](size_t begin, size_t end)
+            // For every read k and line y in [b, H − b): L_y, R_y, median of the b left / right
+            // reference columns over lines y−4 … y+4 (those of the detector: all of them if
+            // b >= 4), then c_y^(ch) of the nCh channels (Eq. 3).
+            parallelFor(nLines * nReads, nThreads, [&](size_t begin, size_t end)
             {
                 for(size_t j = begin; j < end; ++j)
                 {
-                    const size_t k  = j / 2040;
-                    const size_t y  = 4 + j % 2040;
+                    const size_t k  = j / nLines;
+                    const size_t y  = b + j % nLines;
                     const size_t L0 = k * nPix;
 
-                    const double leftRef  = median(std::valarray<T>(data[std::gslice(L0        + (y - 4) * W, {4, 9}, {1, W})]));
-                    const double rightRef = median(std::valarray<T>(data[std::gslice(L0 + 2044 + (y - 4) * W, {4, 9}, {1, W})]));
+                    const size_t first = (y > 4) ? y - 4 : 0;
+                    const size_t n     = std::min(y + 4, H - 1) - first + 1;
 
-                    for(size_t ch = 0; ch < 32; ++ch)
+                    const double leftRef  = median(std::valarray<T>(data[std::gslice(L0           + first * W, {b, n}, {1, W})]));
+                    const double rightRef = median(std::valarray<T>(data[std::gslice(L0 + (W - b) + first * W, {b, n}, {1, W})]));
+
+                    for(size_t ch = 0; ch < nCh; ++ch)
                     {
-                        const double top    = topRef[k * 32 + ch];
-                        const double bottom = bottomRef[k * 32 + ch];
+                        const double top    = topRef[k * nCh + ch];
+                        const double bottom = bottomRef[k * nCh + ch];
 
                         // mode is a bitmask: each pair of bits picks its own reference,
                         // so every combination (TOP|LEFT, BOTTOM|RIGHTnLEFT, …) is handled.
@@ -1314,7 +1454,7 @@ namespace nisp
                             default:                                                              break;
                         }
 
-                        c[(y * 32 + ch) * nReads + k] = ref;
+                        c[(y * nCh + ch) * nReads + k] = ref;
                     }
                 }
             });
@@ -1326,38 +1466,40 @@ namespace nisp
         return c;
     }
 
-    void SCA::referencePixelsCorrection(std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode)
+    void SCA::referencePixelsCorrection(std::shared_ptr<DSL::FITScube>& ramp, const refPixCorrection& mode, const nisp::Geometry& geometry)
     {
-        const std::valarray<double> c = getReferencePixelCorrection(ramp, mode);
+        const std::valarray<double> c = getReferencePixelCorrection(ramp, mode, geometry);
         if(c.size() == 0)
-            return;   // NONE, or smaller than 2048 × 2048
+            return;   // NONE, or the correction does not apply
 
-        const size_t W        = ramp->Size(1);
-        const size_t nPix     = W * ramp->Size(2);
-        const size_t nReads   = c.size() / (2048 * 32);
+        const size_t W        = geometry.width, H = geometry.height, b = geometry.refBorder;
+        const size_t w        = geometry.colPerChannel, nCh = geometry.nChannels();
+        const size_t nPix     = W * H;
+        const size_t nLines   = H - 2 * b;
+        const size_t nReads   = c.size() / (H * nCh);
         const size_t nThreads = std::thread::hardware_concurrency();
 
         withCubeData(*ramp, [&](auto& data)
         {
             using T = typename std::decay_t<decltype(data)>::value_type;
 
-            // One task per read k and line y in [4, 2044); the other lines are not corrected.
-            parallelFor(2040 * nReads, nThreads, [&](size_t begin, size_t end)
+            // One task per read k and line y in [b, H − b); the other lines are not corrected.
+            parallelFor(nLines * nReads, nThreads, [&](size_t begin, size_t end)
             {
                 for(size_t j = begin; j < end; ++j)
                 {
-                    const size_t k    = j / 2040;
-                    const size_t y    = 4 + j % 2040;
+                    const size_t k    = j / nLines;
+                    const size_t y    = b + j % nLines;
                     T*           line = &data[k * nPix + y * W];
 
-                    for(size_t ch = 0; ch < 32; ++ch)
+                    for(size_t ch = 0; ch < nCh; ++ch)
                     {
                         // Unsigned cubes cannot hold v − c (≈ −baseline with ALL): they get
                         // v − (c_k − c_0), the change of the correction since the first read.
-                        const double* cy  = &c[(y * 32 + ch) * nReads];
+                        const double* cy  = &c[(y * nCh + ch) * nReads];
                         const double  ref = std::is_unsigned_v<T> ? cy[k] - cy[0] : cy[k];
 
-                        for(size_t x = ch * 64; x < ch * 64 + 64; ++x)
+                        for(size_t x = ch * w; x < ch * w + w; ++x)
                             line[x] = subtractReference(line[x], ref);
                     }
                 }
@@ -1380,12 +1522,15 @@ namespace nisp
         if(!rampData)
             throw std::runtime_error("SCA::expose_dpu: the MACC ramp is not a uint16 cube.");
 
-        // Reference pixel correction (Eq. 3) of every read, refCorr[(y * 32 + ch) * nG·nR + k].
+        // Reference pixel correction (Eq. 3) of every read, refCorr[(y * nCh + ch) * nG·nR + k],
+        // with the output channels of the geometry.
         // It is subtracted in double below, while each pixel's reads are copied for the fit:
         // the uint16 ramp is not modified, nothing wraps, and the saturation test sees the
-        // raw reads. Empty when "refPixCorr" is off, or for a matrix smaller than
-        // 2048 × 2048: no correction.
-        const std::valarray<double> refCorr = m_refPixCorr ? getReferencePixelCorrection(MACC) : std::valarray<double>();
+        // raw reads. Empty when "refPixCorr" is off, or for a matrix that is not the full
+        // detector: no correction.
+        const size_t columns = _geometry().colPerChannel, nCh = _geometry().nChannels();
+        const std::valarray<double> refCorr = m_refPixCorr ? getReferencePixelCorrection(MACC, refPixCorrection::ALL, _geometry())
+                                                           : std::valarray<double>();
 
         const size_t W    = MACC->Size(1);
         const size_t nPix = MACC->Size(1) * MACC->Size(2);
@@ -1411,8 +1556,8 @@ namespace nisp
 
             for(size_t i = begin; i < end; ++i)
             {
-                // This pixel's corrections, one per read: line i / W, channel (i % W) / 64.
-                const double* c = (refCorr.size() > 0) ? &refCorr[((i / W) * 32 + (i % W) / 64) * nG * nR] : nullptr;
+                // This pixel's corrections, one per read: line i / W, channel (i % W) / columns.
+                const double* c = (refCorr.size() > 0) ? &refCorr[((i / W) * nCh + (i % W) / columns) * nG * nR] : nullptr;
 
                 // Copy the reads group by group, up to the first saturated group: a
                 // saturated read makes the rest of the ramp unusable, only the groups
@@ -1471,8 +1616,6 @@ namespace nisp
 
         return result;
     }
-
-
 
     void SCA::_simulate(const std::valarray<double>& flux, const double& exposureTime,
                         std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg)

@@ -297,6 +297,51 @@ set_target_properties(DST::fits PROPERTIES
 message(STATUS "${_G}  DSTfits lib   :${_Z} ${DSTfits_LIB}")
 message(STATUS "${_G}  DSTfits inc   :${_Z} ${DSTfits_INCLUDE_DIR}")
 
+# ─── Dependency: DSTools headers (required, headers only: libDSTools is not linked) ─
+# DetectorEffect.h needs DSTmorpho.h, and the two headers it includes. When they are not
+# installed, only these three files are downloaded from the deepskyutilities repository.
+# The GitLab repository files API is used rather than the "raw" web link: for a private
+# project, the latter answers with the HTML of the sign-in page instead of an error.
+# Token, if the project is private: environment variable DEEPSKYFITS_TOKEN (read_repository).
+set(DSTools_REF "main" CACHE STRING "Branch, tag or commit of deepskyutilities to download the DSTools headers from")
+
+find_path(DSTools_INCLUDE_DIR
+    NAMES DSTools/DSTmorpho.h
+    HINTS "${DeepSkyROOT}/${CMAKE_INSTALL_INCLUDEDIR}"
+          "${DeepSkyROOT}/include"
+)
+if(NOT DSTools_INCLUDE_DIR)
+    set(_dstools_inc  "${CMAKE_CURRENT_BINARY_DIR}/_deps/DSTools/include")
+    set(_dstools_url  "https://gitlab.in2p3.fr/api/v4/projects/deepskyproject%2Fdeepskyutilities/repository/files")
+    set(_dstools_auth)
+    if(NOT "$ENV{DEEPSKYFITS_TOKEN}" STREQUAL "")
+        set(_dstools_auth HTTPHEADER "PRIVATE-TOKEN: $ENV{DEEPSKYFITS_TOKEN}")
+    endif()
+
+    message(STATUS "${_Y}  DSTools       : not found — downloading DSTmorpho.h (deepskyutilities, ${DSTools_REF})${_Z}")
+    foreach(_h DSTmorpho.h DSTmorph_ops.h DST_version.h)
+        file(DOWNLOAD
+            "${_dstools_url}/include%2FDSTools%2F${_h}/raw?ref=${DSTools_REF}"
+            "${_dstools_inc}/DSTools/${_h}"
+            ${_dstools_auth}
+            TLS_VERIFY ON
+            TIMEOUT    60
+            STATUS     _dstools_status
+        )
+        list(GET _dstools_status 0 _dstools_rc)
+        if(NOT _dstools_rc EQUAL 0)
+            list(GET _dstools_status 1 _dstools_msg)
+            file(REMOVE_RECURSE "${_dstools_inc}")   # no partial file left for the next configure
+            message(FATAL_ERROR "DSTools/${_h} is neither installed in ${DeepSkyROOT} nor downloadable: ${_dstools_msg}. "
+                                "Install deepskyutilities, or set DEEPSKYFITS_TOKEN to a token that can read it.")
+        endif()
+    endforeach()
+
+    set(DSTools_INCLUDE_DIR "${_dstools_inc}" CACHE PATH "Directory of DSTools/DSTmorpho.h" FORCE)
+    set(DSTools_DOWNLOADED  TRUE CACHE INTERNAL "DSTools headers downloaded by phot2pix")
+endif()
+message(STATUS "${_G}  DSTools inc   :${_Z} ${DSTools_INCLUDE_DIR}")
+
 # ─── Dependency: DSTCore (dynamic, optional — only needed by src/utilities) ──
 # Provides DOption (OptionManager.h) and DSF::gGIT. If absent, the libraries
 # still build and the utilities are skipped.
@@ -335,6 +380,7 @@ target_include_directories(phot2pix
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
         $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/generated>
+        $<BUILD_INTERFACE:${DSTools_INCLUDE_DIR}>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
@@ -525,6 +571,10 @@ install(FILES ${PHOT2PIX_HEADERS}
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/phot2pix/phot2pix.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/phot2pix"
 )
+# The installed DetectorEffect.h includes <DSTools/DSTmorpho.h>: provide it when it was downloaded.
+if(DSTools_DOWNLOADED)
+    install(DIRECTORY "${DSTools_INCLUDE_DIR}/DSTools" DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+endif()
 
 # ─── Install: CMake package config (enables find_package(phot2pix)) ───────────
 install(EXPORT phot2pixTargets

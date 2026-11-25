@@ -13,8 +13,9 @@
 /// per-pixel inputs.
 ///
 /// The physical detector is 2048 × 2048 pixels, framed by refBorder reference pixels on
-/// each side (4). It is read through output channels of colPerChannel columns (64,
-/// configured with the 1/f noise, see nispOneOverFNoise.h).
+/// each side (4). It is read through width / colPerChannel output channels (32 channels of
+/// 64 columns), used by the readout noise, the crosstalk, the reference pixel correction and
+/// the DPU.
 ///
 /// The matrix starts at the first detector pixel unless "detectorOrigin" is given: a
 /// 2048 × 2048 matrix is the full detector, a 2040 × 2040 one at [4, 4] its active area,
@@ -29,7 +30,11 @@
 ///   "detectorSize"  : [2048, 2048]   physical width and height
 ///   "detectorOrigin": [x0, y0]       placement of the matrix (default: [0, 0])
 ///   "refBorder"     : 4              reference pixels on each side (0: none)
+///   "colPerChannel" : 64             columns per output channel
+///   "nChannels"     : 32             output channels
 /// @endverbatim
+/// One of "colPerChannel" and "nChannels" is enough: colPerChannel × nChannels is the detector
+/// width. They are the only keys that set the channels.
 
 #ifndef _NISP_GEOMETRY_H_
 #define _NISP_GEOMETRY_H_
@@ -52,15 +57,19 @@ namespace nisp
     class Geometry : public phot2pix::Geometry
     {
     public:
-        size_t refBorder = 4;   ///< reference pixels on each side of the physical detector
+        size_t refBorder     = 4;    ///< reference pixels on each side of the physical detector
+        size_t colPerChannel = 64;   ///< columns per output channel
 
-        /// @brief 2048 × 2048 detector with 4 reference pixels on each side.
+        /// @brief 2048 × 2048 detector with 4 reference pixels on each side, 32 channels of 64 columns.
         Geometry() : phot2pix::Geometry(2048, 2048) {}
+
+        /// @brief Number of output channels of the detector.
+        size_t nChannels() const { return width / colPerChannel; }
 
         /// @brief Copy of this geometry with its dynamic type.
         std::shared_ptr<phot2pix::Geometry> clone() const override { return std::make_shared<Geometry>(*this); }
 
-        /// @brief Read "detectorSize", "detectorOrigin" (phot2pix::Geometry) and "refBorder" from cfg.
+        /// @brief Read "detectorSize", "detectorOrigin" (phot2pix::Geometry), "refBorder", "colPerChannel" and "nChannels" from cfg.
         /// @param cfg Configuration; absent keys leave the current value unchanged.
         /// @throws std::invalid_argument on a malformed value; the geometry is then unchanged.
         void configure(const phot2pix::PixelConfig& cfg) override
@@ -80,6 +89,24 @@ namespace nisp
                 throw std::invalid_argument("nisp::Geometry: 'refBorder' (" + std::to_string(g.refBorder) +
                                             ") does not fit on a " + std::to_string(g.width) + " × " +
                                             std::to_string(g.height) + " detector.");
+
+            // Output channels: "colPerChannel", "nChannels", or both. They cover the detector width.
+            if (cfg.has("colPerChannel") || cfg.has("nChannels"))
+            {
+                const auto count = [&cfg](const std::string& key)
+                {
+                    const double n = cfg.getAsDouble(key);
+                    if (!(n >= 1.0) || n != std::floor(n))
+                        throw std::invalid_argument("nisp::Geometry: '" + key + "' must be an integer >= 1.");
+                    return static_cast<size_t>(n);
+                };
+                const size_t columns  = cfg.has("colPerChannel") ? count("colPerChannel") : g.width / count("nChannels");
+                const size_t channels = cfg.has("nChannels")     ? count("nChannels")     : g.width / columns;
+                if (channels * columns != g.width)
+                    throw std::invalid_argument("nisp::Geometry: " + std::to_string(channels) + " channels of " + std::to_string(columns) +
+                                                " columns do not cover the " + std::to_string(g.width) + " columns of the detector.");
+                g.colPerChannel = columns;
+            }
 
             *this = g;
         }

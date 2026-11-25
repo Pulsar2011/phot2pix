@@ -29,8 +29,6 @@
     "oneOverF"     : {
         "amplitude"     : 0.0,
         "slope"         : 1.0,
-        "nChannels"     : 0,
-        "colPerChannel" : 64,
         "nPoles"        : 16
     },
 

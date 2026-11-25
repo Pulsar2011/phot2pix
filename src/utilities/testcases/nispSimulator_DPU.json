@@ -5,10 +5,13 @@
 
     "benchmark"    : 1,
 
-    "flux"         : 10.0,
+    "flux"         : {"file":"/Users/gillard/DATA/EUC_LE1_NISP-07814-1-C_20250513T173301.000000Z_01_02_01.00_wcs.fits", "hdu": "DET13.SCI"},
 
     "exposureMode" : "DPU",
-    "macc"         : [15, 16, 11],
+    "macc"         : [4, 16, 4],
+
+    "ipc"          : [0.0002,0.0058,0.0002,0.0045, 0.9779 , 0.0062,0.0002,0.0048,0.0002],
+    "crosstalk"    : [1, 0, 1,0, 0, 1, 0, 0, 0, 1, 0, 0, 1],
 
     "frame_time"   : 1.45408,
     "offset"       : 1024.0,
@@ -27,7 +30,7 @@
     "nl0"          : -6.25e-7,
     "nl1"          : -3.1e-13,
 
-    "oneOverF"           : { "amplitude": 22.3, "slope": 1.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "oneOverF"           : { "amplitude": 22.3, "slope": 1.0, "nPoles": 16 },
     "bias_voltage_noise" : { "amplitude": 22.3, "slope": 2.0, "nPoles": 16 },
     "pedestal_drift"     : { "sigma": 2.3, "t0": 0.0, "drift": { "poly": [0.0,0.005] } }
 }

@@ -13,9 +13,11 @@
  *
  * - phot2pix: the instrument-agnostic core. phot2pix::PixelConfig (configuration),
  *   phot2pix::pixsim (one pixel), phot2pix::Geometry and phot2pix::DetectorSimulator (the array),
- *   phot2pix::ScenerySequencer (a sequence of exposures).
+ *   phot2pix::PixelConvolution (coupling between pixels, in DetectorEffect.h, to be included
+ *   separately), phot2pix::ScenerySequencer (a sequence of exposures).
  * - nisp: the Euclid NISP HAWAII-2RG detectors, built on the core. nisp::SCA is the detector and
- *   nisp::SCA::expose() its simulation.
+ *   nisp::SCA::expose() its simulation; nisp::Geometry holds its size, reference border and output
+ *   channels.
  *
  * The concepts, the equations and the configuration keys are described in the project wiki (wiki/).
  */

@@ -1,7 +1,6 @@
 {
-    "width"        : 30,
-    "height"       : 50,
-    "detectorOrigin": [1000, 1210],
+    "width"        : 2048,
+    "height"       : 2048,
 
     "benchmark"    : 0,
 
@@ -9,6 +8,9 @@
 
     "exposureMode" : "FLUX",
     "macc"         : [1, 2, 0],
+
+    "ipc"          : [0.0002,0.0058,0.0002,0.0045, 0.9779 , 0.0062,0.0002,0.0048,0.0002],
+    "crosstalk"    : [1, 2.5e-2, 1e-2,0.5e-2, 2.5e-3, 1e-3, 0.5e-3, 2.5e-4, 1e-4, 0.5e-4, 2.5e-5, 1e-5, 0.5e-5],
 
     "frame_time"   : 1.45408,
     "offset"       : 1024.0,
@@ -26,7 +28,7 @@
     "nl0"          : -6.25e-7,
     "nl1"          : -3.1e-13,
 
-    "oneOverF"           : { "amplitude": 35.0, "slope": 0.0, "nChannels": 32, "colPerChannel": 64, "nPoles": 16 },
+    "oneOverF"           : { "amplitude": 35.0, "slope": 0.0, "nPoles": 16 },
     "bias_voltage_noise" : { "amplitude": 10.0, "slope": 0.5, "nPoles": 16 },
     "pedestal_drift"     : { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [] } }
 }

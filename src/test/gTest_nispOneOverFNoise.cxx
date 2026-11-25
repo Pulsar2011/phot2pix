@@ -196,32 +196,37 @@ TEST(OneOverFNoise, InitializeObjectFormAppliesAllFields)
     PixelConfig cfg;
 
     nlohmann::json obj;
-    obj["amplitude"]     = 9.0;
-    obj["slope"]         = 1.6;
-    obj["nChannels"]     = 4;
-    obj["colPerChannel"] = 32;
-    obj["nPoles"]        = 8;
+    obj["amplitude"] = 9.0;
+    obj["slope"]     = 1.6;
+    obj["nPoles"]    = 8;
     cfg.set("oneOverF", obj);
 
     n.initialize(cfg);
 
-    EXPECT_DOUBLE_EQ(n.getAmplitude(),  9.0);
-    EXPECT_DOUBLE_EQ(n.getSlope(),      1.6);
-    EXPECT_EQ(n.getNChannels(),         4u);
-    EXPECT_EQ(n.getColPerChannel(),     32u);
-    EXPECT_EQ(n.getNPoles(),            8u);
+    EXPECT_DOUBLE_EQ(n.getAmplitude(), 9.0);
+    EXPECT_DOUBLE_EQ(n.getSlope(),     1.6);
+    EXPECT_EQ(n.getNPoles(),           8u);
+
+    // The channels are not set by oneOverF.
+    EXPECT_EQ(n.getColPerChannel(), 64u);
+    n.setColPerChannel(32);
+    EXPECT_EQ(n.getColPerChannel(), 32u);
 }
 
-TEST(OneOverFNoise, InvalidColPerChannelInObjectFormThrows)
+TEST(OneOverFNoise, ChannelsInObjectFormThrow)
 {
-    OneOverFNoise n;
-    PixelConfig cfg;
-    nlohmann::json obj;
-    obj["amplitude"]     = 5.0;
-    obj["colPerChannel"] = 0;
-    cfg.set("oneOverF", obj);
+    // They are top-level keys of the configuration, read by nisp::Geometry.
+    for (const char* key : {"colPerChannel", "nChannels"})
+    {
+        OneOverFNoise n;
+        PixelConfig cfg;
+        nlohmann::json obj;
+        obj["amplitude"] = 5.0;
+        obj[key]         = 32;
+        cfg.set("oneOverF", obj);
 
-    EXPECT_THROW(n.initialize(cfg), std::invalid_argument);
+        EXPECT_THROW(n.initialize(cfg), std::invalid_argument) << key;
+    }
 }
 
 TEST(OneOverFNoise, InvalidNPolesInObjectFormThrows)

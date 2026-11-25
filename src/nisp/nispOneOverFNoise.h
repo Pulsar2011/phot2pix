@@ -27,7 +27,8 @@
 /// @par Physical detector
 /// The noise is defined on the physical detector (nisp::Geometry, 2048 × 2048 by
 /// default), not on the simulated matrix. The detector is read through
-/// width / colPerChannel output channels (32 × 64 columns for NISP); channel c covers
+/// width / colPerChannel output channels (32 × 64 columns for NISP, set by the geometry:
+/// top-level "colPerChannel" or "nChannels", see nisp::Geometry); channel c covers
 /// the physical columns [c·w, (c+1)·w), w = colPerChannel. A simulated matrix is
 /// placed on the detector (at (0, 0) by default), and each of its pixels takes the noise
 /// of the physical pixel it covers. The channel boundaries, the readout timing and the
@@ -116,11 +117,9 @@ namespace nisp
         /// Per-channel 1/f noise, scalar shorthand (amplitude only) or object:
         ///   "oneOverF": 7.0
         ///   "oneOverF": {
-        ///     "amplitude"    : 7.0,
-        ///     "slope"        : 1.0,
-        ///     "nChannels"    : 0,
-        ///     "colPerChannel": 64,
-        ///     "nPoles"       : 16
+        ///     "amplitude": 7.0,
+        ///     "slope"    : 1.0,
+        ///     "nPoles"   : 16
         ///   }
         ///
         /// Bias voltage noise (1/f common to all channels), scalar shorthand or object:
@@ -141,7 +140,8 @@ namespace nisp
         /// @endverbatim
         /// "exp" and "sin" also accept a single object instead of an array.
         ///
-        /// The detector geometry is not read here: nisp::SCA passes it with setGeometry().
+        /// The detector geometry and the channels are not read here: nisp::SCA passes them with
+        /// setGeometry() and setColPerChannel().
         /// @param cfg Configuration.
         /// @throws std::invalid_argument on a malformed or out-of-range value.
         void initialize(const phot2pix::PixelConfig& cfg);
@@ -154,6 +154,10 @@ namespace nisp
         /// @brief Set the physical detector and the placement of the matrix (default: 2048 × 2048,
         ///        origin (0, 0)). nisp::SCA sets it from its own configuration.
         void setGeometry(const Geometry& geometry) { m_geometry = geometry; }
+
+        /// @brief Set the columns per output channel. nisp::SCA sets it from its geometry.
+        /// @param columns Columns per channel, >= 1; checked against the detector by checkGeometry().
+        void setColPerChannel(size_t columns) { m_colPerChannel = columns; }
 
         /// @brief Check that a width × height matrix fits on the detector and that the channel
         ///        layout matches it (colPerChannel divides the detector width, nChannels agrees).
