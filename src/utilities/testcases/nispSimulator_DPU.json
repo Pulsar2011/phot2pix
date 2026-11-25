@@ -5,13 +5,10 @@
 
     "benchmark"    : 1,
 
-    "flux"         : {"file":"/Users/gillard/DATA/EUC_LE1_NISP-07814-1-C_20250513T173301.000000Z_01_02_01.00_wcs.fits", "hdu": "DET13.SCI"},
+    "flux"         : 10.0,
 
     "exposureMode" : "DPU",
-    "macc"         : [4, 16, 4],
-
-    "ipc"          : [0.0002,0.0058,0.0002,0.0045, 0.9779 , 0.0062,0.0002,0.0048,0.0002],
-    "crosstalk"    : [1, 0, 1,0, 0, 1, 0, 0, 0, 1, 0, 0, 1],
+    "macc"         : [15, 16, 11],
 
     "frame_time"   : 1.45408,
     "offset"       : 1024.0,
