@@ -25,7 +25,7 @@ The library is instrument-agnostic by design. The `src/nisp/` subdirectory provi
 ## Dependencies
 
 | Library | Version | Role | Notes |
-|---|---|---|
+|---|---|---|---|
 | [`DSTmath`]:https://gitlab.in2p3.fr/deepskyproject/deepskymath | v0.2.2 | RNG and math primitives | Required; part of the DeepSky toolkit |
 | [`DSTfits`]:https://gitlab.in2p3.fr/deepskyproject/dstfits |  v1.5.0 | FITS I/O (read/write) | Required; wraps `cfitsio` + `wcslib` + `Minuit2` — provided as submodules |
 | [`DSTcore`]:https://gitlab.in2p3.fr/deepskyproject/deepskysys | v2.0.0 | Command Line Tools Helpers | Required to build utilities |
