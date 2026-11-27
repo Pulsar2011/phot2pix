@@ -31,9 +31,9 @@ The library is instrument-agnostic by design. The `src/nisp/` subdirectory provi
 | [`DSTcore`]:https://gitlab.in2p3.fr/deepskyproject/deepskysys | Command Line Tools Helpers | Required to build utilities |
 | [`DSTutils`](https://gitlab.in2p3.fr/deepskyproject/deepskyutils) | *Optional* | Required for `kernelConvolution`. If not found, CMake fetches only the code needed for the convolution, instead of cloning the whole repository, which itself depends on [`DSTdisplay`](https://gitlab.in2p3.fr/deepskyproject/deepskydisplay). |
 | `nlohmann/json` | JSON parsing for `PixelConfig` | Fetched automatically if not found |
-| GoogleTest | Unit test runner | Git submodule; only needed when `-DBUILD_TESTING=ON` |
+| GoogleTest | Unit test runner | Git submodule; only needed when `-DBUILD_TESTS=ON` |
 
-C++ standard: **C++23**. CMake ≥ 3.20.
+C++ standard: **C++23**. CMake ≥ 3.24.
 
 ## Doxygen website:
  https://phot2pix-b41428.pages.in2p3.fr
@@ -53,33 +53,38 @@ The `--recurse-submodules` flag fetches the bundled GoogleTest submodule used by
 
 ## Building
 
-`phot2pix` requires the DeepSky toolkit libraries (`DSTmath`, `DSTfits`, and their transitive dependencies, both available on the [DeepSkyProject]:https://gitlab.in2p3.fr/deepskyproject git repositories). Point CMake to their install root with `DeepSkyROOT`, or let it inherit the `DeepSkyROOT` environment variable.
+`phot2pix` is built like the other DeepSky projects. The DeepSky libraries it needs (available on the [DeepSkyProject]:https://gitlab.in2p3.fr/deepskyproject git repositories) are only looked for in one install tree, `DeepSkyROOT`: the environment variable of that name, or the directory above the project when it is not set. CMake checks their version:
+
+| Library | Repository | Minimum version |
+|---|---|---|
+| `DSTmath` | deepskymath | 0.2.0 |
+| `DSTfits` (and `cfitsio`, `wcslib`, `Minuit2`, installed with it) | deepskyfits | 1.5.0 |
+| `DSTCore` | deepskysys | 2.0.1 — optional: without it, `nispSimulator` is not built |
+| `DSTools` headers | deepskyutilities | 2.2.0 — when no `DSTools` is installed, its three headers are downloaded instead |
+
+The minimum versions are the `<library>_MIN_VERSION` variables at the top of the *DeepSky libraries* section of `CMakeLists.txt`.
 
 ```bash
-# Configure (out-of-source build is enforced)
-cmake -B build \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_INSTALL_PREFIX=../install \
-      -DDeepSkyROOT=/path/to/deepsky/install
-
-# Build
-cmake --build build -j$(nproc)
-
-# Run the test suite
-ctest --test-dir build --output-on-failure
-
-# Install headers + shared libraries
-cmake --install build
+cmake --preset default                  # configure: Release build in build/
+cmake --build build -j                  # build
+ctest --preset default                  # run the test suite
+cmake --build build --target install    # install into DeepSkyROOT
 ```
+
+Other presets: `debug` (Debug build in `build-debug/`) and `asan` (Debug build with AddressSanitizer in `build-asan/`). Without the presets, `cmake -B build` gives the same Release build. In-source builds are refused; `cmake -P cmake/CleanInSourceBuild.cmake` removes what a former one left in the project directory.
+
+The version of phot2pix is the git tag `vX.Y.Z` (`git describe`). A clone without a tag builds unversioned libraries and installs no CMake package.
 
 ### CMake options
 
 | Option | Default | Description |
 |---|---|---|
-| `CMAKE_BUILD_TYPE` | `Release` | `Debug` enables AddressSanitizer; `Release`/`RelWithDebInfo` enable LTO |
-| `BUILD_TESTING` | `ON` | Build and register the GoogleTest suite |
-| `DeepSkyROOT` | `CMAKE_INSTALL_PREFIX` | Root of the DeepSky install tree |
-| `CMAKE_INSTALL_PREFIX` | `../install` | Where headers and `.dylib`/`.so` files are placed |
+| `CMAKE_BUILD_TYPE` | `Release` | `Release` enables LTO; `Debug` builds with `-O0 -g` |
+| `WITH_ASAN` | `OFF` | Build with AddressSanitizer (the `asan` preset) |
+| `BUILD_TESTS` | `ON` | Build and register the GoogleTest suite |
+| `CMAKE_INSTALL_PREFIX` | `DeepSkyROOT` | Where headers (`include/`), libraries (`lib/`) and `nispSimulator` (`exe/`) are installed |
+| `DSTools_REF` | `main` | Branch, tag or commit of deepskyutilities the `DSTools` headers are downloaded from |
+| `CI_CIWORKER` | `OFF` | Build for the GitLab CI runner |
 
 ### Using phot2pix in your own CMake project
 
@@ -426,9 +431,11 @@ The `nisp::SCA` can host a `persistence::scheduler` via `insertPersistenceModel(
 ## Running the tests
 
 ```bash
-cmake --build build --target all
-ctest --test-dir build --output-on-failure
+cmake --build build -j
+ctest --preset default
 ```
+
+The tests run from the build directory: the files they write (`test_data/`) stay there.
 
 Test sources live in `src/test/`:
 
@@ -448,6 +455,7 @@ Test sources live in `src/test/`:
 ```
 phot2pix/
 ├── CMakeLists.txt
+├── CMakePresets.json              ← default, debug and asan builds
 ├── src/
 │   ├── phot2pix/                  ← generic library (instrument-agnostic)
 │   │   ├── PixelConfig.h          ← typed key-value config bag
@@ -463,7 +471,9 @@ phot2pix/
 │   └── test/                      ← GoogleTest suite
 ├── googletest/                    ← git submodule
 └── cmake/
-    └── phot2pixConfig.cmake.in
+    ├── phot2pixConfig.cmake.in    ← CMake package (find_package(phot2pix))
+    ├── GetGitRevisionDescription.cmake(.in) ← version from the git tag
+    └── CleanInSourceBuild.cmake   ← removes what a former in-source build left
 ```
 
 ---

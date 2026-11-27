@@ -1,12 +1,33 @@
 @PACKAGE_INIT@
 
+# find_dependency() runs the config files of the dependencies in this scope, and those written by
+# configure_package_config_file() overwrite PACKAGE_PREFIX_DIR: keep our own copy, taken before any
+# find_dependency().
+set(_phot2pix_PREFIX "${PACKAGE_PREFIX_DIR}")
+
 include(CMakeFindDependencyMacro)
+
+# The DeepSky libraries phot2pix links PUBLIC, at least at the versions it was configured with
+find_dependency(DSTmath @DSTmath_MIN_VERSION@ HINTS "${_phot2pix_PREFIX}")
+find_dependency(DSTfits @DSTfits_MIN_VERSION@ HINTS "${_phot2pix_PREFIX}")
 
 # phot2pix::phot2pix links nlohmann_json::nlohmann_json PUBLIC (PixelConfig.h includes
 # <nlohmann/json.hpp>). When phot2pix fetched it at build time, it was installed under the
 # same prefix as phot2pix: search there too.
-find_dependency(nlohmann_json 3.10 PATHS "${PACKAGE_PREFIX_DIR}")
+find_dependency(nlohmann_json 3.10 PATHS "${_phot2pix_PREFIX}")
+
+# cfitsio, wcslib and Minuit2, installed beside DSTfits by deepskyfits: the DSTfits headers include theirs
+if(NOT TARGET DeepSky::externals)
+    get_filename_component(_phot2pix_DSTfits_PREFIX "${DSTfits_DIR}/../../.." ABSOLUTE)
+    add_library(DeepSky::externals INTERFACE IMPORTED)
+    set_target_properties(DeepSky::externals PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${_phot2pix_DSTfits_PREFIX}/include/cfitsio;${_phot2pix_DSTfits_PREFIX}/include/wcslib;${_phot2pix_DSTfits_PREFIX}/include/Minuit2"
+        INTERFACE_LINK_LIBRARIES      "${_phot2pix_DSTfits_PREFIX}/lib/libMinuit2${CMAKE_SHARED_LIBRARY_SUFFIX};${_phot2pix_DSTfits_PREFIX}/lib/libcfitsio.a;${_phot2pix_DSTfits_PREFIX}/lib/libwcs.a"
+    )
+    unset(_phot2pix_DSTfits_PREFIX)
+endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/phot2pixTargets.cmake")
+unset(_phot2pix_PREFIX)
 
 check_required_components(phot2pix)
