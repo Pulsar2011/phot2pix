@@ -113,7 +113,9 @@ namespace phot2pix
         std::string outputPath(const Exposure& e) const;
 
         /// @brief Simulate the exposures in array order.
-        /// @details simulate(flux, "exposureTime") for each, saved when it has an "output".
+        /// @details expose(flux, "exposureTime") for each, saved when it has an "output": the pixel
+        ///          response plus the charge deposits of the detector's source (cosmic rays, from the
+        ///          "cosmic" key, see DetectorSimulator::expose()).
         ///          Not virtual: DetectorSimulator is a template. A detector family adds its own run()
         ///          overload, which hides this one (nisp::ScenerySequencer::run(SCA&)).
         /// @tparam PixelT Pixel model of the detector.
@@ -126,7 +128,7 @@ namespace phot2pix
             for (const Exposure& e : m_exposures)
             {
                 const std::valarray<double> flux = detector.loadMap(e.cfg, "flux");   // later: + scene generators
-                _save(e, *detector.simulate(flux, e.cfg.getAsDouble("exposureTime")));
+                _save(e, *detector.expose(flux, e.cfg.getAsDouble("exposureTime")));
             }
         }
 

@@ -12,6 +12,7 @@
 
 #include "PixelSimulator.h"
 #include "Geometry.h"
+#include "ChargeDeposit.h"
 
 #include <algorithm>
 #include <memory>
@@ -25,6 +26,7 @@
 #endif
 #include <type_traits>
 #include <array>
+#include <future>       // std::async: the deposits of expose() are drawn while the pixels are simulated
 #include <stdexcept>
 #include <string>
 #include <thread>       // std::thread, hardware_concurrency()
@@ -146,6 +148,11 @@ namespace phot2pix
      *
      *          Parallelism is handled internally by simulate() via std::thread.
      *          Derived classes customise physics by overriding _engine(), not simulate().
+     *
+     *          simulate() is the response of independent pixels. expose() is simulate() plus the
+     *          charge that a source deposits over several pixels during the exposure (cosmic rays,
+     *          radioactivity): the source of _makeChargeDeposit(), configured by initialize() from the
+     *          "cosmic" key. Without that key, expose() and simulate() give the same image.
      * @tparam PixelT Pixel model, derived from pixsim.
      */
     template<typename PixelT = pixsim>
@@ -343,6 +350,128 @@ namespace phot2pix
             }
             return img;
         }
+
+        /// @brief Check that a window lies within the matrix and that flux has one value per window pixel.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if flux
+        ///         does not have the size of the window.
+        void _checkWindow(const std::valarray<double>& flux, size_t c0, size_t r0, size_t ncols, size_t nrows) const
+        {
+            if (r0 + nrows > m_height || c0 + ncols > m_width)
+                throw std::out_of_range("Simulation window exceeds detector boundaries.");
+            if (flux.size() != nrows * ncols)
+                throw std::invalid_argument("Flux size does not match window size (nrows*ncols).");
+        }
+
+        /// @brief Values of simulate(flux, exposureTime) before their conversion to the pixel type (ADU).
+        std::valarray<double> _simulateFrame(const std::valarray<double>& flux, double exposureTime) const
+        {
+            const size_t n        = m_pixels.size();
+            const size_t nThreads = m_nThreads;
+
+            std::valarray<double> frame(0.0, n);
+
+            if (nThreads > 1)
+                _dispatch_cpu(flux, exposureTime, frame, nThreads);
+            else
+                _engine(flux, exposureTime, 0, n, frame);
+
+            return frame;
+        }
+
+        /// @brief Values of the window simulate() before their conversion to the pixel type (ADU).
+        std::valarray<double> _simulateFrame(const std::valarray<double>& flux, double exposureTime,
+                                             size_t c0, size_t r0, size_t ncols, size_t nrows) const
+        {
+            _checkWindow(flux, c0, r0, ncols, nrows);
+
+            const size_t nThreads = std::min(m_nThreads, _computeThreadCount(nrows * ncols));
+            std::valarray<double> frame(0.0, nrows * ncols);
+
+            if (nThreads > 1)
+                _dispatch_cpu_window(flux, exposureTime, c0, r0, ncols, nrows, frame, nThreads);
+            else
+                _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame);
+
+            return frame;
+        }
+
+        /// @brief Values of simulate(flux, exposureTime, cfg) before their conversion to the pixel type (ADU).
+        std::valarray<double> _simulateFrame(const std::valarray<double>& flux, double exposureTime,
+                                             const PixelConfig& cfg) const
+        {
+            const size_t n        = m_pixels.size();
+            const size_t nThreads = m_nThreads;
+            std::valarray<double> frame(0.0, n);
+
+            if (nThreads > 1)
+                _dispatch_cpu_cfg(flux, exposureTime, frame, nThreads, cfg);
+            else
+                _engine(flux, exposureTime, 0, n, frame, cfg);
+
+            return frame;
+        }
+
+        /// @brief Values of the window simulate() with cfg before their conversion to the pixel type (ADU).
+        std::valarray<double> _simulateFrame(const std::valarray<double>& flux, double exposureTime,
+                                             size_t c0, size_t r0, size_t ncols, size_t nrows,
+                                             const PixelConfig& cfg) const
+        {
+            _checkWindow(flux, c0, r0, ncols, nrows);
+
+            const size_t nThreads = std::min(m_nThreads, _computeThreadCount(nrows * ncols));
+            std::valarray<double> frame(0.0, nrows * ncols);
+
+            if (nThreads > 1)
+                _dispatch_cpu_window_cfg(flux, exposureTime, c0, r0, ncols, nrows, frame, nThreads, cfg);
+            else
+                _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame, cfg);
+
+            return frame;
+        }
+
+        /// @brief Owner of the charge source: a copy of the detector gets a copy of the source (clone()),
+        ///        so that two detectors never share one random stream.
+        struct SourceSlot
+        {
+            std::shared_ptr<ChargeDeposit> source;   ///< Charge source; null: none
+
+            SourceSlot() = default;
+            SourceSlot(const SourceSlot& other) : source(other.source ? other.source->clone() : nullptr) {}
+            SourceSlot& operator=(const SourceSlot& other)
+            {
+                source = other.source ? other.source->clone() : nullptr;
+                return *this;
+            }
+            SourceSlot(SourceSlot&&) noexcept            = default;
+            SourceSlot& operator=(SourceSlot&&) noexcept = default;
+        };
+
+        /// Charge source of expose(): set by initialize() from "cosmic" (see _makeChargeDeposit()).
+        SourceSlot m_chargeDeposit;
+
+        /// @brief Deposits of the charge source during dt seconds, on the whole physical detector (e-).
+        /// @return The deposits; none without a configured source.
+        std::vector<Deposit> _drawDeposits(double dt) const
+        {
+            std::vector<Deposit> hits;
+            if (m_chargeDeposit.source && m_chargeDeposit.source->isConfigured())
+                m_chargeDeposit.source->generate(dt, *m_geometry, hits);
+            return hits;
+        }
+
+        /// @brief _drawDeposits() in its own thread, so that expose() draws the deposits while it simulates
+        ///        the pixels.
+        /// @details The source draws from its own random stream (ChargeDeposit::makeRng()), the pixels from
+        ///          the thread_local generator of DST::Math: the result does not depend on the order, and a
+        ///          seeded sequence stays reproducible. Without a configured source, no thread is started
+        ///          (std::launch::deferred: get() returns no deposit at once).
+        /// @return The deposits of dt seconds; get() rethrows an exception of the source.
+        std::future<std::vector<Deposit>> _drawDepositsAsync(double dt) const
+        {
+            const bool active = m_chargeDeposit.source && m_chargeDeposit.source->isConfigured();
+            return std::async(active ? std::launch::async : std::launch::deferred,
+                              [this, dt]() { return _drawDeposits(dt); });
+        }
 #pragma endregion
 
 // ── Protected: data, pixel write access, and virtual physics hook ──────────
@@ -400,6 +529,49 @@ namespace phot2pix
                 setInputCard({fitsKey, *value, comment});
             else if (!hasInputCard(fitsKey) && !m_pixels.empty())
                 setInputCard({fitsKey, static_cast<double>(get(m_pixels.front())), comment});
+        }
+
+        /// @brief Charge source of the detector, created by initialize() when cfg has a "cosmic" key.
+        /// @details The default is an unconfigured CosmicRay::CosmicDeposit, with a silicon sensitive layer
+        ///          (see CosmicDeposit.h). A detector family overrides this function to return its own
+        ///          source (another material, another model), or nullptr when expose() must add no deposit:
+        ///          an instrument that adds the deposits itself at each step of its readout (nisp::SCA), or
+        ///          an array that is not a detector (nisp::persistence::pixelArray).
+        /// @return The source, not configured yet; null: none.
+        virtual std::shared_ptr<ChargeDeposit> _makeChargeDeposit() const { return defaultChargeDeposit(); }
+
+        /// @brief Add the deposits that fall on a window of the matrix to the values of that window (e- → ADU).
+        /// @details Deposit::idx is a physical pixel, Y * width + X (see Geometry.h). A deposit on the window
+        ///          [c0, c0+ncols) × [r0, r0+nrows) of the matrix is divided by the gain of its pixel and added
+        ///          to frame; a deposit outside the window is ignored.
+        /// @param frame Values of the window (ADU), ncols × nrows, row-major.
+        /// @param hits  Deposits (e-).
+        /// @param c0    Matrix column of the first window pixel.
+        /// @param r0    Matrix row of the first window pixel.
+        /// @param ncols Window columns.
+        /// @param nrows Window rows.
+        void _addDeposits(std::valarray<double>& frame, const std::vector<Deposit>& hits,
+                          size_t c0, size_t r0, size_t ncols, size_t nrows) const
+        {
+            if (hits.empty())
+                return;
+
+            const size_t W      = m_geometry->width;   // Deposit::idx = Y * W + X on the physical detector
+            const auto [x0, y0] = getOrigin();         // placement of the matrix on the detector
+
+            for (const Deposit& d : hits)
+            {
+                const size_t X = d.idx % W, Y = d.idx / W;
+                if (X < x0 + c0 || X >= x0 + c0 + ncols || Y < y0 + r0 || Y >= y0 + r0 + nrows)
+                    continue;                                            // outside the window
+
+                const size_t col = X - x0, row = Y - y0;                 // matrix pixel
+                double gain = 1.0;
+                if constexpr (requires(const PixelT& px) { px.getGain(); })
+                    gain = m_pixels[row * m_width + col].getGain();
+
+                frame[(row - r0) * ncols + (col - c0)] += d.electrons / gain;   // e- → ADU
+            }
         }
 
         // Non-const pixel accessors — derived classes only.
@@ -777,6 +949,10 @@ namespace phot2pix
             return m_geometry->extract(*data, img->Size(1), img->Size(2), m_width, m_height, what);
         }
 
+        /// @brief Charge source of expose(), read only.
+        /// @return The source created and configured by initialize() from "cosmic"; null: none.
+        const ChargeDeposit* getChargeDeposit() const { return m_chargeDeposit.source.get(); }
+
         /// @brief Thread budget used by simulate().
         size_t getThreadCount() const { return m_nThreads; }
 
@@ -826,7 +1002,8 @@ namespace phot2pix
 
         /// @brief Set the geometry and the pixel parameters from a configuration.
         /// @details Known keys: "gain", "dark", "readNoise", "QE", "KTCnoise", "baseline", each read
-        ///          by loadMap():
+        ///          by loadMap(), and "cosmic", the charge source of expose() (see _makeChargeDeposit()
+        ///          and CosmicDeposit.h). The pixel keys are read as follows:
         ///          - a number is applied uniformly to all pixels;
         ///          - a FITS image is a per-pixel map, "<path>" or {"file": "<path>", "hdu": h}, h an
         ///            HDU index or an EXTNAME (default: 1, the primary HDU); loadImage() lists every
@@ -879,6 +1056,23 @@ namespace phot2pix
                 _recordInput(cfg, "KTCnoise",  "PIXKTC",  "[e-] Pixel kTC (reset) noise", [](const PixelT& px) { return px.getKTCnoise(); });
             if constexpr (requires(const PixelT& px) { px.getBaseline(); })
                 _recordInput(cfg, "baseline",  "PIXBASE", "[ADU] Pixel baseline",       [](const PixelT& px) { return px.getBaseline(); });
+
+            // Charge deposits of expose() (cosmic rays, radioactivity): the source of _makeChargeDeposit(),
+            // configured from "cosmic". Without the key, the current source is kept.
+            if (cfg.has("cosmic"))
+            {
+                std::shared_ptr<ChargeDeposit> source = m_chargeDeposit.source ? m_chargeDeposit.source
+                                                                               : _makeChargeDeposit();
+                if (source)
+                {
+                    source->configure(cfg);   // a bad "cosmic" throws and leaves the source unchanged
+                    m_chargeDeposit.source = std::move(source);
+
+                    if (m_chargeDeposit.source->isConfigured())
+                        for (const auto& card : m_chargeDeposit.source->inputCards())
+                            setInputCard(card);
+                }
+            }
         }
 
         /// @brief initialize() from a JSON file path.
@@ -1103,17 +1297,7 @@ namespace phot2pix
         /// @return Image of getWidth() × getHeight() pixels.
         std::shared_ptr<DSL::FITScube> simulate(const std::valarray<double>& flux, double exposureTime) const
         {
-            const size_t n        = m_pixels.size();
-            const size_t nThreads = m_nThreads;
-
-            std::valarray<double> frame(0.0, n);
-
-            if (nThreads > 1)
-                _dispatch_cpu(flux, exposureTime, frame, nThreads);
-            else
-                _engine(flux, exposureTime, 0, n, frame);
-
-            return _convertFrame(frame, m_width, m_height);
+            return _convertFrame(_simulateFrame(flux, exposureTime), m_width, m_height);
         }
 
         /// @brief Window: simulate only a sub-region of the matrix.
@@ -1136,21 +1320,7 @@ namespace phot2pix
                   const size_t&                        ncols,
                   const size_t&                        nrows) const
         {
-
-            if (r0 + nrows > m_height || c0 + ncols > m_width)
-                throw std::out_of_range("Simulation window exceeds detector boundaries.");
-            if (flux.size() != nrows * ncols)
-                throw std::invalid_argument("Flux size does not match window size (nrows*ncols).");
-
-            const size_t nThreads = std::min(m_nThreads, _computeThreadCount(nrows * ncols));
-            std::valarray<double> frame(0.0, nrows * ncols);
-
-            if (nThreads > 1)
-                _dispatch_cpu_window(flux, exposureTime, c0, r0, ncols, nrows, frame, nThreads);
-            else
-                _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame);
-
-            return _convertFrame(frame, ncols, nrows);
+            return _convertFrame(_simulateFrame(flux, exposureTime, c0, r0, ncols, nrows), ncols, nrows);
         }
 
         /// @brief Full matrix, with runtime parameters.
@@ -1164,16 +1334,7 @@ namespace phot2pix
                                                  double                        exposureTime,
                                                  const PixelConfig&            cfg) const
         {
-            const size_t n        = m_pixels.size();
-            const size_t nThreads = m_nThreads;
-            std::valarray<double> frame(0.0, n);
-
-            if (nThreads > 1)
-                _dispatch_cpu_cfg(flux, exposureTime, frame, nThreads, cfg);
-            else
-                _engine(flux, exposureTime, 0, n, frame, cfg);
-
-            return _convertFrame(frame, m_width, m_height);
+            return _convertFrame(_simulateFrame(flux, exposureTime, cfg), m_width, m_height);
         }
 
         /// @brief Window, with runtime parameters.
@@ -1195,19 +1356,115 @@ namespace phot2pix
                                                  const size_t&                 nrows,
                                                  const PixelConfig&            cfg) const
         {
-            if (r0 + nrows > m_height || c0 + ncols > m_width)
-                throw std::out_of_range("Simulation window exceeds detector boundaries.");
-            if (flux.size() != nrows * ncols)
-                throw std::invalid_argument("Flux size does not match window size (nrows*ncols).");
+            return _convertFrame(_simulateFrame(flux, exposureTime, c0, r0, ncols, nrows, cfg), ncols, nrows);
+        }
+#pragma endregion
 
-            const size_t nThreads = std::min(m_nThreads, _computeThreadCount(nrows * ncols));
-            std::valarray<double> frame(0.0, nrows * ncols);
+#pragma region - exposure: simulate() plus the charge deposits
+        // expose() draws the deposits of the charge source (cosmic rays, ...) for the exposure time in a
+        // thread of its own while it simulates the pixels, adds the deposits that fall on the matrix or
+        // the window, and converts the result to the pixel type. It is a single read: every deposit of
+        // exposureTime is in the image. Without a configured source, expose() and simulate() give the
+        // same image.
 
-            if (nThreads > 1)
-                _dispatch_cpu_window_cfg(flux, exposureTime, c0, r0, ncols, nrows, frame, nThreads, cfg);
-            else
-                _engine(flux, exposureTime, c0, r0, 0, nrows, ncols, frame, cfg);
+        /// @brief Full matrix, uniform flux, with the charge deposits.
+        /// @param flux         Photons/s/pixel.
+        /// @param exposureTime Exposure time (s).
+        /// @return Image of getWidth() × getHeight() pixels.
+        std::shared_ptr<DSL::FITScube> expose(double flux, double exposureTime) const
+        {
+            return expose(std::valarray<double>(flux, m_pixels.size()), exposureTime);
+        }
 
+        /// @brief Full matrix, flux of a double-precision FITS image, with the charge deposits.
+        /// @param flux         Photons/s/pixel, matrix-sized.
+        /// @param exposureTime Exposure time (s).
+        /// @return Image of getWidth() × getHeight() pixels.
+        std::shared_ptr<DSL::FITScube> expose(const std::shared_ptr<DSL::FITScube>& flux, double exposureTime) const
+        {
+            std::valarray<double> fluxArray(0.0, m_pixels.size());
+            fluxArray += *flux->GetData<double>();
+            return expose(fluxArray, exposureTime);
+        }
+
+        /// @brief Full matrix, per-pixel flux, with the charge deposits.
+        /// @param flux         Photons/s of every pixel, row-major.
+        /// @param exposureTime Exposure time (s).
+        /// @return Image of getWidth() × getHeight() pixels.
+        std::shared_ptr<DSL::FITScube> expose(const std::valarray<double>& flux, double exposureTime) const
+        {
+            std::future<std::vector<Deposit>> hits = _drawDepositsAsync(exposureTime);   // drawn meanwhile
+            std::valarray<double> frame = _simulateFrame(flux, exposureTime);
+            _addDeposits(frame, hits.get(), 0, 0, m_width, m_height);
+            return _convertFrame(frame, m_width, m_height);
+        }
+
+        /// @brief Window, with the charge deposits that fall on it.
+        /// @details The deposits are drawn on the whole physical detector, as for the full matrix; only
+        ///          those on the window are added.
+        /// @param flux         Photons/s of the window pixels (ncols × nrows, row-major).
+        /// @param exposureTime Exposure time (s).
+        /// @param c0           Matrix column of the first window pixel.
+        /// @param r0           Matrix row of the first window pixel.
+        /// @param ncols        Window columns.
+        /// @param nrows        Window rows.
+        /// @return Image of ncols × nrows pixels.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if flux
+        ///         does not have the size of the window.
+        std::shared_ptr<DSL::FITScube> expose(const std::valarray<double>& flux,
+                                               double                        exposureTime,
+                                               const size_t&                 c0,
+                                               const size_t&                 r0,
+                                               const size_t&                 ncols,
+                                               const size_t&                 nrows) const
+        {
+            _checkWindow(flux, c0, r0, ncols, nrows);
+
+            std::future<std::vector<Deposit>> hits = _drawDepositsAsync(exposureTime);   // drawn meanwhile
+            std::valarray<double> frame = _simulateFrame(flux, exposureTime, c0, r0, ncols, nrows);
+            _addDeposits(frame, hits.get(), c0, r0, ncols, nrows);
+            return _convertFrame(frame, ncols, nrows);
+        }
+
+        /// @brief Full matrix, with runtime parameters and the charge deposits.
+        /// @param flux         Photons/s of every pixel, row-major.
+        /// @param exposureTime Exposure time (s).
+        /// @param cfg          Runtime parameters (see simulate()).
+        /// @return Image of getWidth() × getHeight() pixels.
+        std::shared_ptr<DSL::FITScube> expose(const std::valarray<double>& flux,
+                                               double                        exposureTime,
+                                               const PixelConfig&            cfg) const
+        {
+            std::future<std::vector<Deposit>> hits = _drawDepositsAsync(exposureTime);   // drawn meanwhile
+            std::valarray<double> frame = _simulateFrame(flux, exposureTime, cfg);
+            _addDeposits(frame, hits.get(), 0, 0, m_width, m_height);
+            return _convertFrame(frame, m_width, m_height);
+        }
+
+        /// @brief Window, with runtime parameters and the charge deposits that fall on it.
+        /// @param flux         Photons/s of the window pixels (ncols × nrows, row-major).
+        /// @param exposureTime Exposure time (s).
+        /// @param c0           Matrix column of the first window pixel.
+        /// @param r0           Matrix row of the first window pixel.
+        /// @param ncols        Window columns.
+        /// @param nrows        Window rows.
+        /// @param cfg          Runtime parameters (see simulate()).
+        /// @return Image of ncols × nrows pixels.
+        /// @throws std::out_of_range if the window exceeds the matrix, std::invalid_argument if flux
+        ///         does not have the size of the window.
+        std::shared_ptr<DSL::FITScube> expose(const std::valarray<double>& flux,
+                                               double                        exposureTime,
+                                               const size_t&                 c0,
+                                               const size_t&                 r0,
+                                               const size_t&                 ncols,
+                                               const size_t&                 nrows,
+                                               const PixelConfig&            cfg) const
+        {
+            _checkWindow(flux, c0, r0, ncols, nrows);
+
+            std::future<std::vector<Deposit>> hits = _drawDepositsAsync(exposureTime);   // drawn meanwhile
+            std::valarray<double> frame = _simulateFrame(flux, exposureTime, c0, r0, ncols, nrows, cfg);
+            _addDeposits(frame, hits.get(), c0, r0, ncols, nrows);
             return _convertFrame(frame, ncols, nrows);
         }
 #pragma endregion

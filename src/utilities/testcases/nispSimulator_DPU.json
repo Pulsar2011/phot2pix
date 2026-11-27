@@ -8,7 +8,7 @@
     "flux"         : 10.0,
 
     "exposureMode" : "DPU",
-    "macc"         : [15, 16, 11],
+    "macc"         : [4, 16, 4],
 
     "frame_time"   : 1.45408,
     "offset"       : 1024.0,

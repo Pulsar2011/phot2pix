@@ -1477,6 +1477,32 @@ TEST(SCA, DpuDoesNotFlagAPlateauBelowTheAdcLimit)
     EXPECT_NEAR(planeStats(data, 0, kW * kH).first, expected, 0.01 * expected);
 }
 
+TEST(SCA, DpuFlagsAPixelSaturatedInAnyGroup)
+{
+    // As on the flight DPU, one raw read at 65535 flags the pixel: no slope is fitted, the slope
+    // plane is 65535 with no scale and no offset, the chi2 and error planes are 0.
+    // 3000 e- per frame, gain 1, baseline 1000 ADU, MACC(4, 4, 4): read r of group g at frame
+    // 8 g + r. Groups 0 to 2 stay below 61000 ADU, the last one reaches 76000, clamped to 65535.
+    // Fitting the 3 groups before it would give 24000 x 0.5 + 1024 = 13024.
+    PixelConfig cfg = makeWellCfg();
+    cfg.set("gain",         1.0);
+    cfg.set("readNoise",    0.0);
+    cfg.set("fullWell",     1.0e6);   // never reached: the ADC limit saturates
+    cfg.set("scale",        0.5);
+    cfg.set("offset",       1024.0);
+    cfg.set("exposureMode", std::string("DPU"));
+    nisp::SCA sca(kW, kH);
+    sca.initialize(cfg);
+
+    const auto   result = sca.expose(makeUniformFlux(kW, kH, 3000.0), nisp::macc{4, 4, 4});
+    const auto&  data   = uint16Data(result);
+    const size_t nPix   = kW * kH;
+    EXPECT_EQ(std::count(std::begin(data), std::begin(data) + nPix, uint16_t(65535)),
+              static_cast<std::ptrdiff_t>(nPix)) << "slope plane";
+    EXPECT_EQ(std::count(std::begin(data) + nPix, std::begin(data) + 3 * nPix, uint16_t(0)),
+              static_cast<std::ptrdiff_t>(2 * nPix)) << "chi2 and error planes";
+}
+
 TEST(SCA, FullFrameAndWindowReadTheSamePixels)
 {
     // Saturated pixels, no read noise: a read is exactly baseline + (full well + drift) / gain,

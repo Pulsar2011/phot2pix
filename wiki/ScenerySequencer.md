@@ -1,6 +1,6 @@
 # ScenerySequencer: sequences of exposures
 
-`phot2pix::ScenerySequencer` is the **Scene** layer of the [philosophy](Philosophy#1-separate-what-changes-for-different-reasons). It simulates a series of exposures on **one** detector, in time order. Because the same detector is used throughout, the effects that remember past exposures carry over from one exposure to the next: an exposure on a bright field leaves persistence in the darks that follow it.
+`phot2pix::ScenerySequencer` is the **Scene** layer of the [phot2pix](Philosophy#1-separate-what-changes-for-different-reasons) framework. It initiate a series of exposures on **one** detector, in time order. Because the same detector is used throughout, the effects that remember past exposures carry over from one exposure to the next: an exposure on a bright field leaves persistence in the darks that follow it.
 
 Today, the scene of each exposure is static: a flux image (a FITS file) or a uniform flux. The generators that will build the sky, spectra, transients and moving objects are still to be written ([§7](#7-todo-scene-generators)).
 
@@ -65,7 +65,7 @@ flowchart LR
 ```mermaid
 classDiagram
     ScenerySequencer <|-- NispScenerySequencer : nisp
-    ScenerySequencer ..> DetectorSimulator~PixelT~ : run() calls simulate()
+    ScenerySequencer ..> DetectorSimulator~PixelT~ : run() calls expose()
     NispScenerySequencer ..> SCA : run(sca) calls expose()
     NispScenerySequencer ..> readout : _checkExposure()
     SCA ..> readout : expose(flux, readout)
@@ -108,7 +108,7 @@ struct Exposure
 |---|---|---|
 | `virtual void initialize(const PixelConfig& cfg)` | Read the sequence. Override it to read keys of the whole sequence, calling the base first | Parses and checks the `flux` array |
 | `virtual void _checkExposure(const Exposure& e) const` | Check the keys of **one** exposure that belong to your family. Throw any `std::exception` when the entry cannot be simulated; the base class adds the entry number to the message | Requires `exposureTime` |
-| `run(YourDetector&) const` | The time loop: load the flux, call **your detector's** exposure function, save | `run(const DetectorSimulator<PixelT>&)` calls `simulate(flux, exposureTime)` |
+| `run(YourDetector&) const` | The time loop: load the flux, call **your detector's** exposure function, save | `run(const DetectorSimulator<PixelT>&)` calls `expose(flux, exposureTime)`, which adds the cosmic-ray hits of the `"cosmic"` key ([CosmicDeposit §6](CosmicDeposit#6-using-it-from-a-detector-family)) |
 | `_save(e, image)` | Add the sequence cards and write the output. Call it once per exposure | — |
 | `_checkInitialized()` | Throw `std::logic_error` if `initialize()` was not called. Call it first in `run()` | — |
 
@@ -116,7 +116,7 @@ struct Exposure
 
 - **`DetectorSimulator<PixelT>` is a template,** so the base `run()` has to be a member template, and a member template cannot be virtual.
 - **Each detector family adds its own `run()`** for its own detector class. That overload hides the base one, so `nispSequencer.run(sca)` can only reach `nisp::SCA::expose()`.
-- **The wrong call cannot happen silently.** `nisp::SCA` inherits `DetectorSimulator` privately, so an `SCA` cannot be passed to the base `run()`. Running it through `simulate()`, which skips the readout modes, persistence and the uint16 output, is a **compile error**, not a wrong result.
+- **The wrong call cannot happen silently.** `nisp::SCA` inherits `DetectorSimulator` privately, so an `SCA` cannot be passed to the base `run()`. Running it through `DetectorSimulator::expose()`, which skips the readout modes, persistence and the uint16 output, is a **compile error**, not a wrong result.
 
 The sequencer does not hold the detector: it is passed to `run()`. You can therefore run several sequences one after another on the same detector, which keeps its persistence history.
 
@@ -282,7 +282,7 @@ Guidelines:
 
 ### Example: a realistic NISP sequence
 
-A dark, then one dither of a Euclid-like observation: a spectroscopic exposure followed by the three photometric bands. Then darks follow, to watch the persistence of the field decay.
+An Euclid-like observation: a spectroscopic exposure followed by the three photometric bandsrepeated 4 times before a slew dark.
 
 ```json
 {
@@ -295,27 +295,54 @@ A dark, then one dither of a Euclid-like observation: a spectroscopic exposure f
     "persistence": {"traps": [{"f": 2.0e-6, "t": 500.0}, {"f": 2.78e-8, "t": 18000.0}], "dT": 60.0},
 
     "flux": [
-        {"flux": 0.0, "macc": [4, 16, 4], "output": "dark_before.fits"},
+        {"file": "scene_spectro_d1.fits", "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [15, 16, 11], "output": "spectro_d1.fits"},
+        {"flux": 1, "exposureMode": "MACC", "macc": [1, 1, 0]},  // exposure between two reset while detector is in IDLE to accumulate persistance signal while the wheel are moving
+        ...
+        {"flux": 1, "exposureMode": "MACC", "macc": [1, 1, 0]},// exposure between two reset while detector is in IDLE to accumulate persistance signal while the wheel are moving
+        {"file": "scene_Y_d1.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "Y_d1.fits"},
+        ...
+        {"file": "scene_J_d1.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "J_d1.fits"},
+        ...
+        {"file": "scene_H_d1.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "H_d1.fits"},
+        ...
 
-        {"file": "scene_spectro_d1.fits", "hdu": "DET13.SCI", "macc": [15, 16, 11], "output": "spectro_d1.fits"},
-        {"file": "scene_Y_d1.fits",       "hdu": "DET13.SCI", "macc": [4, 16, 4],   "output": "Y_d1.fits"},
-        {"file": "scene_J_d1.fits",       "hdu": "DET13.SCI", "macc": [4, 16, 4],   "output": "J_d1.fits"},
-        {"file": "scene_H_d1.fits",       "hdu": "DET13.SCI", "macc": [4, 16, 4],   "output": "H_d1.fits"},
+        {"file": "scene_spectro_d2.fits", "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [15, 16, 11], "output": "spectro_d2.fits"},
+        ...
+        {"file": "scene_Y_d2.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "Y_d2.fits"},
+        ...
+        {"file": "scene_J_d2.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "J_d2.fits"},
+        ...
+        {"file": "scene_H_d2.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "H_d2.fits"},
+        ...
 
-        {"flux": 0.0, "exposureMode": "MACC", "macc": [4, 16, 4], "output": "dark_after_1.fits"},
-        {"flux": 0.0, "exposureMode": "FLUX", "exposureTime": 500.0},
-        {"flux": 0.0, "exposureMode": "FLUX", "exposureTime": 500.0},
-        {"flux": 0.0, "exposureMode": "MACC", "macc": [4, 16, 4], "output": "dark_after_2.fits"}
+        {"file": "scene_spectro_d1.fits", "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [15, 16, 11], "output": "spectro_d3.fits"},
+        ...
+        {"file": "scene_Y_d3.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "Y_d3.fits"},
+        ...
+        {"file": "scene_J_d3.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "J_d3.fits"},
+        ...
+        {"file": "scene_H_d3.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "H_d3.fits"},
+        ...
+
+        {"file": "scene_spectro_d1.fits", "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [15, 16, 11], "output": "spectro_d4.fits"},
+        ...
+        {"file": "scene_Y_d3.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "Y_d4.fits"},
+        ...
+        {"file": "scene_J_d3.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "J_d4.fits"},
+        ...
+        {"file": "scene_H_d3.fits",       "hdu": "DET13.SCI", "exposureMode": "DPU", "macc": [4, 16, 4],   "output": "H_d4.fits"},
+        ...
+
+        {"flux": 0.0, "exposureMode": "MACC", "macc": [4, 16, 4], "output": "slew_dark.fits"},
     ]
 }
 ```
 
 - **Detector.** The top-level keys describe the detector: averaged NISP values, two persistence traps (500 s and 5 h), and 60 s between exposures (slew, filter change).
 - **Science exposures** are taken in the flight mode, `DPU` (the top-level `exposureMode`). The output is a cube of three planes: the slope image, as sent to the ground, its χ² and its error. The order of the bands is illustrative.
-- **Darks after the field** keep the full ramp (`MACC`), so the persistence released during each read can be seen.
-  - The two 500 s darks in the middle have no `output`. They only let the detector age, by 500 s each plus 60 s after each exposure.
-  - `dark_after_2.fits` therefore shows the persistence about 20 minutes after the field, when the 500 s trap has largely decayed and the 5 h trap has not.
+- **Slew dark** keep the full ramp (`MACC`), so the persistence released during each read can be seen.
 - **Flux images** (`scene_*.fits`: the sky with its PSF, and the dispersed image for the spectroscopic exposure) are computed upstream until the generators of [§7](#7-todo-scene-generators) exist.
+- While the NISP detector are IDLE (i.e. not exposing) the pixel are continuously reset every 1.45408 s. But pixels still collect photon and charge accumulated persistence signal. The `...` is the sery of `{"flux": 1, "exposureMode": "MACC", "macc": [1, 1, 0]}` exposure modeling the accumulation of persistence while the detector are IDLE. Such exposure design is needed if the persistence is activated and if the aim of the analyses is to the persistence. More realistic scenery exposure will rotate the field in front of the detector to mimic the effect of the nisp wheel rotation. Not the those exposur entry do not contins any output, so they are not saved, but they still fill the history of the detector.
 
 ---
 
@@ -363,14 +390,7 @@ The sequencer still needs generators that build the flux of each exposure, inste
 - [ ] **`transientGenerator`**: transient and variable sources (supernovae, variable stars) described by a light curve. Their flux changes during an exposure, so the affected window is re-simulated at a finer time step and composited into the full frame.
 - [ ] **`movingObjectGenerator`**: moving objects (asteroids, satellites) following a trajectory. The window follows the object at each time step, which produces a trail.
 - [ ] **Time window of each exposure**, needed by the transient and moving generators: its start time, its duration (from `exposureTime`, or `macc` × `frame_time` for NISP) and the delay before the next exposure. This also replaces the single persistence `dT` by a delay per exposure.
-- [ ] **Windowed exposures in the sequence**, so that a transient or moving object costs in proportion to its area, not the area of the detector. `DetectorSimulator::simulate()` and `SCA::expose()` already have windowed versions (`c0, r0, ncols, nrows`).
-
-Open questions before writing them:
-
-- How is the PSF represented: analytical or numerical, constant or varying over the field?
-- How are positions given: pixel coordinates, or sky coordinates through a WCS?
-- How is a trajectory parameterised: a linear trail or an ephemeris?
-- How is a light curve described: a table or a function?
+- [ ] **Windowed exposures in the sequence**, so that a transient or moving object costs in proportion to its area, not the area of the detector. `DetectorSimulator::expose()` and `SCA::expose()` already have windowed versions (`c0, r0, ncols, nrows`).
 
 ---
 

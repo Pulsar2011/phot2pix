@@ -23,6 +23,7 @@
 
 #include <phot2pix/phot2pix.h>
 #include <phot2pix/DetectorEffect.h>
+#include <phot2pix/CosmicDeposit.h>
 
 /// @namespace nisp
 /// @brief The Euclid NISP HAWAII-2RG detectors, built on the phot2pix core.
@@ -136,6 +137,12 @@ namespace nisp
                 /// @brief Set the captured fraction. @throws std::invalid_argument if it is not in [0, 1].
                 inline void setCapturedFraction(const double& fR) { setQuantumEfficiency(fR); }
 
+                /// @brief Gain of the pixel the traps belong to (e-/ADU), 1 by default: pixelresponse()
+                ///        returns the released charge divided by it.
+                using phot2pix::pixsim::getGain;
+                /// @brief Set the gain (e-/ADU). @throws std::invalid_argument if it is not valid.
+                using phot2pix::pixsim::setGain;
+
                 /// @brief Elapsed time since the last exposure (s).
                 inline double getTimeSinceLastExposure() const { return dT; }
                 /// @brief Add bydT seconds to the elapsed time since the last exposure.
@@ -144,7 +151,7 @@ namespace nisp
                 /// @brief Released charge, with the elapsed time of the pixel (getTimeSinceLastExposure()).
                 /// @param flux         Charge stored during the past exposure (e-).
                 /// @param exposureTime Duration of the step (s).
-                /// @return Charge released during the step (e-).
+                /// @return Charge released during the step (ADU: e- / getGain(); e- with the default gain 1).
                 double pixelresponse(const double& flux, const double& exposureTime) const override;
 
                 /// @brief Released charge, with the elapsed time "dT" of cfg.
@@ -155,7 +162,7 @@ namespace nisp
                 /// @param exposureTime Duration of the step (s).
                 /// @param cfg          Runtime parameters: "dT", time from the end of the past exposure to
                 ///                     the start of the step (s).
-                /// @return Charge released during the step (e-).
+                /// @return Charge released during the step (ADU: e- / getGain(); e- with the default gain 1).
                 double pixelresponse(const double& flux, const double& exposureTime, const phot2pix::PixelConfig& cfg) const override;
         };
 #pragma endregion
@@ -181,6 +188,11 @@ namespace nisp
                 /// @param cfg Configuration.
                 void initialize(const phot2pix::PixelConfig& cfg) override;
 
+                /// @brief Set the gain of every pixel (e-/ADU): the released charge is then in ADU.
+                /// @param gain One value per pixel, row-major.
+                /// @throws std::invalid_argument if gain has not one value per pixel, or a value is not valid.
+                void setGain(const std::valarray<double>& gain);
+
             protected:
                 /// @brief Full-array hook: charge released by the pixels [begin, end).
                 void _engine(const std::valarray<double>& flux,
@@ -194,6 +206,10 @@ namespace nisp
                              size_t row_begin, size_t row_end, size_t ncols,
                              std::valarray<double>& frame,
                              const phot2pix::PixelConfig& cfg) const override;
+
+                /// @brief No charge source: the array models the charge stored by past exposures, not a
+                ///        detector, so it never receives cosmic-ray hits (see DetectorSimulator::expose()).
+                std::shared_ptr<phot2pix::ChargeDeposit> _makeChargeDeposit() const override { return nullptr; }
         };
 #pragma endregion
 
@@ -217,6 +233,7 @@ namespace nisp
                 const phot2pix::PixelConfig& m_cfg;            ///< Configuration (not owned)
                 size_t                       m_threadCount{0}; ///< 0 = use pixelArray default
                 double                       m_delay{0.0};     ///< "dT": time between the end of an exposure and the start of the next (s)
+                std::valarray<double>        m_gain;           ///< Gain of every pixel (e-/ADU), given to the pixelArray; empty: 1
 
             public:
                 /// @brief Empty history.
@@ -241,6 +258,14 @@ namespace nisp
                     if (m_pixelModel) m_pixelModel->setThreadCount(n);
                 }
 
+                /// @brief Gain of every pixel (e-/ADU): computePersistenceSignal() then returns ADU.
+                /// @details Before the first insertCharges() call the gains are kept, and applied when the
+                ///          pixelArray is created.
+                /// @param gain One value per pixel, row-major; empty: 1 (released charge in e-).
+                /// @throws std::invalid_argument if the pixelArray exists and gain has not one value per pixel
+                ///         (nothing changed), or a value is not valid.
+                void setGain(const std::valarray<double>& gain);
+
                 /// @brief Store a new exposure.
                 /// @details The next exposure starts getDelay() later: every stored exposure, this one
                 ///          included, ages by that delay.
@@ -260,16 +285,36 @@ namespace nisp
                 /// @details Advances the clock of every past exposure by dT + exposureTime.
                 /// @param dT           Time from the end of the previous step to the start of this one (s).
                 /// @param exposureTime Duration of the step (s).
-                /// @return Released charge of every pixel (e-); nullptr without past exposure.
+                /// @return Released charge of every pixel (ADU with setGain(), e- otherwise); nullptr without past exposure.
                 std::shared_ptr<DSL::FITScube> computePersistenceSignal(const double& dT, const double& exposureTime);
                 /// @brief Same for the window [c0, c0+ncols) × [r0, r0+nrows).
-                /// @return Released charge of the window pixels (e-); nullptr without past exposure.
+                /// @return Released charge of the window pixels (ADU with setGain(), e- otherwise); nullptr without past exposure.
                 std::shared_ptr<DSL::FITScube> computePersistenceSignal(const double& dT, const double& exposureTime, const size_t& c0, const size_t& r0, const size_t& ncols, const size_t& nrows);
 
         };
 #pragma endregion
 
     } // namespace persistence
+#pragma endregion
+
+// ── Cosmic rays ───────────────────────────────────────────────────────────────
+#pragma region - cosmic rays
+    /// @brief Cosmic ray deposits in a NISP H2RG: the phot2pix model (phot2pix/CosmicDeposit.h) with a
+    ///        Hg(1-x)Cd(x)Te sensitive layer, x = cdFraction.
+    /// @details The material is not a configuration key: it is set here, for every NISP configuration.
+    ///          The other parameters and the spectrum come from the "cosmic" object.
+    class CosmicDeposit : public phot2pix::CosmicRay::CosmicDeposit
+    {
+    public:
+        /// @brief Cd fraction x of the sensitive layer.
+        static constexpr double cdFraction = 0.3;
+
+        /// @brief Not configured (see phot2pix::CosmicRay::CosmicDeposit), HgCdTe(cdFraction) material.
+        CosmicDeposit() { m_params.material = phot2pix::CosmicRay::target::material::HgCdTe(cdFraction); }
+
+        /// @brief Copy of this source with its dynamic type.
+        std::shared_ptr<phot2pix::ChargeDeposit> clone() const override { return std::make_shared<CosmicDeposit>(*this); }
+    };
 #pragma endregion
 
 // ── NISP SCA ──────────────────────────────────────────────────────────────────
@@ -308,6 +353,18 @@ namespace nisp
         phot2pix::PixelConvolution m_crosstalk;
         size_t                     m_crosstalkColumns = 0;   ///< Crosstalk: columns per output channel of the kernel
         std::vector<double>        m_crosstalkCouplings;     ///< Crosstalk: coupling at each distance in channels (1 at 0)
+
+        nisp::CosmicDeposit m_cosmicDeposit;   ///< Cosmic ray deposit model ("cosmic"), HgCdTe sensitive layer; empty: no deposit
+
+        /// @brief No charge source in DetectorSimulator: the SCA draws its cosmic rays itself
+        ///        (m_cosmicDeposit, HgCdTe) and adds them at each step of its readout (_addCosmicHits()),
+        ///        so the base initialize() leaves "cosmic" to SCA::initialize().
+        std::shared_ptr<phot2pix::ChargeDeposit> _makeChargeDeposit() const override { return nullptr; }
+
+        /// @brief Charge of the cosmic hits on the matrix during the current exposure (e-), for persistence.
+        /// @details Filled by _addCosmicHits() when persistence is modelled, cleared at the start of each
+        ///          exposure and added to the charge registered with insertCharges(); empty: no hit.
+        std::valarray<double> m_cosmicCharge;
 
         /// @brief Physical detector and placement of this matrix on it ("detectorSize",
         ///        "detectorOrigin", "refBorder"), held by the base class.
@@ -420,7 +477,7 @@ namespace nisp
                 }
         }
 
-        /// @brief Charge collected over exposureTime (ADU, double): pixel charge + persistence.
+        /// @brief Charge collected over exposureTime (ADU, double): pixel charge + cosmic hits (_addCosmicHits()) + persistence.
         /// @details The pixel charge is resetLevel() + integrate(), see the engines above. No read
         ///          noise and no 1/f noise: those belong to a read and are added by _read() /
         ///          _accumulate(), so they never accumulate along a ramp.
@@ -437,6 +494,21 @@ namespace nisp
                           const double& exposureTime,
                           std::shared_ptr<DSL::FITScube>& frame,
                           size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg = phot2pix::PixelConfig());
+
+        /// @brief Add the cosmic hits of a step (CosmicDeposit::generate()) to the charge of a window.
+        /// @details hit.idx is a physical pixel (Y * width + X). The hits inside the window
+        ///          [c0, c0+ncols) × [r0, r0+nrows) are added to frame, divided by the gain of their pixel
+        ///          (e- → ADU), reference pixels included. With persistence, every hit on the matrix is
+        ///          also added to m_cosmicCharge (e-), which the expose functions register with the charge
+        ///          of the flux: the hits leave persistence in the next exposures.
+        /// @param frame Charge of the window (ADU), ncols × nrows, row-major.
+        /// @param hits  Deposits of the step.
+        void _addCosmicHits(std::valarray<double>& frame, const std::vector<phot2pix::Deposit>& hits,
+                            size_t c0, size_t r0, size_t ncols, size_t nrows);
+
+        /// @brief Give the gains of the pixels to the persistence scheduler, so that the persistence
+        ///        signal added to the frames is in ADU. Nothing without a scheduler.
+        void _setPersistenceGain();
 
         /// @brief Read a full-frame charge map in place (ADU).
         /// @details The pixels are first coupled (_couplePixels(): IPC, crosstalk). Every pixel is then read
@@ -525,11 +597,11 @@ namespace nisp
                           const double& exposureTime);
 
         /// @brief DPU: ramp, reference pixel correction, then slope of every pixel (Ramp::getSlope()).
-        /// @details Only the groups before the first saturated read (65535) are fitted. The planes of
-        ///          the output are:
-        ///          - 0: slope per group interval, × scale + offset; 65535 with less than 2 good groups;
-        ///          - 1: chi2 (not reduced), 0 with 2 good groups or less;
-        ///          - 2: squared error of the slope, × 100 x scale + offset; 0 with less than 2 good groups.
+        /// @details As on the flight DPU, a pixel with a saturated read (65535 in the raw ramp) is not
+        ///          fitted. The planes of the output are:
+        ///          - 0: slope per group interval, × scale + offset; 65535 for a saturated pixel (no scale, no offset);
+        ///          - 1: chi2 (not reduced), 0 with 2 groups or for a saturated pixel;
+        ///          - 2: squared error of the slope, × 100 x scale + offset; 0 for a saturated pixel.
         /// @return uint16 cube of W × H × 3.
         /// @throws std::invalid_argument with less than 2 groups.
         std::shared_ptr<DSL::FITScube> expose_dpu(const std::valarray<double>& flux,
@@ -629,9 +701,10 @@ namespace nisp
         void initialize(const phot2pix::PixelConfig& cfg) override;
 
         /// @brief Replace the persistence scheduler, e.g. to share the history of another SCA.
-        /// @details Only used when persistence is enabled ("persistence" in the configuration).
+        /// @details Only used when persistence is enabled ("persistence" in the configuration). The
+        ///          scheduler takes the gains of this SCA (_setPersistenceGain()).
         void insertPersistenceModel(const std::shared_ptr<persistence::scheduler>& model)
-        { persistenceModelling = model; }
+        { persistenceModelling = model; _setPersistenceGain(); }
 
         /// @brief Set the non-linearity model applied at each read.
         /// @details Call it after initialize(), which sets the full wells and the parameters of the

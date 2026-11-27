@@ -116,7 +116,7 @@ namespace
 
     void initialize(PixelConvolution& c, const PixelConfig& cfg, size_t W, size_t H, const PixelConvolution::CubeLoader& loader = notCalled)
     {
-        c.initialize(cfg, phot2pix::Geometry(W, H), W, H, loader);
+        c.initialize(cfg, phot2pix::Geometry(W, H), W, H, loader, "ipc");
     }
 
     PixelConvolution staticConvolution(const PixelConfig& cfg, size_t W, size_t H)
@@ -342,12 +342,12 @@ TEST(PixelConvolution, DetectorSizedCubeIsCropped)
 
     const CubePtr cube = makeCube<float>(16, 12, 9, pixelKernel9);
     PixelConvolution c;
-    c.initialize(fileCfg(), geometry, 8, 6, [cube]() { return cube; });
+    c.initialize(fileCfg(), geometry, 8, 6, [cube]() { return cube; }, "ipc");
     expectDynamic(c, 8, 6, 9, [](size_t x, size_t y, size_t k) { return pixelKernel9(3 + x, 2 + y, k); });
 
     // A matrix-sized cube is used as is.
     const CubePtr matrix = makeCube<float>(8, 6, 9, pixelKernel9);
-    c.initialize(fileCfg(), geometry, 8, 6, [matrix]() { return matrix; });
+    c.initialize(fileCfg(), geometry, 8, 6, [matrix]() { return matrix; } ,"ipc");
     expectDynamic(c, 8, 6, 9, pixelKernel9);
 }
 

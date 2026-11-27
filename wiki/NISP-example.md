@@ -428,6 +428,7 @@ The `mode` bitmask selects the terms. `TOP` or `BOTTOM` alone replace the first 
 
 #### DPU: the onboard slope, per pixel
 
+The DPU starts from the MACC layers $`Y_i[\ell]`$. As on the flight DPU, a pixel with a saturated read (65535 in the raw reads $`Y_i[\ell]`$, any group) is flagged and not fitted (below). The reads of the other pixels are corrected for the reference pixels (`ALL`, previous paragraph) in double precision. With y(i) and ch(i) the line and channel of pixel *i*:
 The DPU starts from the MACC layers $Y_i[\ell]$. Let $n_{\mathrm{good}}$ be the number of groups before the first group that contains a saturated read (65535 in the raw reads $Y_i[\ell]$). The reads are corrected for the reference pixels (`ALL`, previous paragraph) in double precision. With y(i) and ch(i) the line and channel of pixel *i*:
 
 ```math
@@ -441,7 +442,7 @@ G_g = \frac{1}{n_r} \sum_{r=0}^{n_r-1} Y'_i[g\,n_r + r],
 \qquad
 d_g = G_{g+1} - G_g,
 \qquad
-g < n_{\mathrm{good}}
+g < n_g
 ```
 
 and the Kubik et al. (2016) estimator, with $\sigma_{\mathrm{DPU}}$ = `dpu_noise` (e⁻) and $g_{\mathrm{DPU}}$ = `dpu_gain` (e⁻ ADU⁻¹, the $f_e$ of the paper), is
@@ -457,14 +458,14 @@ and the Kubik et al. (2016) estimator, with $\sigma_{\mathrm{DPU}}$ = `dpu_noise
 ```
 
 ```math
-\bar F = \frac{1}{n_{\mathrm{good}} - 1} \sum_{g=0}^{n_{\mathrm{good}}-2} (d_g + \beta)^2,
+\bar F = \frac{1}{n_g - 1} \sum_{g=0}^{n_g-2} (d_g + \beta)^2,
 \qquad
 \hat F = \frac{\sqrt{1 + \gamma^2 \bar F} - 1}{\gamma} - \beta,
 \qquad
 Y_i =
 \begin{cases}
-\mathcal{Q}_{so}(\hat F) & n_{\mathrm{good}} \ge 2\\
-65535 & \text{otherwise}
+\mathcal{Q}_{so}(\hat F) & \text{no read of pixel } i \text{ at } 65535\\
+65535 & \text{otherwise (no scale, no offset)}
 \end{cases}
 ```
 
@@ -473,12 +474,12 @@ $\hat F$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated line
 ```math
 \hat F_x = \sqrt{\bar F} - \beta,
 \qquad
-\chi^2 = \gamma\,\Big[(n_{\mathrm{good}} - 1)\,\hat F_x - \big(G_{n_{\mathrm{good}}-1} - G_0\big)\Big],
+\chi^2 = \gamma\,\Big[(n_g - 1)\,\hat F_x - \big(G_{n_g-1} - G_0\big)\Big],
 \qquad
-\sigma_{\hat F}^2 = \frac{2\,(\hat F_x + \beta)^2}{(n_{\mathrm{good}} - 1)\,\big(1 + \gamma\,(\hat F_x + \beta)\big)}
+\sigma_{\hat F}^2 = \frac{2\,(\hat F_x + \beta)^2}{(n_g - 1)\,\big(1 + \gamma\,(\hat F_x + \beta)\big)}
 ```
 
-The output has three planes: $\mathcal{Q}_{so}(\hat F)$, $\mathcal{Q}(\chi^2)$ and $\mathcal{Q}_{so}(100\,\sigma_{\hat F}^2)$. With $n_{\mathrm{good}} = 2$ there is no degree of freedom and the χ² is 0; with $n_{\mathrm{good}} < 2$ the last two planes are 0.
+The output has three planes: $`\mathcal{Q}_{so}(\hat F)`$, $`\mathcal{Q}(\chi^2)`$ and $`\mathcal{Q}_{so}(100\,\sigma_{\hat F}^2)`$. With $`n_g = 2`$ there is no degree of freedom and the χ² is 0; for a saturated pixel the last two planes are 0.
 
 ### 3.3 The algorithm
 
@@ -543,7 +544,7 @@ flowchart TD
     REG --> DPUQ{"DPU?"}
     DPUQ -->|"no: MACC, UTR"| CUBE["uint16 cube<br/>$$W \times H \times n_g n_r$$"]
     DPUQ -->|"yes"| RPC["reference pixel correction, threaded<br/>$$c_y^{(\mathrm{ch})}[\ell]$$ of every read: medians of T, B, L, R<br/>the uint16 cube is not modified"]
-    RPC --> DPU["per pixel, threaded<br/>cut at the first saturated group, on the raw reads: $$n_{\mathrm{good}}$$<br/>subtract the correction in double: $$Y' = Y - c$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$, $$\chi^2$$, squared error<br/>output $$\mathcal{Q}_{so}(\hat F)$$, $$\mathcal{Q}(\chi^2)$$, $$\mathcal{Q}_{so}(100 \sigma_{\hat F}^2)$$"]
+    RPC --> DPU["per pixel, threaded<br/>a raw read at 65535: slope plane 65535, no fit<br/>subtract the correction in double: $$Y' = Y - c$$<br/>co-add the groups $$G_g$$<br/>Kubik slope $$\hat F$$, $$\chi^2$$, squared error<br/>output $$\mathcal{Q}_{so}(\hat F)$$, $$\mathcal{Q}(\chi^2)$$, $$\mathcal{Q}_{so}(100 \sigma_{\hat F}^2)$$"]
     DPU --> MAP["uint16 slope, chi2 and squared error planes<br/>$$W \times H \times 3$$"]
 ```
 
@@ -860,13 +861,13 @@ A single read after the whole exposure: reset level + integration over *t* + one
 
 The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::getReferencePixelCorrection(ramp)` then computes the reference pixel correction $c_y^{(\mathrm{ch})}$ of every read, with mode `ALL` ([§3.2](#reference-pixel-correction)). It uses the size, the border and the channels of the geometry. When the matrix is not the full detector there is no correction, and a warning is printed. The header keyword `REFCORR` records whether the correction was applied. Then, for each pixel (threaded, with no allocation per pixel):
 
-1. **Saturation:** the reads are copied group by group, up to the first group that contains a saturated read (65535). Only the groups before it are used. With fewer than 2 good groups, the pixel is set to 65535. As on the flight DPU, 65535 is the only test: a pixel whose full well is reached below the ADC limit is not flagged, and its plateau is fitted as signal.
+1. **Saturation:** as on the flight DPU, a pixel with a saturated read (65535 in the raw ramp, in any group) is not fitted. Its slope plane is 65535, with no scale and no offset, and its χ² and error planes are 0. 65535 is the only test: a pixel whose full well is reached below the ADC limit is not flagged, and its plateau is fitted as signal.
 2. **Reference pixel correction** (when on): while the reads are copied, the pixel's correction is subtracted in double. The `uint16` ramp itself is never modified, so nothing wraps around below 0, and the saturation test sees the raw reads.
 3. **Co-adding:** each group is averaged (`Ramp::coadd`).
 4. **Slope:** the Kubik et al. 2016 estimator (`Ramp::getSlope`) is applied, with σ = `dpu_noise` / `dpu_gain` (in ADU). It uses only the differences between groups, so the level left by the correction does not matter.
 5. **Output**, one plane each:
    - plane 0, `uint16(slope × scale + offset)`, the slope being in **ADU per group interval** ((nr+nd) frames);
-   - plane 1, `uint16(χ²)`, not reduced: n_good − 2 degrees of freedom, 0 with 2 good groups;
+   - plane 1, `uint16(χ²)`, not reduced: n_g − 2 degrees of freedom, 0 with 2 groups;
    - plane 2, `uint16(error² × 100 × scale + offset)`, the squared error (variance) of the slope, in **(ADU per group interval)²**. The factor 100 limits the precision lost when rounding to `uint16`: with `scale` = 1, the step is 0.01 ADU².
 
 The estimator is linear: with a non-linear response, the slope is that of the chord between the first and the last group, and the χ² grows with the curvature.
@@ -1117,7 +1118,7 @@ NISP_IPC_OUTPUT=images ./gTest_nispCrosstalk --gtest_filter='SCACrosstalk.*'
 
 - With MACC parameters, the UTR mode produces the same output as MACC, and the MACC output always writes `MODE = MACC`. The MACC `EXPTIME` counts the drops after the last group.
 - DPU:
-  - the planes hold integers, so the χ² (about n_good − 2 on average for a linear pixel) and the squared error × 100 × `scale` are rounded to 1;
+  - the planes hold integers, so the χ² (about n_g − 2 on average for a linear pixel) and the squared error × 100 × `scale` are rounded to 1;
   - no test runs the DPU at a gain other than 1;
   - `nispSimulator` writes the three HDUs only when `exposureMode` is written exactly `DPU`, and for a single exposure; otherwise the output is the three-plane cube.
 - The readout-noise model and the crosstalk read every channel in the same direction, and the readout noise has no row or frame overhead.

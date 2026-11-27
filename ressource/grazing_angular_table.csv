@@ -1,0 +1,7 @@
+# Zenith-angle intensity for the "table" angular model of CosmicDeposit: grazing directions only, 89 to 90 deg from the zenith
+# (f = 0 outside the table). On a horizontal sensor (tilt_deg 0) every particle crosses at 89-90 deg from the normal, mu <= 0.0175:
+# projected track >= (depth / pitch) / mu pixels, 32 pixels for depth 10 um and pitch 18 um. Geometric factor G = pi mu_max^2 = 9.6e-4 sr.
+# Use: "angular": {"model": "table", "file": "<this file>", "colTheta": "theta", "colIntensity": "intensity"}, "faces": "front".
+theta [deg],intensity
+89.0,1.0
+90.0,1.0

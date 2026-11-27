@@ -7,15 +7,24 @@
 // DetectorEffect.h
 //
 /// @file DetectorEffect.h
-/// @brief Effects that couple the pixels of a detector: phot2pix::PixelConvolution.
+/// @brief Detector effect not used by default in the DetectorSimulato.
 ///
-/// An effect is a member of the detector that uses it (see nisp::SCA), which decides when to apply
-/// it: it depends on the readout. Not included by phot2pix.h, because DSTmorpho.h brings
-/// `using namespace DSL` at global scope.
+/// An effect is a plain class that a detector owns as a data member (nisp::SCA holds m_ipc and
+/// m_crosstalk). The detector calls it where its own readout needs it (for SCA, during a read, see
+/// _couplePixels()). DetectorSimulator does not know about these effects and never applies them: where
+/// an effect belongs depends on the readout (ramp, CDS, single read).
+///
+/// The sources of charge over several pixels (Deposit, ChargeDeposit) are in ChargeDeposit.h, which
+/// this header includes: DetectorSimulator::expose() adds the deposits of its source.
+///
+/// This header is not included by phot2pix.h: DSTmorpho.h brings `using namespace DSL` at global
+/// scope, which the umbrella header would then impose on every user of the library. Include it
+/// where an effect is used.
 
 #ifndef P2P_DETECTOR_EFFECT_H
 #define P2P_DETECTOR_EFFECT_H
 
+#include "ChargeDeposit.h"
 #include "Geometry.h"
 #include "PixelConfig.h"
 
@@ -23,6 +32,10 @@
 #include <functional>
 #include <memory>
 #include <valarray>
+#include <atomic>
+#include <random>
+#include <cstdint>
+#include <vector>
 
 #include <DSTfits/FITSimg.h>
 #include <DSTools/DSTmorpho.h>
@@ -51,13 +64,13 @@ namespace phot2pix
         /// @brief Returns the FITS image of "ipc"; null when the key does not name a file.
         using CubeLoader = std::function<std::shared_ptr<DSL::FITScube>()>;
 
-        /// @brief Read the kernel from cfg "ipc". Nothing changes if the key is absent.
+        /// @brief Read the kernel from cfg "name". Nothing changes if the key is absent.
         /// @verbatim
-        ///   "ipc": [k0, k1, ...]                                → static kernel, square (n × n weights)
-        ///   "ipc": {"kernel": [...], "width": w, "height": h}   → static kernel, w columns × h rows
-        ///   "ipc": "<path>" [+ "ipc.hdu": h]                    → dynamic kernel, FITS cube
-        ///   "ipc": {"file": "<path>", "hdu": h}                 → dynamic kernel, FITS cube
-        ///   "ipc": []                                           → no IPC
+        ///   "<name>": [k0, k1, ...]                                → static kernel, square (n × n weights)
+        ///   "<name>": {"kernel": [...], "width": w, "height": h}   → static kernel, w columns × h rows
+        ///   "<name>": "<path>" [+ "<name>>.hdu": h]                → dynamic kernel, FITS cube
+        ///   "<name>": {"file": "<path>", "hdu": h}                 → dynamic kernel, FITS cube
+        ///   "<name>": []                                           → no kernel
         /// @endverbatim
         /// @details - Static: the weights are >= 0.
         ///          - Dynamic: cube of n + 1 layers, the n neighbours and the central pixel of a square
@@ -70,11 +83,11 @@ namespace phot2pix
         /// @param geometry Physical detector, and placement of the matrix on it.
         /// @param width    Matrix columns.
         /// @param height   Matrix rows.
-        /// @param loadCube Loads the FITS image of "ipc", e.g. with DetectorSimulator::loadImage(); only
-        ///                 called when "ipc" is not an array nor a {"kernel", …} object.
-        /// @throws std::invalid_argument if the kernel is not valid; the IPC is then unchanged.
+        /// @param loadCube Loads the FITS image of a kernel, e.g. with DetectorSimulator::loadImage(); only
+        ///                 called when kernel doesn't point to an array nor a {"kernel", …} object.
+        /// @throws std::invalid_argument if the kernel is not valid; the kernel is then unchanged.
         void initialize(const PixelConfig& cfg, const Geometry& geometry, size_t width, size_t height,
-                        const CubeLoader& loadCube);
+                        const CubeLoader& loadCube, const std::string& what = "PixelConvolution");
 
         /// @brief Set a static kernel, e.g. built by the detector from its own configuration.
         /// @details The kernel may be wider than the matrix. A null weight costs little (a comparison per pixel,
@@ -130,7 +143,6 @@ namespace phot2pix
         void _applyDynamic(std::valarray<double>& image, size_t c0, size_t r0, size_t ncols, size_t nrows, size_t nThreads) const;
     };
 #pragma endregion
-
 } // namespace phot2pix
 
 #endif // P2P_DETECTOR_EFFECT_H
