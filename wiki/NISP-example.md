@@ -8,7 +8,7 @@
 
 - NISP has 16 **Teledyne HAWAII-2RG** (H2RG) HgCdTe arrays. Each SCA (sensor chip assembly) is 2048 × 2048 pixels of 18 µm, including a 4-pixel border of reference pixels (2040 × 2040 sensitive). Reference pixels have no photodiode but are read like the others, so they record the drifts of the readout electronics.
 - An SCA is read **non-destructively**, one full frame every **1.45408 s**, through **32 output channels** of 64 columns each, read in parallel. One channel reads 2048 × 64 pixels per frame, one pixel every 11.1 µs.
-- Reads are taken in **MACC(ng, nr, nd)** mode: *ng* groups of *nr* consecutive reads, separated by *nd* dropped frames.
+- Reads are taken in _Mullti ACCumulated_ **MACC(ng, nr, nd)** mode: *ng* groups of *nr* consecutive reads, separated by *nd* dropped frames.
   - Photometry uses MACC(4,16,4) (87.2 s between the first and last group).
   - Spectroscopy uses MACC(15,16,11) (549.6 s).
 - The onboard **DPU** groups read into groups to compute a per group average before it fits a slope to the group averages ([Kubik et al. 2016, PASP 128, 104504](https://iopscience-iop-org.lama.univ-amu.fr/article/10.1088/1538-3873/128/968/104504)). Only that slope image is sent to the ground.
@@ -133,16 +133,16 @@ This section writes down what the code computes. Every ε is an independent draw
 
 | Symbol | Meaning | Unit | Config key |
 |---|---|---|---|
-| $`\phi`$ | Incident flux | ph s⁻¹ | input array |
-| $`\eta`$ | Quantum efficiency | — | `QE` |
-| $`D`$ | Dark current | e⁻ s⁻¹ | `dark` |
-| $`g`$ | Gain | e⁻ ADU⁻¹ | `gain` |
-| $`B`$ | Baseline | ADU | `baseline` |
-| $`\sigma_{\mathrm{kTC}}`$ | Reset (kTC) noise | e⁻ | `KTCnoise` |
-| $`\sigma_{\mathrm{RN}}`$ | Read noise | e⁻ | `readNoise` |
-| $`Q_{\mathrm{FW}}`$ | Full well | e⁻ | `fullWell` |
-| $`c_2, c_3`$ | Non-linearity (`polynomial`) | (e⁻)⁻¹, (e⁻)⁻² | `nl0`, `nl1` |
-| $`t_f`$ | Frame time | s | `frame_time` |
+| $\phi$ | Incident flux | ph s⁻¹ | input array |
+| $\eta$ | Quantum efficiency | — | `QE` |
+| $D$ | Dark current | e⁻ s⁻¹ | `dark` |
+| $g$ | Gain | e⁻ ADU⁻¹ | `gain` |
+| $B$ | Baseline | ADU | `baseline` |
+| $\sigma_{\mathrm{kTC}}$ | Reset (kTC) noise | e⁻ | `KTCnoise` |
+| $\sigma_{\mathrm{RN}}$ | Read noise | e⁻ | `readNoise` |
+| $Q_{\mathrm{FW}}$ | Full well | e⁻ | `fullWell` |
+| $c_2, c_3$ | Non-linearity (`polynomial`) | (e⁻)⁻¹, (e⁻)⁻² | `nl0`, `nl1` |
+| $t_f$ | Frame time | s | `frame_time` |
 
 **The three stages** (`phot2pix::pixsim`). Every stage returns ADU:
 
@@ -161,7 +161,7 @@ A read does not measure the mean signal $S$ of one integration, but the charge $
 ```math
 Q_k = R + \sum_{j=1}^{k} I(\Delta t_j)
 ```
-A single read after one integration of duration $t$ is $Q = R + I(t)$. $Q$ accumulates from one read to the next; the read noise of $`M(Q)`$ does not. In the NISP readout, the persistence is also added to $Q$ ([§4.8](#48-persistence)), and the full well and the non-linearity are applied to it at each read (below).
+A single read after one integration of duration $t$ is $Q = R + I(t)$. $Q$ accumulates from one read to the next; the read noise of $M(Q)$ does not. In the NISP readout, the persistence is also added to $Q$ ([§4.8](#48-persistence)), and the full well and the non-linearity are applied to it at each read (below).
 
 **Full well and non-linearity** (`nisp::pixel::read(charge, nl)`, used by every readout mode). The accumulated charge *Q* stays linear; each read converts it to electrons above the baseline, limits it to the full well, and applies the non-linear response *P* before the read noise:
 
@@ -194,13 +194,13 @@ y = M\big(R + I(T)\big) = B + \frac{S + \sqrt{S}\,\varepsilon_I + \sigma_{\mathr
 \mathrm{Var}(y) = \frac{S + \sigma_{\mathrm{kTC}}^2 + \sigma_{\mathrm{RN}}^2}{g^2}
 ```
 
-**A ramp** reads the pixel once per frame without resetting it. With $`S_f = (\eta\,\phi + D)\,t_f`$ the mean charge collected in one frame, the charge after frame *n* and the value of read *n* are
+**A ramp** reads the pixel once per frame without resetting it. With $S_f = (\eta\,\phi + D)\,t_f$ the mean charge collected in one frame, the charge after frame *n* and the value of read *n* are
 
 ```math
 Q_1 = R + I_1, \qquad Q_n = Q_{n-1} + I_n, \qquad y_n = M(Q_n) = Q_n + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_n
 ```
 
-where each $`I_n`$ is an independent draw of $`I(t_f)`$. The charge carries the memory of the ramp and the read noise does not. The statistics of the ramp follow:
+where each $I_n$ is an independent draw of $I(t_f)$. The charge carries the memory of the ramp and the read noise does not. The statistics of the ramp follow:
 
 ```math
 \langle y_n\rangle = B + n\,\frac{S_f}{g},
@@ -222,10 +222,10 @@ The last relation is the CDS: the reset level *R* and its kTC noise cancel. Thes
 
 ### 3.2 The full array
 
-Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}, Q_{\mathrm{FW},i}, c_{2,i}, c_{3,i}`$. Pixels remain independent, except through the terms that the SCA adds on top of the pixel model:
+Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}, Q_{\mathrm{FW},i}, c_{2,i}, c_{3,i}$. Pixels remain independent, except through the terms that the SCA adds on top of the pixel model:
 
-- the **inter-pixel capacitance** (IPC) and the **crosstalk** between output channels, which couple the pixels at each read and leave the charge unchanged. Both are a convolution of the image by a kernel (`phot2pix::PixelConvolution`): for the IPC, the kernel $`K`$ of the `ipc` key, the same for every pixel or one per pixel; for the crosstalk, a one-row kernel holding the couplings $`\kappa_d`$ at ± *d* channel widths, applied to the signal above the baseline and added to the image ([details](#inter-pixel-capacitance-and-crosstalk));
-- the **readout noise** $`\mathcal{R}`$, in electrons, added at each read: the 1/f noise of each output channel, modelled as a sum of $`n_p`$ AR(1) processes whose spectrum approximates PSD ∝ 1/ν^a, with amplitude *A* and slope *a* ([details](#1f-noise-of-channel-c)), the bias voltage noise shared by all channels and the pedestal drift of each channel;
+- the **inter-pixel capacitance** (IPC) and the **crosstalk** between output channels, which couple the pixels at each read and leave the charge unchanged. Both are a convolution of the image by a kernel (`phot2pix::PixelConvolution`): for the IPC, the kernel $K$ of the `ipc` key, the same for every pixel or one per pixel; for the crosstalk, a one-row kernel holding the couplings $\kappa_d$ at ± *d* channel widths, applied to the signal above the baseline and added to the image ([details](#inter-pixel-capacitance-and-crosstalk));
+- the **readout noise** $\mathcal{R}$, in electrons, added at each read: the 1/f noise of each output channel, modelled as a sum of $n_p$ AR(1) processes whose spectrum approximates PSD ∝ 1/ν^a, with amplitude *A* and slope *a* ([details](#1f-noise-of-channel-c)), the bias voltage noise shared by all channels and the pedestal drift of each channel;
 - the **persistence** *P*, which depends on the previous exposures and is added to the charge.
 
 A quantiser then converts each value to `uint16`:
@@ -246,7 +246,7 @@ An exposure is simulated as a sequence of charge steps $m = 1 … M$ of duration
 n_\ell = g\,(n_r + n_d) + r + 1
 ```
 
-that is, n_ℓ·t_f after the reset. UTR is MACC(N, 1, 0).
+that is, $n_\ell\times t_f$ after the reset. A Up The Ramp acquisition (UTR) is obtained with a multi accumulated MACC(N, 1, 0).
 
 #### Charge
 
@@ -254,21 +254,21 @@ that is, n_ℓ·t_f after the reset. UTR is MACC(N, 1, 0).
 Q_i[m] = R_i + \sum_{m'=1}^{m} \Big( I_i(\Delta t_{m'}) + P_i[m'] \Big)
 ```
 
-$`R_i`$ is drawn at the first step only; the later steps are run with `baseline = "off"`.
+$R_i$ is drawn at the first step only; the later steps are run with `baseline = "off"`.
 
 #### Inter-pixel capacitance and crosstalk
 
-Both act on the signal at each read, in every readout mode, and never on the charge *Q* that the pixels hold. They are off by default.
+Both act on the signal at each read, in every readout mode, and never on the charge *Q* that the pixels hold. They are off by default and are activated once configureation parameter are found in the config file.
 
-The **inter-pixel capacitance** shares the signal of a pixel with its neighbours. $`K_j(\delta)`$ is the fraction of the signal of pixel *j* that appears at the position j + δ, with $`\sum_\delta K_j(\delta) = 1`$. The kernel is either the same for every pixel or one per pixel:
+The **inter-pixel capacitance** shares the signal of a pixel with its neighbours. $K_j(\delta)$ is the fraction of the signal of pixel *j* that appears at the position j + δ, with $\sum_\delta K_j(\delta) = 1$. The kernel is either the same for every pixel or one per pixel:
 
 ```math
 V_i = \sum_\delta K_{i-\delta}(\delta)\; Q_{i-\delta}
 ```
 
-Each neighbour gives its signal with **its own** kernel. A pixel at the border of the image misses neighbours: its sum is divided by the sum of the weights it has, so that the level of a uniform baseline is kept.
+Each neighbour gives its signal with **its own** kernel. A pixel at the border of the image misses neighbours: its sum is divided by the sum of the weights it has, so that the level of a uniform baseline is kept. IPC is applyed to the matrix through convolution kernel.
 
-The **crosstalk** adds, to the pixels read at the same time in the other channels, a fraction $`\kappa_d`$ of the signal above the baseline that a pixel outputs. These pixels are on the same row, a multiple of the channel width *w* away, since every channel is read in the same direction. *d* is the distance between the channels:
+The **crosstalk** adds, to the pixels read at the same time in the other channels, a fraction $\kappa_d$ of the signal above the baseline that a pixel outputs. These pixels are on the same row, a multiple of the channel width $w$ away, since every channel is read in the same direction. $d$ is the distance between the channels:
 
 ```math
 \tilde Q_i = V_i + \sum_{d \ge 1} \kappa_d\,\big(s_{i - d\,w} + s_{i + d\,w}\big),
@@ -276,9 +276,9 @@ The **crosstalk** adds, to the pixels read at the same time in the other channel
 s_j = \frac{P_j\big(\min(g_j\,(V_j - B_j),\ Q_{\mathrm{FW},j})\big)}{g_j}
 ```
 
-The source keeps its own signal (no loss), and a saturated pixel cannot give more than its full well. $`P_j`$ is the non-linear response of §3.1, not the persistence. Positions outside the image give nothing.
+The source keeps its own signal (no loss), and a saturated pixel cannot give more than its full well. $P_j$ is the non-linear response of §3.1, not the persistence. Positions outside the image give nothing.
 
-The read is then that of the coupled signal: **everywhere below, $`M_i(Q_i)`$ stands for $`M_i(\tilde Q_i)`$.**
+The read is then that of the coupled signal: **everywhere below, $M_i(Q_i)$ stands for $M_i(\tilde Q_i)$.**
 
 #### MACC and UTR: one layer of the output cube
 
@@ -286,23 +286,23 @@ The read is then that of the coupled signal: **everywhere below, $`M_i(Q_i)`$ st
 Y_i[\ell] = \mathcal{Q}\Big( M_i\big(Q_i[m_\ell]\big) + \frac{\mathcal{R}_i[n_\ell]}{g_i} \Big)
 ```
 
-where $`M_i`$ is the read of §3.1 (full well, non-linearity, read noise) and $`m_\ell`$ is the step that ends at frame $`n_\ell`$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
+where $M_i$ is the read of §3.1 (full well, non-linearity, read noise) and $m_\ell$ is the step that ends at frame $n_\ell$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
 
 #### Physical detector and placement of the matrix
 
-The readout noise, the crosstalk and the reference pixels are defined on the **physical detector** (`nisp::Geometry`), not on the simulated matrix: $`W_d \times H_d`$ = 2048 × 2048 pixels (`detectorSize`), a border of b = 4 reference pixels (`refBorder`), and $`W_d / w`$ = 32 channels (`nChannels`) of w = 64 columns (`colPerChannel`), channel *c* covering the physical columns [c·w, (c+1)·w). The W × H matrix is a part of that detector, placed at (x₀, y₀) (`detectorOrigin`, [0, 0] by default: the first matrix pixel is the first detector pixel):
+The readout noise, the crosstalk and the reference pixels are defined on the **physical detector** (`nisp::Geometry`), not on the simulated matrix: $W_d \times H_d$ = 2048 × 2048 pixels (`detectorSize`), a border of b = 4 reference pixels (`refBorder`), and $W_d / w$ = 32 channels (`nChannels`) of w = 64 columns (`colPerChannel`), channel *c* covering the physical columns [c·w, (c+1)·w). The W × H matrix is a part of that detector, placed at (x₀, y₀) (`detectorOrigin`, [0, 0] by default: the first matrix pixel is the first detector pixel):
 
 ```math
 X_i = x_0 + x, \qquad Y_i = y_0 + y
 ```
 
-Pixel *i* belongs to channel $`c(i) = \lfloor X_i / w \rfloor`$, and is a reference pixel when $`X_i`$ or $`Y_i`$ is within *b* of the detector edge. A 2048 × 2048 matrix is the full detector, a 2040 × 2040 one at [4, 4] its active area, a 2044-wide one at x₀ = 2 keeps 2 reference columns on each side, and a 256-wide one at x₀ = 896 covers the channels 14 to 17. At the default origin, a small matrix has the 4 reference columns on its left and the 4 reference rows at its bottom. A matrix that does not fit on the detector throws at `initialize()`. Since everything is derived from physical coordinates, a smaller matrix has the same channels, timing and noise spectrum as the corresponding part of the full detector: it is only cheaper.
+Pixel $i$ belongs to channel $c(i) = \lfloor X_i / w \rfloor$, and is a reference pixel when $X_i$ or $Y_i$ is within $b$ of the detector edge. A 2048 × 2048 matrix is the full detector, a 2040 × 2040 one at [4, 4] its active area. a 2044-wide detector starting at $x_0 = 2$ keeps 2 reference columns on each side, and a 256-wide detector starting at $x_0 =  896$ covers the channels 14 to 17. At the default origin, a small matrix has the 4 reference columns on its left and the 4 reference rows at its bottom. A matrix that does not fit on the detector throws at `initialize()`. Since everything is derived from physical coordinates, a smaller matrix has the same channels, timing and noise spectrum as the corresponding part of the full detector: it is only cheaper.
 
-The geometry also maps the per-pixel inputs onto the matrix (`phot2pix::Geometry`): a FITS map (`gain`, `dark`, `readNoise`, `QE`, `KTCnoise`, `baseline`) is either W × H, used as is, or $`W_d \times H_d`$, in which case the section [x₀, x₀ + W) × [y₀, y₀ + H) is used. Any other size throws at `initialize()`. A full-detector calibration map can therefore be used to simulate any part of the detector.
+The geometry also maps the per-pixel inputs onto the matrix (`phot2pix::Geometry`): a FITS map (`gain`, `dark`, `readNoise`, `QE`, `KTCnoise`, `baseline`) is either $W \times H$, used as is, or $W_d \times H_d$, in which case the section [x₀, x₀ + W) × [y₀, y₀ + H) is used. Any other size throws at `initialize()`. A full-detector calibration map can therefore be used to simulate any part of the detector.
 
 #### Readout noise
 
-All channels are read in parallel, row by row, with no row or frame overhead. Within a frame, pixel *i* is read at pixel-clock sample $`t_i = Y_i\,w + (X_i - c(i)\,w)`$ of its channel, one frame being $`L = H_d\,w`$ samples (one sample every $`t_f / L`$ = 11.1 µs). The readout noise of pixel *i* in frame *n* is the sum of three components, in electrons:
+All channels are read in parallel, row by row, with no row or frame overhead. Within a frame, pixel *i* is read at pixel-clock sample $t_i = Y_i\,w + (X_i - c(i)\,w)$ of its channel, one frame being $L = H_d\,w$ samples (one sample every $t_f / L$ = 11.1 µs). The readout noise of pixel *i* in frame *n* is the sum of three components, in electrons:
 
 ```math
 \mathcal{R}_i[n] =
@@ -313,11 +313,11 @@ All channels are read in parallel, row by row, with no row or frame overhead. Wi
 t_{n,Y} = \Big(n - 1 + \frac{Y + \frac12}{H_d}\Big)\,t_f
 ```
 
-$`t_{n,Y}`$ is the time since the reset at which physical row *Y* of frame *n* is read. Every component is off by default.
+$t_{n,Y}$ is the time since the reset at which physical row *Y* of frame *n* is read. Every component is off by default.
 
 #### 1/f noise of channel *c*
 
-The noise of channel *c* is a single time series over the whole ramp, a sum of n_p AR(1) processes:
+The noise of channel *c* is a single time series over the whole ramp, a sum of $n_p AR(1)$ processes:
 
 ```math
 \mathcal{N}_c[t] = A \sum_{p=0}^{n_p-1} z_{c,p}[t],
@@ -339,7 +339,7 @@ V_p = \frac{\sigma_p^2}{1 - \rho_p^2} \propto \nu_p^{\,1-a},
 \sum_p V_p = 1
 ```
 
-The corner frequencies ν_p are in cycles per pixel-clock sample and log-spaced (ν_0 = ν_min when n_p = 1). *A* is `amplitude` and *a* is `slope`. Each pole carries the variance $`V_p`$ that a spectrum ∝ 1/ν^a holds in its log step of frequency, so together the poles approximate that spectrum, with a stationary variance A². The processes start from their stationary state, since the amplifier does not reset with the pixels. The AR(1) processes of different channels are driven by independent draws, so channels are uncorrelated. [§4.7](#47-readout-noise) explains how to choose *A*, *a* and n_p.
+The corner frequencies ν_p are in cycles per pixel-clock sample and log-spaced (ν_0 = ν_min when n_p = 1). *A* is `amplitude` and *a* is `slope`. Each pole carries the variance $V_p$ that a spectrum ∝ 1/ν^a holds in its log step of frequency, so together the poles approximate that spectrum, with a stationary variance A². The processes start from their stationary state, since the amplifier does not reset with the pixels. The AR(1) processes of different channels are driven by independent draws, so channels are uncorrelated. [§4.7](#47-readout-noise) explains how to choose *A*, *a* and n_p.
 
 Only the samples of the matrix are generated: the samples of the rows and columns outside it are skipped exactly, since an AR(1) process advances over *n* samples in one step,
 
@@ -349,35 +349,37 @@ z[t + n] = \rho^n\, z[t] + \sigma \sqrt{\frac{1 - \rho^{2n}}{1 - \rho^2}}\;\vare
 
 so the cost scales with W × H.
 
+$1/f$ **noise is disabled by default and is activated only if its parametrisations is present in the configuration file.**
+
 #### Bias voltage noise
 
-$`\mathcal{C}`$ is one series built like $`\mathcal{N}_c`$ (amplitude, slope and poles of `bias_voltage_noise`), but **shared by every channel**: it is indexed by the same pixel-clock sample $`t_i`$ in every channel. The pixels read at the same instant in all channels get the same value: this is the horizontal banding across the full width, repeating every 64 columns, that the left/right reference columns measure.
+$\mathcal{C}$ is one series built like $\mathcal{N}_c$ (amplitude, slope and poles of `bias_voltage_noise`), but **shared by every channel**: it is indexed by the same pixel-clock sample $t_i$ in every channel. The pixels read at the same instant in all channels get the same value: this is the horizontal banding across the full width, repeating every 64 columns, that the left/right reference columns measure. **Bias voltage is disable by default and is activated only if its parametrisations is present in the configuration file.**
 
 #### Pedestal drift
 
-Each channel is offset by the same amount over all its pixels: a mean drift *f*, common to all channels and evaluated at the read time of each row, plus $`\sigma_P\,\varepsilon_{c,n}`$, one independent draw per channel and per frame (read or dropped). The top/bottom reference rows of a channel measure it.
+Each channel is offset by the same amount over all its pixels: a mean drift *f*, common to all channels and evaluated at the read time of each row, plus $\sigma_P\,\varepsilon_{c,n}$, one independent draw per channel and per frame (read or dropped). The top/bottom reference rows of a channel measure it.
 
 ```math
 f(t) = \sum_k a_k\,t^k + \sum_j A_j\,e^{-t/\tau_j} + \sum_m B_m \sin\!\Big(\frac{2\pi t}{P_m} + \varphi_m\Big)
 ```
 
-$`t_0`$ places the exposure in time (for example after a power-on or a mode change). A constant offset belongs to the `baseline` map instead: it is drawn at the reset and cancels in every difference, whereas the pedestal drift changes from one read to the next.
+$t_0$ places the exposure in time (for example after a power-on or a mode change). A constant offset belongs to the `baseline` map instead: it is drawn at the reset and cancels in every difference, whereas the pedestal drift changes from one read to the next. **Pedestal drift is by default disable and is activated only if its parametrisations is present in the configuration file.**
 
 #### Persistence
 
-Each past exposure *j* leaves a stored charge $`E_i^{(j)} = \eta_i\,\phi_i^{(j)}\,T^{(j)}`$, in electrons, where $`T^{(j)}`$ is the integration time registered for that exposure (see [§10](#10-known-limitations) for MACC). Trap *k* releases it at the rate $`E\,f_k\,e^{-t/\tau_k}`$, *t* being the time since the end of exposure *j*. The charge released during step *m*, which starts $`\Delta_j[m]`$ after the end of exposure *j* and lasts $`\Delta t_m`$, is the integral of that rate over the step:
+Each past exposure $j$ leaves a stored charge $E_i^{(j)} = \eta_i\,\phi_i^{(j)}\,T^{(j)}$, in electrons, where $T^{(j)}$ is the integration time registered for that exposure (see [§10](#10-known-limitations) for MACC). Trap $\kappa$ releases its charge at the rate $E\,f_\kappa\,e^{-t/\tau_k}$, $t$ being the time since the end of exposure $j$. The charge released during step $m$, which starts $\Delta_j[m]$ after the end of exposure $j$ and lasts $\Delta t_m$, is the integral of that rate over the step interval:
 
 ```math
-P_i[m] = \sum_j E_i^{(j)} \sum_k f_k\,\tau_k\, e^{-\Delta_j[m]/\tau_k} \left( 1 - e^{-\Delta t_m/\tau_k} \right),
+P_i[m] = \sum_j E_i^{(j)} \sum_k f_\kappa\,\tau_\kappa\, e^{-\Delta_j[m]/\tau_\kappa} \left( 1 - e^{-\Delta t_m/\tau_\kappa} \right),
 \qquad
 \Delta_j[m] = \sum_{m' < m} \Delta t_{m'} + n_j\,\delta
 ```
 
-$`f_k`$ is therefore a release rate (s⁻¹) per stored electron, and $`f_k\,\tau_k`$ the fraction of the stored charge that trap *k* releases in total ([§4.8](#48-persistence)); consecutive steps add up to the release over their total duration. The elapsed time $`\Delta_j[m]`$ counts the simulated steps since exposure *j*, plus the delay δ = `dT` between two exposures, once for each of the $`n_j`$ exposures that have ended since *j* (exposure *j* included). $`P_i[m]`$ is added to the charge as it is, without conversion by $`g_i`$. $`E_i^{(j)}`$ is not limited by the full well ([§10](#10-known-limitations)).
+$f_\kappa$ is therefore a release rate (s⁻¹) per stored electron, and $f_\kappa\,\tau_\kappa$ the fraction of the stored charge that trap $\kappa$ releases in total ([§4.8](#48-persistence)); consecutive steps add up to the release over their total duration. The elapsed time $\Delta_j[m]$ counts the simulated steps since exposure $j$, plus the delay $\delta = $`dT` between two exposures, once for each of the $n_j$ exposures that have ended since $j$ (exposure $j$ included). $P_i[m]$ is added to the charge as it is, without conversion by $g_i$. $E_i^{(j)}$ is not limited by the full well ([§10](#10-known-limitations)).
 
 #### FLUX and CDS
 
-Both modes read the array once or twice. Each read draws a new, independent readout-noise realisation whose AR(1) processes start from their stationary state ($`\mathcal{R}`$ and $`\mathcal{R}'`$ below). The pedestal drift is evaluated at the frame of the read: the last frame for FLUX, frames 1 and N for CDS.
+Both modes read the array once or twice. Each read draws a new, independent readout-noise realisation whose AR(1) processes start from their stationary state ($\mathcal{R}$ and $\mathcal{R}'$ below). The pedestal drift is evaluated at the frame of the read: the last frame for FLUX, frames 1 and N for CDS.
 
 ```math
 \text{FLUX:}\qquad Y_i = \mathcal{Q}_{so}\Big( M_i\big(R_i + I_i(T') + P_i[1]\big) + \frac{\mathcal{R}_i[N]}{g_i} \Big),
@@ -393,15 +395,15 @@ Y_i &= \mathcal{Q}_{so}\Big( \Big[M_i(Q_i^{(N)}) + \frac{\mathcal{R}'_i[N]}{g_i}
 \end{aligned}
 ```
 
-In CDS, the pedestal drift leaves $`f(t_0 + t_{N,Y}) - f(t_0 + t_{1,Y})`$.
+In CDS, the pedestal drift leaves $f(t_0 + t_{N,Y}) - f(t_0 + t_{1,Y})$.
 
-$`M_i`$ is the read of §3.1 with the parameters of pixel *i*. Each call draws a new ε. The windowed single read `expose(flux, t, c0, r0, nc, nr)` uses the FLUX expression on the window, with *T* not rounded to whole frames.
+$M_i$ is the read of [§3.1](#3.1-One-pixel) with the parameters of pixel $i$. Each call draws a new ε. The windowed single read `expose(flux, t, c0, r0, nc, nr)` uses the FLUX expression on the window, with $T$ not rounded to whole frames.
 
 #### Reference pixel correction
 
 It works on the full detector, one read at a time. The numbers below are those of NISP: 2048 × 2048 pixels, a border of 4 reference pixels, 32 channels of 64 columns. With other values of `detectorSize`, `refBorder` and `colPerChannel`, the same formula is used with them; only the sliding window of ± 4 lines is fixed (it stops at the edge of the detector).
 
-Write $`Y[\ell](x, y)`$ for read ℓ at column *x* and line *y*. For output channel ch, which covers the columns [64·ch, 64·ch + 64), and for a line y ∈ [4, 2044), the correction is Eq. 3 of Euclid Collaboration (arXiv:2507.11326), from Kubik et al. (2014):
+Write $Y[\ell](x, y)$ for read ℓ at column *x* and line *y*. For output channel ch, which covers the columns [64·ch, 64·ch + 64), and for a line y ∈ [4, 2044), the correction is Eq. 3 of Euclid Collaboration (arXiv:2507.11326), from Kubik et al. (2014):
 
 ```math
 c_y^{(\mathrm{ch})}[\ell] = \tfrac12\big(T^{(\mathrm{ch})}[\ell] + B^{(\mathrm{ch})}[\ell]\big) + \tfrac12\big(L_y[\ell] + R_y[\ell]\big)
@@ -418,21 +420,21 @@ R_y[\ell] &= \operatorname{med}\big\{\,Y[\ell](x, y') : 2044 \le x < 2048,\ |y' 
 \end{aligned}
 ```
 
-- **Columns $`X_{\mathrm{ch}}`$:** the columns of the channel without the left and right reference columns. That is [4, 64) for channel 0, [1984, 2044) for channel 31, and [64·ch, 64·ch + 64) for the others.
+- **Columns $X_{\mathrm{ch}}$:** the columns of the channel without the left and right reference columns. That is [4, 64) for channel 0, [1984, 2044) for channel 31, and [64·ch, 64·ch + 64) for the others.
 - **Pixels per median:** T and B use 4 × 64 pixels (4 × 60 for channels 0 and 31). L and R use 4 columns × 9 lines.
-- **Corrected read:** $`Y[\ell](x, y) - c_y^{(\mathrm{ch})}[\ell]`$, applied to the 64 columns of the channel, including the left and right reference columns. The top and bottom reference lines are not corrected ($`c = 0`$).
+- **Corrected read:** $Y[\ell](x, y) - c_y^{(\mathrm{ch})}[\ell]$, applied to the 64 columns of the channel, including the left and right reference columns. The top and bottom reference lines are not corrected ($c = 0$).
 
 The `mode` bitmask selects the terms. `TOP` or `BOTTOM` alone replace the first term by T or B, and `TOPnBOTTOM` keeps their mean. `LEFT`, `RIGHT` and `RIGHTnLEFT` do the same for the second term. `ALL` is Eq. 3.
 
 #### DPU: the onboard slope, per pixel
 
-The DPU starts from the MACC layers $`Y_i[\ell]`$. Let $`n_{\mathrm{good}}`$ be the number of groups before the first group that contains a saturated read (65535 in the raw reads $`Y_i[\ell]`$). The reads are corrected for the reference pixels (`ALL`, previous paragraph) in double precision. With y(i) and ch(i) the line and channel of pixel *i*:
+The DPU starts from the MACC layers $Y_i[\ell]$. Let $n_{\mathrm{good}}$ be the number of groups before the first group that contains a saturated read (65535 in the raw reads $Y_i[\ell]$). The reads are corrected for the reference pixels (`ALL`, previous paragraph) in double precision. With y(i) and ch(i) the line and channel of pixel *i*:
 
 ```math
 Y'_i[\ell] = Y_i[\ell] - c_{y(i)}^{(\mathrm{ch}(i))}[\ell]
 ```
 
-On a matrix that is not the full detector, $`Y'_i = Y_i`$. Then
+On a matrix that is not the full detector, $Y'_i = Y_i$. Then
 
 ```math
 G_g = \frac{1}{n_r} \sum_{r=0}^{n_r-1} Y'_i[g\,n_r + r],
@@ -442,7 +444,7 @@ d_g = G_{g+1} - G_g,
 g < n_{\mathrm{good}}
 ```
 
-and the Kubik et al. (2016) estimator, with $`\sigma_{\mathrm{DPU}}`$ = `dpu_noise` (e⁻) and $`g_{\mathrm{DPU}}`$ = `dpu_gain` (e⁻ ADU⁻¹, the $`f_e`$ of the paper), is
+and the Kubik et al. (2016) estimator, with $\sigma_{\mathrm{DPU}}$ = `dpu_noise` (e⁻) and $g_{\mathrm{DPU}}$ = `dpu_gain` (e⁻ ADU⁻¹, the $f_e$ of the paper), is
 
 ```math
 \alpha = \frac{1 - n_r^2}{3\,n_r\,(n_r + n_d)},
@@ -466,7 +468,7 @@ Y_i =
 \end{cases}
 ```
 
-$`\hat F`$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated linear pixel, $`\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i`$. The estimator also gives the χ² of the fit (not reduced, n_good − 2 degrees of freedom) and the square of the error of the slope estimate, in the square unit of the slope (ADU² per group interval²):
+$\hat F$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated linear pixel, $\langle d_g \rangle = (n_r + n_d)\,S_{f,i}/g_i$. The estimator also gives the χ² of the fit (not reduced, n_good − 2 degrees of freedom) and the square of the error of the slope estimate, in the square unit of the slope (ADU² per group interval²):
 
 ```math
 \hat F_x = \sqrt{\bar F} - \beta,
@@ -476,7 +478,7 @@ $`\hat F`$ is in ADU per group interval, (n_r + n_d)·t_f. For an unsaturated li
 \sigma_{\hat F}^2 = \frac{2\,(\hat F_x + \beta)^2}{(n_{\mathrm{good}} - 1)\,\big(1 + \gamma\,(\hat F_x + \beta)\big)}
 ```
 
-The output has three planes: $`\mathcal{Q}_{so}(\hat F)`$, $`\mathcal{Q}(\chi^2)`$ and $`\mathcal{Q}_{so}(100\,\sigma_{\hat F}^2)`$. With $`n_{\mathrm{good}} = 2`$ there is no degree of freedom and the χ² is 0; with $`n_{\mathrm{good}} < 2`$ the last two planes are 0.
+The output has three planes: $\mathcal{Q}_{so}(\hat F)$, $\mathcal{Q}(\chi^2)$ and $\mathcal{Q}_{so}(100\,\sigma_{\hat F}^2)$. With $n_{\mathrm{good}} = 2$ there is no degree of freedom and the χ² is 0; with $n_{\mathrm{good}} < 2$ the last two planes are 0.
 
 ### 3.3 The algorithm
 
@@ -856,7 +858,7 @@ A single read after the whole exposure: reset level + integration over *t* + one
 
 ### DPU: the onboard slope
 
-The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::getReferencePixelCorrection(ramp)` then computes the reference pixel correction $`c_y^{(\mathrm{ch})}`$ of every read, with mode `ALL` ([§3.2](#reference-pixel-correction)). It uses the size, the border and the channels of the geometry. When the matrix is not the full detector there is no correction, and a warning is printed. The header keyword `REFCORR` records whether the correction was applied. Then, for each pixel (threaded, with no allocation per pixel):
+The MACC ramp is simulated first. When `refPixCorr` is on (the default), `SCA::getReferencePixelCorrection(ramp)` then computes the reference pixel correction $c_y^{(\mathrm{ch})}$ of every read, with mode `ALL` ([§3.2](#reference-pixel-correction)). It uses the size, the border and the channels of the geometry. When the matrix is not the full detector there is no correction, and a warning is printed. The header keyword `REFCORR` records whether the correction was applied. Then, for each pixel (threaded, with no allocation per pixel):
 
 1. **Saturation:** the reads are copied group by group, up to the first group that contains a saturated read (65535). Only the groups before it are used. With fewer than 2 good groups, the pixel is set to 65535. As on the flight DPU, 65535 is the only test: a pixel whose full well is reached below the ADC limit is not flagged, and its plateau is fitted as signal.
 2. **Reference pixel correction** (when on): while the reads are copied, the pixel's correction is subtracted in double. The `uint16` ramp itself is never modified, so nothing wraps around below 0, and the saturation test sees the raw reads.
@@ -908,7 +910,7 @@ double c_yk = c[(y * 32 + ch) * nReads + k];                // line y, channel c
 
 | Function | Result |
 |---|---|
-| `getReferencePixelCorrection(ramp, mode, geometry)` | $`c_y^{(\mathrm{ch})}`$ of every read *k*, in the units of the cube, at `c[(y * nCh + ch) * nReads + k]`, nCh being the number of channels (the reads of one line and channel are contiguous). The top and bottom reference lines hold 0. Empty when `mode` is `NONE`, or, with a warning, when the correction does not apply: the image is not the full detector, there is no reference border, or the channels do not cover the detector or have no column outside the border |
+| `getReferencePixelCorrection(ramp, mode, geometry)` | $c_y^{(\mathrm{ch})}$ of every read *k*, in the units of the cube, at `c[(y * nCh + ch) * nReads + k]`, nCh being the number of channels (the reads of one line and channel are contiguous). The top and bottom reference lines hold 0. Empty when `mode` is `NONE`, or, with a warning, when the correction does not apply: the image is not the full detector, there is no reference border, or the channels do not cover the detector or have no column outside the border |
 | `referencePixelsCorrection(ramp, mode, geometry)` | Subtracts that correction from the cube, in place |
 
 `geometry` is a `nisp::Geometry`: detector size, reference border and channels. By default it is the NISP one (2048 × 2048, 4, 32 channels of 64 columns), as in the example above. For another instrument, pass the one of the detector: `static_cast<const nisp::Geometry&>(sca.getGeometry())`.
@@ -1019,7 +1021,7 @@ The reference pixels are read through the same channels as the active pixels, so
 - **`bias_voltage_noise`**: the same 1/f series in every channel at the same pixel clock, so horizontal bands across the full width. The left and right reference columns measure it row by row.
 - **`oneOverF`**: independent in each channel. Only its slow part is seen by the reference rows; the rest stays in the data, as on the real detector.
 
-The reference pixel correction ([§3.2](#reference-pixel-correction)) uses exactly these two measurements. T and B of each channel remove the pedestal, and $`L_y`$ and $`R_y`$ remove the bias voltage noise line by line.
+The reference pixel correction ([§3.2](#reference-pixel-correction)) uses exactly these two measurements. T and B of each channel remove the pedestal, and $L_y$ and $R_y$ remove the bias voltage noise line by line.
 
 ### Inter-pixel capacitance, crosstalk and the noise
 
