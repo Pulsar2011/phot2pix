@@ -1,6 +1,6 @@
-# NISP example: the Euclid HAWAII-2RG detectors
+# NISP example: the Euclid/NISP HAWAII-2RG detectors
 
-`src/nisp/` is a complete instrument built on the phot2pix core: a simulator of the infrared detectors of Euclid's **NISP** (Near-Infrared Spectrometer and Photometer). It shows how an instrument is assembled from the generic building blocks described in [Philosophy](Philosophy).
+`src/nisp/` is a modelling of the Near Infrared Detector of the **NISP** (Near-Infrared Spectrometer and Photometer) instrument which is built on the `phot2pix` core. It shows how an realistic detector is assembled from the generic building blocks described in [Philosophy](Philosophy).
 
 ---
 
@@ -8,10 +8,18 @@
 
 - NISP has 16 **Teledyne HAWAII-2RG** (H2RG) HgCdTe arrays. Each SCA (sensor chip assembly) is 2048 × 2048 pixels of 18 µm, including a 4-pixel border of reference pixels (2040 × 2040 sensitive). Reference pixels have no photodiode but are read like the others, so they record the drifts of the readout electronics.
 - An SCA is read **non-destructively**, one full frame every **1.45408 s**, through **32 output channels** of 64 columns each, read in parallel. One channel reads 2048 × 64 pixels per frame, one pixel every 11.1 µs.
-- Reads are taken in **MACC(ng, nr, nd)** mode: *ng* groups of *nr* consecutive reads, separated by *nd* frames that are read but dropped.
+- Reads are taken in **MACC(ng, nr, nd)** mode: *ng* groups of *nr* consecutive reads, separated by *nd* dropped frames.
   - Photometry uses MACC(4,16,4) (87.2 s between the first and last group).
   - Spectroscopy uses MACC(15,16,11) (549.6 s).
-- The onboard **DPU** averages each group and fits a slope to the group averages (Kubik et al. 2016, PASP 128, 104504). Only that slope image is sent to the ground.
+- The onboard **DPU** groups read into groups to compute a per group average before it fits a slope to the group averages ([Kubik et al. 2016, PASP 128, 104504](https://iopscience-iop-org.lama.univ-amu.fr/article/10.1088/1538-3873/128/968/104504)). Only that slope image is sent to the ground.
+
+While NISP instrument use fixed exposure parameter this model allows to simulate any exposure time and readout mode, with the same physics as the real instrument. The model includes:
+- **per-pixel calibration maps** of gain, dark, read noise, quantum efficiency, kTC noise and baseline; Configuration can be a number or a FITS map of the matrix. When number is provided the same value is used for all pixels.
+- **full well and non-linear response** of the pixels. Non linear response is given as list of polynomial coeficients.
+- **inter-pixel capacitance** (IPC) and **crosstalk** between channels, applied at each read. **IPC** can be a 3D cube from a fits file. In that case, the convolution is performed dynamically with the kernel associated to each pixel. **Crosstalk** is a list of couplings between channels as a vector representing the coupling depending on the distance separating two channels. The crosstalk is applied to the signal after the IPC convolution.
+- **correlated readout noise** of the output channels, including 1/f noise per channel, bias voltage noise common to all channels and pedestal drift per channel. The readout noise is generated as a continuous stream over the ramp.
+- **persistence** of the pixels, with a configurable number of traps and decay times. The persistence is added to the charge at each step of the ramp.
+- **reference pixel correction** and **on board NISP DPU processing** as well as various acquisition mode not used by NISP instrument which are native to the H2RG detectors.
 
 ---
 
@@ -37,6 +45,8 @@
 | `../utilities/*.json` | A default configuration with averaged NISP values, and one test configuration per readout mode |
 
 ### 2.2 Classes
+
+Class diagram of the NISP model, with the main classes and their relations. The arrows show the direction of the dependency, not the direction of the data flow. The `DetectorSimulator` base class is templated on the pixel type, and `SCA` inherits it **privately** to hide the pixel type from the outside.
 
 ```mermaid
 classDiagram
@@ -65,8 +75,11 @@ classDiagram
 How the layers map onto the [philosophy](Philosophy):
 
 - **Pixel:** `nisp::pixel` uses the reset and integration stages of `pixsim` unchanged, and adds the full well and the non-linear response to the read: `read(charge, nl)`. Other NISP-specific pixel physics would go there too, by overriding a stage.
-- **Detector:** `nisp::SCA` inherits `DetectorSimulator<nisp::pixel>` **privately** and gives it a `nisp::Geometry`. Its simulation engines produce **charge only** (`resetLevel() + integrate()`), never a complete read. The geometry, the per-pixel maps and the cards that describe them come from the base class.
-- **Instrument:** `nisp::SCA` marks the reference pixels, sequences the reads of each readout mode, applies the inter-pixel capacitance and the crosstalk between channels, adds the read noise (through `pixel::read()`) and the readout noise of the output channels at each read, runs the DPU processing (reference pixel correction, then slope) and writes the output header. Its only public simulation entry point is `expose()`. The reference pixel correction is also public, as two static functions ([§5](#reference-pixel-correction-of-a-ramp)), and so are the inter-pixel capacitance and the crosstalk of an image ([§5](#inter-pixel-capacitance-and-crosstalk-of-an-image)).
+- **Detector:** `nisp::SCA` inherits `DetectorSimulator<nisp::pixel>` **privately**, gives it a `nisp::Geometry`, and adds its own methods on top of it to model the behaviour specific to the NISP H2RG.
+  - Used as is from `DetectorSimulator`: the geometry, the per-pixel maps (`loadMap()`, `loadImage()`), the header cards that describe them, and the multi-threaded dispatch `simulate()`. The members that `nisp::SCA` keeps public are re-exported with `using`.
+  - Overridden: `initialize()`, which calls the base version first and then reads the NISP keys, and the `_engine()` hooks that `simulate()` dispatches to. The base hooks return a complete read of each pixel (`pixelresponse()`); those of `nisp::SCA` return its **charge only** (`resetLevel() + integrate()`), which the readout modes then read with `pixel::read()`.
+  - On top of that, `nisp::SCA` adds its own methods to model the detector behaviour proper to the NISP H2RG: it marks the reference pixels, sequences the reads of each readout mode, applies the inter-pixel capacitance and the crosstalk between channels, adds the read noise (through `pixel::read()`) and the readout noise of the output channels at each read, runs the DPU processing (reference pixel correction, then slope) and writes the output header.
+  - Its only public simulation entry point is `expose()`. The reference pixel correction is also public, as two static functions ([§5](#reference-pixel-correction-of-a-ramp)), and so are the inter-pixel capacitance and the crosstalk of an image ([§5](#inter-pixel-capacitance-and-crosstalk-of-an-image)).
 
 ### 2.3 The pipeline
 
@@ -141,7 +154,14 @@ This section writes down what the code computes. Every ε is an independent draw
 \end{aligned}
 ```
 
-*S* is the mean number of electrons collected. Its shot noise √S is the Gaussian approximation of Poisson, and I(Δt) = 0 when S = 0.
+$S$ is the mean number of electrons collected, photo-electrons and dark current together. Its shot noise $\sqrt{S}$ is the Gaussian approximation of Poisson. $I(\Delta t) = 0$ only when $S = 0$, that is with no light **and** no dark current ($\eta\,\phi = 0$ and $D = 0$), or for $\Delta t = 0$: a dark exposure ($\phi = 0$) still integrates the dark current, with its shot noise.
+
+A read does not measure the mean signal $S$ of one integration, but the charge $Q$ the pixel actually holds when it is read, in ADU: the reset level $R$ plus every integration $I(\Delta t_j)$ since the reset, each with its own noise draw (both defined below). For read $k$ after a reset:
+
+```math
+Q_k = R + \sum_{j=1}^{k} I(\Delta t_j)
+```
+A single read after one integration of duration $t$ is $Q = R + I(t)$. $Q$ accumulates from one read to the next; the read noise of $`M(Q)`$ does not. In the NISP readout, the persistence is also added to $Q$ ([§4.8](#48-persistence)), and the full well and the non-linearity are applied to it at each read (below).
 
 **Full well and non-linearity** (`nisp::pixel::read(charge, nl)`, used by every readout mode). The accumulated charge *Q* stays linear; each read converts it to electrons above the baseline, limits it to the full well, and applies the non-linear response *P* before the read noise:
 
@@ -156,7 +176,11 @@ M(Q) = B + \frac{P(q)}{g} + \frac{\sigma_{\mathrm{RN}}}{g}\,\varepsilon_M
 - *P* is the `polynomial` model. A model is any function of the charge and of the parameters of the pixel ([§5](#non-linearity-model)). P(q) = q for q ≤ 0 (kTC noise can put the charge below the baseline), and without a model.
 - The kTC noise and the persistence are part of the charge, so they share the well. The baseline is an electronic offset: it does not fill it.
 - The read noise and the readout noise are added after the response: they are not compressed. The shot noise is: the variance of a read is (P′(q)²·q + σ_RN²)/g² below the full well, and σ_RN²/g² above.
-- Without `fullWell` (the default), M(Q) is the linear read above.
+
+> **⚠ Warning: the non-linearity needs a full well.** Without a finite full well, `nisp::pixel::read(charge, nl)` is the linear read M(Q) above: both the full well **and** the non-linear response are skipped, whatever `nl` is. By default there is no full well (`fullWell` not given), so:
+> - through `nisp::SCA`, a non-linearity model (`nlModel`, or `setNonLinearity()`) is refused unless every pixel has a finite `fullWell`: `initialize()` or `setNonLinearity()` throws `std::invalid_argument`;
+> - `nl0`, `nl1`, … given without `nlModel` give a linear response, with no error;
+> - a code that calls `nisp::pixel::read(charge, nl)` itself, outside `nisp::SCA`, gets a linear read with no error when the full well of the pixel was not set (`setFullWell()`).
 
 The statistics below are those of the linear pixel, far from the full well.
 
@@ -200,8 +224,8 @@ The last relation is the CDS: the reset level *R* and its kTC noise cancel. Thes
 
 Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x. Every parameter of §3.1 can be a per-pixel FITS map: $`\eta_i, D_i, g_i, B_i, \sigma_{\mathrm{kTC},i}, \sigma_{\mathrm{RN},i}, Q_{\mathrm{FW},i}, c_{2,i}, c_{3,i}`$. Pixels remain independent, except through the terms that the SCA adds on top of the pixel model:
 
-- the **inter-pixel capacitance** (IPC) and the **crosstalk** between output channels, which couple the pixels at each read and leave the charge unchanged;
-- the **readout noise** $`\mathcal{R}`$, in electrons, added at each read: the 1/f noise of each output channel, the bias voltage noise shared by all channels and the pedestal drift of each channel;
+- the **inter-pixel capacitance** (IPC) and the **crosstalk** between output channels, which couple the pixels at each read and leave the charge unchanged. Both are a convolution of the image by a kernel (`phot2pix::PixelConvolution`): for the IPC, the kernel $`K`$ of the `ipc` key, the same for every pixel or one per pixel; for the crosstalk, a one-row kernel holding the couplings $`\kappa_d`$ at ± *d* channel widths, applied to the signal above the baseline and added to the image ([details](#inter-pixel-capacitance-and-crosstalk));
+- the **readout noise** $`\mathcal{R}`$, in electrons, added at each read: the 1/f noise of each output channel, modelled as a sum of $`n_p`$ AR(1) processes whose spectrum approximates PSD ∝ 1/ν^a, with amplitude *A* and slope *a* ([details](#1f-noise-of-channel-c)), the bias voltage noise shared by all channels and the pedestal drift of each channel;
 - the **persistence** *P*, which depends on the previous exposures and is added to the charge.
 
 A quantiser then converts each value to `uint16`:
@@ -216,7 +240,7 @@ with *s* = `scale` and *o* = `offset`.
 
 #### Steps of a ramp
 
-An exposure is simulated as a sequence of charge steps m = 1 … M of duration Δt_m. In MACC(n_g, n_r, n_d), each group contributes n_r steps of t_f, each followed by a read. Between two groups there is one step of n_d·t_f with no read (the dropped frames). Read *r* of group *g* is stored in layer ℓ = g·n_r + r and taken at frame
+An exposure is simulated as a sequence of charge steps $m = 1 … M$ of duration $\Delta t_m$. In MACC($n_g$, $n_r$, $n_d$), each group contributes $n_r$ exposure step of $t_f$ integration time, each followed by a read. Between two groups there is one exposure step of $n_d·t_f$ integration time without any read (the dropped frames). Read *r* of group *g* is stored in layer $\ell = g\times n_r + r$ and taken at frame
 
 ```math
 n_\ell = g\,(n_r + n_d) + r + 1

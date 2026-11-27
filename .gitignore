@@ -18,6 +18,7 @@ doc/latex
 *.csh
 *.sh
 build
+build-*
 *.*~
 scripts
 DarkSim

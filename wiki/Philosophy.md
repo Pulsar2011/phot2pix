@@ -1,22 +1,24 @@
 # Philosophy of phot2pix
 
-This page explains how phot2pix is organised and **why**. It is not an API reference; the headers in `src/phot2pix/` hold the details.
+This page explains how phot2pix is organised and **why**. It is not an API reference; the headers in `src/phot2pix/` hold the details and the API also accessible [here](https://phot2pix-b41428.pages.in2p3.fr) .
 
 ---
 
-## 1. Separate what changes for different reasons
+## 1. Phot2pix : a layered detector model
 
-A detector simulation mixes very different things: the physics of one pixel, the geometry of an array, the readout sequence of a given instrument, its configuration, and the observing sequence. phot2pix gives each of them its own layer, so that one can be changed without touching the others.
+A detector simulation mixes very different effects: the physics of one pixel, the geometry of an array, the readout sequence of a given instrument, its configuration, and the observing sequence. phot2pix gives each of them its own layer, so that one can be changed without touching the others.
 
 | Layer | Class | Responsible for | Knows nothing about |
 |---|---|---|---|
-| **Configuration** | `PixelConfig` | Parameters, from JSON files, inline lists or per-pixel FITS maps | Physics |
-| **Pixel** | `pixsim` and subclasses | The physics of **one** pixel: reset, charge collection, read | Neighbouring pixels, time sequences, readout patterns |
+| **Configuration** | `PixelConfig` | The model parameters, read from a JSON files. It holds the physical parameters to configure a simulation run | Physics |
+| **Pixel** | `pixsim` and subclasses | The physics of **one** single pixel: reset, charge collection, read. This class holds the physical response of the pixel to illumination. | Neighbouring pixels, time sequences, readout patterns |
 | **Detector** | `DetectorSimulator<PixelT>` | The pixel array, per-pixel maps, multi-threading, FITS output, effects that couple pixels | Readout patterns |
-| **Instrument** | e.g. `nisp::SCA` | The readout modes, electronics noise, onboard processing, output headers | — |
+| **Instrument** | e.g. `nisp::SCA` | The readout modes, electronics noise, onboard processing, output headers | Scenery |
 | **Scene** | `ScenerySequencer` | The sequence of exposures (`"flux"` array, see [Sequences of exposures](ScenerySequencer)); later the sky, variable and moving sources | — |
 
 The core (`src/phot2pix/`) contains the first three layers and is **instrument-agnostic**. An instrument lives in its own directory, as `src/nisp/` does, and builds on the core by inheritance.
+
+<span style="color:#FF0000" bf>**At the current time,** `ScenerySequencer` **is a placeholder for the scene layer. It is not yet implemented, but it will be in the future.**</span>
 
 ---
 
@@ -24,11 +26,11 @@ The core (`src/phot2pix/`) contains the first three layers and is **instrument-a
 
 ### The physics
 
-A modern image sensor pixel (an infrared HgCdTe pixel, a CMOS pixel) is read **non-destructively**:
+Current model have been initially desinged for CMOS sensor array. `phot2pix::pixsim` implements the three stages of a CMOS pixel:
 
-1. **Reset:** the pixel is set to a reference level. That level is not exactly the same at every reset (kTC or reset noise), and it stays fixed until the next reset.
+1. **Reset:** the pixel is set to a reference level. That level is not exactly the same at every reset ($kTC$ or reset noise), and it stays fixed until the next reset.
 2. **Integration:** photons and dark current deposit charge, which **accumulates**. Its fluctuation is Poisson (shot) noise, so it accumulates too.
-3. **Read:** the electronics measure the charge. Each measurement adds its own electronic noise (read noise, 1/f noise), and **the measurement does not change the charge**. Reading the same pixel twice gives two independent noise draws on the same charge.
+3. **Read:** the electronics measure the charge. Each measurement adds its own electronic noise (read noise), and **the measurement does not change the charge**. Reading the same pixel twice gives two independent noise draws on the same charge.
 
 ### The model
 
@@ -40,30 +42,32 @@ A modern image sensor pixel (an infrared HgCdTe pixel, a CMOS pixel) is read **n
 | Integration | `integrate(flux, t)` | Charge collected during *t* | N(S, √S)/gain, with S = (flux·QE + dark)·t electrons |
 | Read | `read(charge)` | Measured value of a given charge | charge + N(0, RN)/gain |
 
-A **single-read exposure** chains the three: `pixelresponse(flux, t) = read(resetLevel() + integrate(flux, t))`. Its mean is S/g + B and its variance (S + RN² + kTC²)/g².
+A **single-read exposure** chains the three: `pixelresponse(flux, t) = read(resetLevel() + integrate(flux, t))`. For an input signal $S$ on a pixel of baseline $B$, the mean count in the pixel is $S/g + B$ and its variance $(S + RN^2 + kTC^2)/g^2$.
 
-A **multi-read sequence** (a ramp) calls the stages directly:
+A **multi-read sequence** (a ramp or UTR) calls the stages directly:
 
 ```
 read 1 :  charge  = resetLevel() + integrate(flux, t_frame)    value_1 = read(charge)
 read k :  charge += integrate(flux, t_frame)                   value_k = read(charge)
 ```
 
+`phot2pix::pixsim` class can easily be used for CCD pixel too by tuning the parameters for a CCD, and by **overriding the** `read()` **method** to implement the CCD readout model (which is different from CMOS).
+
 ### Why pixels are simulated on their own
 
-phot2pix starts from the assumption that **pixels are independent**: the response of a pixel depends only on the flux it receives, on its own parameters and on the time it integrates. It does not depend on its neighbours or on what happened before. Everything that breaks this assumption is added *on top* of the pixel simulation, by the layer that has the information it needs.
+phot2pix starts from the assumption that **pixels are independent**: the response of a pixel depends only on the flux it receives, on its own parameters and on the time it integrates. It does not depend on its neighbours or on what happened before. Everything that breaks this assumption is added *on top* of the pixel simulation, by the layer that old the physical model to correlate pixels.
 
-**Array effects** couple pixels together. Examples are inter-pixel capacitance, crosstalk, the 1/f noise shared by all the pixels of one output channel, and column or amplifier glow. These effects need to know the geometry of the array and the way it is read out, so they belong to the detector or instrument layer, not to the pixel. The calculation itself is be generic: `phot2pix::PixelConvolution` function is used to convolves charge deposited in the pixel area with a dedicated kernel. The instrument model is then used to decide both the kernel and at which point of the readout the convolution is applyed. Default `phot2pix::DetectorSimulator` class do not apply any convolution.
+**Array effects** couple pixels together. Examples are inter-pixel capacitance, crosstalk, the 1/f noise shared by all the pixels of one output channel, and column or amplifier glow. These effects need to know the geometry of the array and the way it is read out, so they belong to the detector or instrument layer, not to the pixel. The calculation itself is be generic: `phot2pix::PixelConvolution` function is used to convolves charge deposited in the pixel area with a dedicated kernel. The instrument model is then used to decide both the kernel and at which point of the readout the convolution is applyed. Default `phot2pix::DetectorSimulator` class **do not apply any convolution**.
 
 **History effects** depend on time. Examples are the charge accumulated along a ramp, the persistence released by traps filled during previous exposures, and the readout sequence itself. These effects need a memory of the past, which is added on top of the pixel response. In the NISP example, the readout loop keeps the accumulated charge and the persistence scheduler keeps the past exposures.
 
 This separation is what makes the simulator understandable:
 
 - **Each layer can be validated on its own.** The pixel is checked against its analytic mean and variance. Each array or history effect is then checked as a difference from the independent-pixel result.
-- **Each effect lives in one place**, so reading or changing it does not require understanding the rest.
-- **Independent pixels can be simulated in parallel** with no synchronisation, and that is where most of the computing time goes.
+- **Each effect lives in one place**.
+- **Independent pixels can be simulated in parallel** with no synchronisation, and that is where most of the computing time goes. This is verry usefull in testing the same pixel model is used in a multi-threaded ramp simulation millions of pixels.
 
-The three pixel stages follow from the same reasoning applied to time. A ramp is a history: the charge accumulates from one read to the next, but the noise of a read does not. Because the read is separate from the charge, the readout loop can accumulate `integrate()` and call `read()` at each read. Read noise then stays at the same level on every read instead of growing along the ramp.
+The three pixel stages follow from the same reasoning applied to time. A ramp is a history: the charge accumulates from one read to the next, but the noise of a read does not. Because the read is separate from the charge, the readout loop can accumulate `integrate()` and call `read()` at each read. Read noise then stays at the readout level instead of growing along the ramp.
 
 ### Statistics
 
@@ -87,6 +91,8 @@ The three pixel stages follow from the same reasoning applied to time. A ramp is
 
 Every stage returns ADU in double precision. Conversion to the final integer type (e.g. `uint16`) happens once, at output, in the detector or instrument layer.
 
+**Inheritance can add their own parameters**. For example, the NISP SCA adds `fullWell` and `nonLinearity` to the pixel, and `exposureMode`, `frame_time` and `oneOverF` to the instrument.
+
 ---
 
 ## 4. Configuration-driven
@@ -95,7 +101,7 @@ All parameters enter through a `PixelConfig`, a typed key/value bag that can be 
 
 - **from a JSON file:** `PixelConfig cfg("detector.json");`
 - **inline:** `PixelConfig cfg{{"gain", 1.9}, {"readNoise", 13.0}};`
-- **with per-pixel maps:** any standard key can be a FITS file path instead of a number, with an optional `"<key>.hdu"` to select the HDU.
+- **with per-pixel maps:** any standard key can be a FITS file path instead of a number, with an optional `"<key>.hdu"` to select the HDU. For example it is possible to provide readnoise map as `"readNoise": <file>` coupled with `"readNoise.hdu": <idx>||<EXTNAME>` or `"readNoise": {"file":<file>, "hdu":<idx>||<EXTNAME>}`.
 
 `DetectorSimulator::initialize(cfg)` understands the standard pixel keys (`gain`, `dark`, `readNoise`, `QE`, `KTCnoise`, `baseline`). Derived classes add their own keys by overriding `initialize()` and calling the base version first.
 
@@ -150,8 +156,8 @@ public:
 Things to keep in mind:
 
 - **Override a stage, not `pixelresponse()`, when you can.** Multi-read simulators (such as the NISP readout modes) call the stages directly and never call `pixelresponse()`. A model that only overrides `pixelresponse()` works for single-read exposures (`DetectorSimulator::simulate()`) but not in ramps.
-- **`integrate()` only sees the charge of one interval.** Effects that depend on the *total* accumulated charge (non-linearity, full-well saturation) need the accumulated charge. The instrument's readout loop accumulates it and passes it to `read()`, so these effects belong there: `nisp::pixel::read(charge, nl)` limits the charge to the full well and applies the non-linear response, while the accumulated charge itself stays linear ([NISP example §3.1](NISP-example#31-one-pixel)).
-- **Pixels with state** (for example trap occupancy in a persistence model) must keep that state per pixel. `DetectorSimulator` splits the pixels into disjoint ranges per thread, so each pixel is touched by one thread only.
+- **`integrate()` only sees the charge of one interval.** Effects that depend on the *total* accumulated charge (non-linearity, full-well saturation) need the accumulated charge. The instrument's readout loop accumulates it and passes it to `read()`, so these effects belong there: `nisp::pixel::read(charge, nl)` limits the charge to the full well and applies the non-linear response, while the accumulated charge itself stays linear ([NISP example §3.1](NISP-example#31-one-pixel)) - An other possibility would have been to change pixel response model with non linear function and make sure pixel is tracking its accumulated charge along integration time. This would have been more complex and less generic, so it was not chosen.
+- **Pixels with state** Some physical effects, such as charge trapping in persistence models, depend on the history of individual pixels. To retain memory of its past behaviour across integration intervals and exposures, the associated state (e.g. trap occupancy) must be stored at the pixel level. It should not be stored in temporary variables inside integrate(), nor in shared global variables or thread-local storage because `phot2pix::DetectorSimulator` divides the detector into disjoint pixel ranges, each processed by a single thread. Consequently, each pixel is updated by only one thread at a time, avoiding the need for thread synchronisation when accessing pixel-specific state.
 
 ---
 
@@ -160,20 +166,14 @@ Things to keep in mind:
 - **Parallelism is built into the detector.** `simulate()` splits the pixel range across `std::thread::hardware_concurrency()` threads once the array has more than 100 pixels per thread. Each thread makes **one** virtual call to `_engine()`, so the cost of virtual dispatch scales with the number of threads, not pixels.
 - **No allocation in per-pixel loops.** Buffers are allocated once and reused; output cubes are allocated at their final size instead of being grown layer by layer.
 - **Fused passes over memory.** For example, a NISP ramp step adds the charge, applies the read and converts to `uint16` in a single threaded loop.
-- **Measure before optimising.** The `nispSimulator` tool has a `"benchmark"` mode that times the simulation, per run and per layer.
 
 ---
 
 ## 7. Testing philosophy
 
-A simulator of noise cannot be tested value by value. phot2pix tests are **statistical**:
+phot2pix come with serrry of unitary test that validate the modelling (including validation of the NISP example). However, noise simulator as phot2pix cannot be tested value by value. The phot2pix unit tests are **statistical** and may occasionally fail due to random fluctuations, particularly when the random number generator is not seeded. The tests are designed to be **robust**, with **sufficiently conservative tolerances** to minimise such false failures. However, occasional failures due to statistical fluctuations cannot be entirely ruled out, even when the code is correct.
 
-- **One effect at a time:** every other effect is switched off (gain 1, QE 1, no read noise, no kTC…) so that the expected mean and variance are known exactly.
-- **Many samples:** means and variances are measured over thousands of draws or millions of pixels and compared with the expectation within **5σ**, plus a small margin for integer rounding.
-- **Each stage on its own, then the composition:** for example, `integrate()` must contain no read noise; a ramp must show RN² on every read and 2·RN² on every read-to-read difference; a CDS must cancel the reset level.
-- **Full scale:** the NISP readout modes are validated on the 2040 × 2040 active area of the detector against analytic expectations; see [NISP example → Validation](NISP-example#9-validation).
-
-Tests use GoogleTest and run with `ctest`. Files written by tests for inspection go to `./build/` and are replaced on every run.
+Tests use [GoogleTest](https://github.com/google/googletest) and run with `ctest`. Files written by tests for inspection go to `./build/` and are replaced on every run. [GoogleTest](https://github.com/google/googletest) is provided as gitsubmodule.
 
 ---
 

@@ -79,9 +79,14 @@ build:
     - job: deps
       artifacts: true
   script:
-  - export DeepSkyROOT=$(pwd)/deepskyproject   # absolu
+  # phot2pix takes its version from the git tag: no tag, no versioned library
   - git fetch --tags --force || true
-  - cmake -B build -DCMAKE_THREAD_LIBS_INIT="-lpthread" -DCMAKE_USE_PTHREADS_INIT=2 && cmake --build build -j 2
+  - export DeepSkyROOT=$(pwd)/deepskyproject
+  # Same presets as on the workstations (CMakePresets.json): Release build in build/. The DeepSky
+  # libraries are only looked for in DeepSkyROOT, at their minimum version; DSTools is not in the
+  # deps artifact, so its headers are downloaded (DEEPSKYFITS_TOKEN).
+  - cmake --preset default
+  - cmake --build --preset default --parallel 2
   artifacts:
     expire_in: 2 hrs
     paths:
@@ -97,7 +102,8 @@ test:
       artifacts: true
   script:
   - export DeepSkyROOT=$(pwd)/deepskyproject
-  - ctest --output-on-failure --test-dir .
+  # Runs the tests of build/, from build/ (output on failure: test preset)
+  - ctest --preset default
 
 # ─── Wiki: publish wiki/*.md to the GitLab project wiki ──────────────────────
 # The project wiki is a separate repository (<project>.wiki.git). On every push
@@ -163,7 +169,8 @@ create-pages:
     - mkdir public
     - npm install mathjax@2
     # Configure again: the build job had no Doxygen, so its build tree has no doc target (nothing is recompiled)
-    - cmake -B build && cmake --build build -j 64 --target doc
+    - cmake --preset default
+    - cmake --build --preset default --target doc
     - mv build/doc/html/* ./public
     - mv node_modules/mathjax ./public/mathjax
     - ls public
