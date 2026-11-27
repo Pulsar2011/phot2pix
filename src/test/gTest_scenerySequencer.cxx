@@ -89,6 +89,35 @@ namespace
                 throw std::invalid_argument("no \"nFrames\".");
         }
     };
+
+    // Charge source that deposits the same charge on one pixel at every call (a fixed cosmic-ray hit).
+    class OneHitSource : public ChargeDeposit
+    {
+    public:
+        OneHitSource(size_t idx, double electrons) : m_hit{idx, electrons} {}
+
+        std::shared_ptr<ChargeDeposit> clone() const override { return std::make_shared<OneHitSource>(*this); }
+        void configure(const PixelConfig&) override {}
+        void generate(double, const Geometry&, std::vector<Deposit>& out) const override { out.push_back(m_hit); }
+
+    private:
+        Deposit m_hit;
+    };
+
+    // Detector whose charge source, created from the "cosmic" key, is a OneHitSource.
+    class OneHitDetector : public DetectorSimulator<>
+    {
+    public:
+        OneHitDetector(size_t w, size_t h, size_t idx, double electrons)
+            : DetectorSimulator<>(w, h), m_idx(idx), m_electrons(electrons) {}
+
+    protected:
+        std::shared_ptr<ChargeDeposit> _makeChargeDeposit() const override { return std::make_shared<OneHitSource>(m_idx, m_electrons); }
+
+    private:
+        size_t m_idx;
+        double m_electrons;
+    };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -348,4 +377,39 @@ TEST(ScenerySequencer, UniformFluxInsteadOfAFile)
 
     std::filesystem::remove(out);
     std::filesystem::remove(dark);
+}
+
+TEST(ScenerySequencer, RunAddsTheChargeDepositsOfTheDetector)
+{
+    // Dark exposures of quiet pixels (gain 1): each image is 0 except the hit of the source, 150 e- on pixel 5
+    const size_t W = 4, H = 4;
+    const std::string first  = outputPath("seq_hit_1.fits");
+    const std::string second = outputPath("seq_hit_2.fits");
+
+    OneHitDetector det(W, H, 5, 150.0);
+    PixelConfig cfg = quietPixels();
+    cfg.set("cosmic", json::object());   // creates the source of the detector
+    det.initialize(cfg);
+    ASSERT_NE(det.getChargeDeposit(), nullptr);
+
+    ScenerySequencer seq;
+    seq.initialize(sequence(json::array({
+        {{"flux", 0.0}, {"exposureTime", 5.0}, {"output", first}},
+        {{"flux", 0.0}, {"exposureTime", 5.0}, {"output", second}}
+    })));
+    seq.run(det);
+
+    for (const std::string& path : {first, second})
+    {
+        const auto img = readImage(path);
+        ASSERT_TRUE(img) << path;
+        const std::valarray<double> data =
+            (img->GetEqBitPerPixel() == DOUBLE_IMG && img->GetBitPerPixel() == DOUBLE_IMG)
+                ? *img->GetData<double>()
+                : *img->cast<double>()->GetData<double>();
+        ASSERT_EQ(data.size(), W * H);
+        for (size_t i = 0; i < W * H; ++i)
+            EXPECT_NEAR(data[i], (i == 5) ? 150.0 : 0.0, 1e-9) << path << ", pixel " << i;
+        std::filesystem::remove(path);
+    }
 }

@@ -11,6 +11,7 @@
 #include "nispPixel.h"
 
 #include <phot2pix/DetectorTools.h>
+#include <phot2pix/CosmicDeposit.h>
 
 #include <algorithm>
 #include <atomic>
@@ -184,7 +185,7 @@ namespace nisp
                 const double tau = _decayTime.at(idx);
                 signal += f * tau * std::exp(-timeDelay / tau) * (1.0 - std::exp(-exposureTime / tau));
             }
-            return signal * flux;
+            return signal * flux / getGain();   // e- → ADU (default gain 1: e-)
         }
 #pragma endregion
 // ── pixelArray ────────────────────────────────────────────────────────────────
@@ -194,6 +195,11 @@ namespace nisp
         {
             for (size_t i = 0; i < size(); ++i)
                 at(i).incrementTime(dT);
+        }
+
+        void pixelArray::setGain(const std::valarray<double>& gain)
+        {
+            setGainMap(std::span<const double>(std::begin(gain), gain.size()));   // throws on a wrong size or value
         }
 
         void pixelArray::initialize(const phot2pix::PixelConfig& cfg)
@@ -271,14 +277,25 @@ namespace nisp
             }
         }
 
+        void scheduler::setGain(const std::valarray<double>& gain)
+        {
+            if (m_pixelModel)
+                m_pixelModel->setGain(gain.size() > 0 ? gain : std::valarray<double>(1.0, m_pixelModel->size()));
+            m_gain = gain;
+        }
+
         void scheduler::insertCharges(const std::shared_ptr<DSL::FITScube>& flux, const double& t0)
         {
             if (!m_pixelModel)
             {
-                m_pixelModel = std::make_unique<pixelArray>(flux->Size(1), flux->Size(2));
-                m_pixelModel->initialize(m_cfg);
+                // Built aside, kept only when complete: a bad gain leaves the scheduler unchanged.
+                auto pixels = std::make_unique<pixelArray>(flux->Size(1), flux->Size(2));
+                pixels->initialize(m_cfg);
+                if (m_gain.size() > 0)
+                    pixels->setGain(m_gain);   // released charge in ADU
                 if (m_threadCount > 0)
-                    m_pixelModel->setThreadCount(m_threadCount);
+                    pixels->setThreadCount(m_threadCount);
+                m_pixelModel = std::move(pixels);
             }
             else if (flux->Size(1) != m_pixelModel->getWidth() ||
                      flux->Size(2) != m_pixelModel->getHeight())
@@ -487,6 +504,7 @@ namespace nisp
     void SCA::_accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
                           uint16_t* layer, const std::valarray<double>* oneOverF) const
     {
+
         // Measured value of pixel i for the given signal (ADU).
         const auto readPixel = [this, oneOverF](size_t i, double signal)
         {
@@ -707,6 +725,9 @@ namespace nisp
                 persistenceModelling = std::make_shared<persistence::scheduler>(cfg);
         }
 
+        // The persistence signal is added to ADU frames: the traps of each pixel get its gain.
+        _setPersistenceGain();
+
         // Readout noise added at each read: per-channel 1/f ("oneOverF"), 1/f common to
         // every channel ("bias_voltage_noise") and channel offsets ("pedestal_drift").
         if(cfg.has("oneOverF") || cfg.has("bias_voltage_noise") || cfg.has("pedestal_drift"))
@@ -767,12 +788,19 @@ namespace nisp
         }
 
         // Inter-pixel capacitance kernel "ipc": none by default.
-        m_ipc.initialize(cfg, getGeometry(), getWidth(), getHeight(), [this, &cfg]() { return loadImage(cfg, "ipc"); });
+        m_ipc.initialize(cfg, getGeometry(), getWidth(), getHeight(), [this, &cfg]() { return loadImage(cfg, "ipc"); }, "ipc");
 
         // Crosstalk between the output channels "crosstalk": none by default.
         _configureCrosstalk(cfg);
 
         _recordInputs(cfg);
+
+        m_cosmicDeposit.configure(cfg);
+
+        // Cosmic ray inputs in the output header (CRFLUX, CRACC, ...): only with a "cosmic" object.
+        if (m_cosmicDeposit.isConfigured())
+            for (const auto& card : m_cosmicDeposit.inputCards())
+                setInputCard(card);
     }
 
     void SCA::_configureCrosstalk(const phot2pix::PixelConfig& cfg)
@@ -1019,6 +1047,7 @@ namespace nisp
 
         std::shared_ptr<DSL::FITScube> frame;
 
+        m_cosmicCharge.resize(0);   // cosmic hits of this exposure only (persistence)
         _simulate(fullFlux, exposureTime, frame, c0, r0, ncols, nrows);
         // Single read: read noise + readout noise, the read being the last frame of the exposure.
         _read(*(frame->GetData<double>()), c0, r0, ncols, nrows, std::max(0.0, exposureTime - frameTime));
@@ -1031,6 +1060,8 @@ namespace nisp
             std::valarray<double> chargeMap(0.0, size());
             for (size_t i = 0; i < size(); ++i)
                 chargeMap[i] = fullFlux[i] * at(i).getQuantumEfficiency() * exposureTime;
+            if (m_cosmicCharge.size() == chargeMap.size())
+                chargeMap += m_cosmicCharge;   // + charge of the cosmic hits (e-)
             
             *(chargeImg) += chargeMap;
             persistenceModelling->insertCharges(chargeImg, 0.0);
@@ -1145,6 +1176,7 @@ namespace nisp
         // Charge accumulated in the pixels (ADU): signal + dark + shot noise + reset level.
         // Read noise and 1/f noise are added to each read's layer only, never to cumul.
         std::valarray<double>          cumul(0.0, nPix);
+        m_cosmicCharge.resize(0);   // cosmic hits of this exposure only (persistence)
         std::shared_ptr<DSL::FITScube> frame    = nullptr;
         std::shared_ptr<DSL::FITScube> skipped  = nullptr;
         size_t                         layer    = 0;
@@ -1168,8 +1200,10 @@ namespace nisp
                 if (oneOverFStream)
                     oneOverFFuture = std::async(std::launch::async,
                         [&stream = *oneOverFStream]() { return stream.next(); });
-
+                
                 _simulate(fullFlux, integrationTime, frame, ((layer == 0) ? firstRead : cfg));
+                
+
                 if(!frame)
                     throw std::runtime_error("SCA::expose: failed to simulate frame ["+std::to_string(g)+","+std::to_string(f)+"]");
 
@@ -1220,6 +1254,8 @@ namespace nisp
             std::valarray<double> chargeMap(0.0, size());
             for (size_t i = 0; i < size(); ++i)
                 chargeMap[i] = fullFlux[i] * at(i).getQuantumEfficiency() * integrationTime;
+            if (m_cosmicCharge.size() == chargeMap.size())
+                chargeMap += m_cosmicCharge;   // + charge of the cosmic hits (e-)
             
             *(chargeImg) += chargeMap;
             persistenceModelling->insertCharges(chargeImg, 0.0);
@@ -1252,6 +1288,8 @@ namespace nisp
 
         std::shared_ptr<DSL::FITScube> f0 = nullptr;   // read 1
         std::shared_ptr<DSL::FITScube> f1 = nullptr;   // read N
+
+        m_cosmicCharge.resize(0);   // cosmic hits of this exposure only (persistence)
 
         // Charge at read 1: reset level (baseline + kTC) + one frame of signal.
         _simulate(fullFlux, frameTime, f0);
@@ -1288,6 +1326,8 @@ namespace nisp
             std::valarray<double> chargeMap(0.0, size());
             for (size_t i = 0; i < size(); ++i)
                 chargeMap[i] = fullFlux[i] * at(i).getQuantumEfficiency() * eff_exposureTime;
+            if (m_cosmicCharge.size() == chargeMap.size())
+                chargeMap += m_cosmicCharge;   // + charge of the cosmic hits (e-)
             
             *(chargeImg) += chargeMap;
             persistenceModelling->insertCharges(chargeImg, 0.0);
@@ -1314,6 +1354,7 @@ namespace nisp
 
         double effectiveExposureTime = std::floor(exposureTime/frameTime)*frameTime;
 
+        m_cosmicCharge.resize(0);   // cosmic hits of this exposure only (persistence)
         _simulate(flux, effectiveExposureTime, frame);
         // Single read: read noise + readout noise, the read being the last frame of the exposure.
         _read(*(frame->GetData<double>()), std::max(0.0, effectiveExposureTime - frameTime));
@@ -1325,6 +1366,8 @@ namespace nisp
             std::valarray<double> chargeMap(0.0, size());
             for (size_t i = 0; i < size(); ++i)
                 chargeMap[i] = flux[i] * at(i).getQuantumEfficiency() * effectiveExposureTime;
+            if (m_cosmicCharge.size() == chargeMap.size())
+                chargeMap += m_cosmicCharge;   // + charge of the cosmic hits (e-)
             *(chargeImg) += chargeMap;
             persistenceModelling->insertCharges(chargeImg, 0.0);
         }
@@ -1559,41 +1602,34 @@ namespace nisp
                 // This pixel's corrections, one per read: line i / W, channel (i % W) / columns.
                 const double* c = (refCorr.size() > 0) ? &refCorr[((i / W) * nCh + (i % W) / columns) * nG * nR] : nullptr;
 
-                // Copy the reads group by group, up to the first saturated group: a
-                // saturated read makes the rest of the ramp unusable, only the groups
-                // before it are fitted.
-                size_t nGood = 0;
-                for(size_t g = 0; g < nG; ++g)
+                // Copy the reads. As on the flight DPU, a saturated read (65535) anywhere in the
+                // ramp flags the pixel: no slope is fitted, the slope plane is 65535 (no scale,
+                // no offset) and the other planes stay 0.
+                bool saturated = false;
+                for(size_t k = 0; k < nG * nR && !saturated; ++k)
                 {
-                    bool saturated = false;
-                    for(size_t r = 0; r < nR; ++r)
-                    {
-                        const uint16_t v = (*rampData)[(g * nR + r) * nPix + i];
-                        saturated |= (v >= 65535);
-                        reads[g * nR + r] = static_cast<double>(v) - (c ? c[g * nR + r] : 0.0);
-                    }
-                    if(saturated)
-                        break;
-                    ++nGood;
+                    const uint16_t v = (*rampData)[k * nPix + i];
+                    saturated = (v >= 65535);
+                    reads[k] = static_cast<double>(v) - (c ? c[k] : 0.0);
                 }
 
-                if(nGood < 2)
+                if(saturated)
                 {
-                    outData[i] = 65535;   // saturated before two groups: no slope
+                    outData[i] = 65535;
                     continue;
                 }
 
                 // The MACC cube holds the reads only (dropped frames are not stored), so
                 // the reads are co-added with no drops; nD is then set for the estimator.
-                const nisp::Ramp raw(&reads, std::slice(0, nGood * nR, 1), sigmaADU, dpuGain);
-                nisp::Ramp       grouped = raw.coadd(groups, nGood, nR, 0);
+                const nisp::Ramp raw(&reads, std::slice(0, nG * nR, 1), sigmaADU, dpuGain);
+                nisp::Ramp       grouped = raw.coadd(groups, nG, nR, 0);
                 grouped.drops_per_group(static_cast<int16_t>(nD));
 
                 double slope = 0., chi2 = 0., err = 0.;
                 grouped.getSlope(slope, chi2, err);
 
                 outData[i] = toUint16(slope * dpuScale + dpuOffset);   // rounded, clamped to [0, 65535], NaN → 0
-                outData[i+nPix] = toUint16(chi2 * static_cast<double>(nGood - 2));   // reduced chi2 → chi2 (2 groups: NaN → 0)
+                outData[i+nPix] = toUint16(chi2 * static_cast<double>(nG - 2));   // reduced chi2 → chi2 (2 groups: NaN → 0)
                 outData[i+2*nPix] = toUint16(err * 100. * dpuScale + dpuOffset);            // x100 with same conversion as the slope
             }
         });
@@ -1620,37 +1656,8 @@ namespace nisp
     void SCA::_simulate(const std::valarray<double>& flux, const double& exposureTime,
                         std::shared_ptr<DSL::FITScube>& frame, phot2pix::PixelConfig cfg)
     {
-        std::shared_ptr<DSL::FITScube>       persistenceSignal;
-
-        if (persistenceModelling && persistenceModelling->getHistory().size() > 0)
-        {
-            const size_t hw   = std::thread::hardware_concurrency();
-            const size_t half = std::max(size_t(1), hw / 2);
-            setThreadCount(half);
-            persistenceModelling->setThreadCount(hw - half);
-
-            auto persFuture = std::async(std::launch::async,
-                [this, exposureTime]() -> std::shared_ptr<DSL::FITScube>
-                {
-                    return persistenceModelling->computePersistenceSignal(0.0, exposureTime);
-                });
-
-            frame = phot2pix::DetectorSimulator<nisp::pixel>::simulate(flux, exposureTime, cfg);
-            persistenceSignal = persFuture.get();
-
-            setThreadCount(0);
-            persistenceModelling->setThreadCount(0);
-        }
-        else
-        {
-            frame = phot2pix::DetectorSimulator<nisp::pixel>::simulate(flux, exposureTime, cfg);
-        }
-
-        if (persistenceSignal && m_enable_persistence)
-        {
-            *(frame->GetData<double>()) += *(persistenceSignal->GetData<double>());
-            persistenceSignal.reset();
-        }
+        // Full frame = the window covering the whole matrix.
+        _simulate(flux, exposureTime, frame, 0, 0, getWidth(), getHeight(), cfg);
     }
 
     void SCA::_simulate(const std::valarray<double>& flux,
@@ -1659,6 +1666,21 @@ namespace nisp
                         size_t c0, size_t r0, size_t ncols, size_t nrows, phot2pix::PixelConfig cfg)
     {
         std::shared_ptr<DSL::FITScube>      persistenceSignal;
+
+        // Here we draw the cosmic ray event. This gives us which pixel are affected and how much energy is deposited in each pixel.
+        // Once done the cosmic ray signal is added to the measured signal before the persistence signal is added.
+        // The draw runs in parallel with the simulation; get() waits for it just before the hits are added.
+        auto cosmicFuture = std::async(std::launch::async,
+            [this, exposureTime]() -> std::vector<phot2pix::Deposit>
+            {
+                std::vector<phot2pix::Deposit> hits;
+
+                if(!m_cosmicDeposit.isConfigured())
+                    return hits;
+
+                m_cosmicDeposit.generate(exposureTime, _geometry(), hits);
+                return hits;
+            });
 
         // Extract window flux first — pure data copy, no compute cost.
         std::valarray<double> windowFlux(0.0, ncols * nrows);
@@ -1670,7 +1692,7 @@ namespace nisp
             const size_t hw   = std::thread::hardware_concurrency();
             const size_t half = std::max(size_t(1), hw / 2);
             setThreadCount(half);
-            persistenceModelling->setThreadCount(hw - half);
+            persistenceModelling->setThreadCount((hw > half + 1) ? hw - half - 1 : 1);
 
             auto persFuture = std::async(std::launch::async,
                 [this, exposureTime, c0, r0, ncols, nrows]() -> std::shared_ptr<DSL::FITScube>
@@ -1680,6 +1702,9 @@ namespace nisp
                 });
 
             frame = phot2pix::DetectorSimulator<nisp::pixel>::simulate(windowFlux, exposureTime, c0, r0, ncols, nrows, cfg);
+            
+            _addCosmicHits(*(frame->GetData<double>()), cosmicFuture.get(), c0, r0, ncols, nrows);
+            
             persistenceSignal = persFuture.get();
 
             setThreadCount(0);
@@ -1688,10 +1713,57 @@ namespace nisp
         else
         {
             frame = phot2pix::DetectorSimulator<nisp::pixel>::simulate(windowFlux, exposureTime, c0, r0, ncols, nrows, cfg);
+            
+            _addCosmicHits(*(frame->GetData<double>()), cosmicFuture.get(), c0, r0, ncols, nrows);
         }
 
+        // Charge released by the past exposures, in ADU (gains set by _setPersistenceGain()).
         if (persistenceSignal && m_enable_persistence)
             *(frame->GetData<double>()) += *(persistenceSignal->GetData<double>());
+    }
+
+    void SCA::_setPersistenceGain()
+    {
+        if (!persistenceModelling)
+            return;
+
+        std::valarray<double> gain(size());
+        for (size_t i = 0; i < size(); ++i)
+            gain[i] = at(i).getGain();
+        persistenceModelling->setGain(gain);
+    }
+
+    void SCA::_addCosmicHits(std::valarray<double>& frame, const std::vector<phot2pix::Deposit>& hits,
+                             size_t c0, size_t r0, size_t ncols, size_t nrows)
+    {
+        if (hits.empty())
+            return;
+
+        // Charge of the hits kept for persistence (e-), only when persistence is modelled.
+        const bool keep = persistenceModelling && m_enable_persistence;
+        if (keep && m_cosmicCharge.size() != size())
+            m_cosmicCharge.resize(size(), 0.0);
+
+        const size_t W      = _geometry().width;   // hit.idx = Y * W + X on the physical detector
+        const auto [x0, y0] = getOrigin();         // matrix placement on the detector
+
+        for (const auto& hit : hits)
+        {
+            const size_t X = hit.idx % W, Y = hit.idx / W;
+            if (X < x0 || X >= x0 + getWidth() || Y < y0 || Y >= y0 + getHeight())
+                continue;                                            // outside this matrix
+
+            const size_t col = X - x0, row = Y - y0;
+            const size_t i   = row * getWidth() + col;               // matrix pixel, reference pixels included
+
+            if (keep)
+                m_cosmicCharge[i] += hit.electrons;                  // the whole matrix sees the hit
+
+            if (col < c0 || col >= c0 + ncols || row < r0 || row >= r0 + nrows)
+                continue;                                            // outside this window
+
+            frame[(row - r0) * ncols + (col - c0)] += hit.electrons / m_pixels[i].getGain();   // e- → ADU
+        }
     }
 
 #pragma endregion

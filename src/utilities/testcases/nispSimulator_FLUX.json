@@ -4,7 +4,7 @@
 
     "benchmark"    : 0,
 
-    "flux"         : {"file":"/Users/gillard/DATA/EUC_LE1_NISP-07814-1-C_20250513T173301.000000Z_01_02_01.00_wcs.fits", "hdu": "DET13.SCI"},
+    "flux"         : 10.0,
 
     "exposureMode" : "FLUX",
     "macc"         : [1, 2, 0],

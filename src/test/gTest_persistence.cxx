@@ -356,6 +356,36 @@ TEST(PersistenceScheduler, SingleExposureMatchesFormula)
         EXPECT_NEAR(data[i], exp, 1e-9 * exp) << "Pixel " << i;
 }
 
+TEST(PersistenceScheduler, GainGivesTheSignalInAdu)
+{
+    // setGain(): the released charge (e-) is divided by the gain of its pixel, whether the
+    // gains are given before the first exposure (kept) or after it (applied to the pixelArray).
+    const double f = 0.01, tau = 100.0, dT = 50.0, T = 10.0, flux = 1000.0;
+    const size_t W = 4, H = 4;
+    const double exp = expectedSignal(f, tau, dT, T, flux);   // e-
+
+    std::valarray<double> gain(2.0, W * H);
+    gain[5] = 4.0;
+
+    PixelConfig cfg = makeTrapConfig(f, tau);
+    scheduler before(cfg), after(cfg);
+    before.setGain(gain);
+    before.insertCharges(makeFluxImage(W, H, flux), 0.0);
+    after.insertCharges(makeFluxImage(W, H, flux), 0.0);
+    after.setGain(gain);
+
+    for (scheduler* s : {&before, &after})
+    {
+        const std::shared_ptr<DSL::FITScube> result = s->computePersistenceSignal(dT, T);
+        ASSERT_NE(result, nullptr);
+        const std::valarray<double>& data = *(result->GetData<double>());
+        for (size_t i = 0; i < data.size(); ++i)
+            EXPECT_NEAR(data[i], exp / gain[i], 1e-9 * exp) << "Pixel " << i;
+    }
+
+    EXPECT_THROW(after.setGain(std::valarray<double>(2.0, W * H + 1)), std::invalid_argument);   // one gain per pixel
+}
+
 TEST(PersistenceScheduler, T0AccumulatesAfterCompute)
 {
     const size_t W = 4, H = 4;

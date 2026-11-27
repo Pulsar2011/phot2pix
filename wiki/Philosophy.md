@@ -16,9 +16,9 @@ A detector simulation mixes very different effects: the physics of one pixel, th
 | **Instrument** | e.g. `nisp::SCA` | The readout modes, electronics noise, onboard processing, output headers | Scenery |
 | **Scene** | `ScenerySequencer` | The sequence of exposures (`"flux"` array, see [Sequences of exposures](ScenerySequencer)); later the sky, variable and moving sources | — |
 
-The core (`src/phot2pix/`) contains the first three layers and is **instrument-agnostic**. An instrument lives in its own directory, as `src/nisp/` does, and builds on the core by inheritance.
+The core (`src/phot2pix/`) is **instrument-agnostic**. It contains the configuration, pixel and detector layers, the base class of the scene layer (`ScenerySequencer`), and the generic effects an instrument can use: `PixelConvolution` (`DetectorEffect.h`), `ChargeDeposit` (`ChargeDeposit.h`), and the cosmic-ray source `CosmicDeposit`. An instrument lives in its own directory, as `src/nisp/` does, and builds on the core by inheritance: `nisp::pixel`, `nisp::SCA`, `nisp::CosmicDeposit` and `nisp::ScenerySequencer`.
 
-<span style="color:#FF0000" bf>**At the current time,** `ScenerySequencer` **is a placeholder for the scene layer. It is not yet implemented, but it will be in the future.**</span>
+<span style="color:#FF0000" bf>**At the current time,** `ScenerySequencer` **simulates sequences of exposures with a static scene**: the flux of each exposure is a FITS image or a uniform value. **The generators of the sky, spectra, variable and moving sources are not yet implemented** ([ScenerySequencer §7](ScenerySequencer#7-todo-scene-generators)).</span>
 
 ---
 
@@ -59,7 +59,9 @@ phot2pix starts from the assumption that **pixels are independent**: the respons
 
 **Array effects** couple pixels together. Examples are inter-pixel capacitance, crosstalk, the 1/f noise shared by all the pixels of one output channel, and column or amplifier glow. These effects need to know the geometry of the array and the way it is read out, so they belong to the detector or instrument layer, not to the pixel. The calculation itself is be generic: `phot2pix::PixelConvolution` function is used to convolves charge deposited in the pixel area with a dedicated kernel. The instrument model is then used to decide both the kernel and at which point of the readout the convolution is applyed. Default `phot2pix::DetectorSimulator` class **do not apply any convolution**.
 
-**History effects** depend on time. Examples are the charge accumulated along a ramp, the persistence released by traps filled during previous exposures, and the readout sequence itself. These effects need a memory of the past, which is added on top of the pixel response. In the NISP example, the readout loop keeps the accumulated charge and the persistence scheduler keeps the past exposures.
+**Charge deposits over several pixels** also break the independence of pixels. A cosmic ray, or a particle emitted by a radioactive material near the sensor, crosses the sensor along a track and deposits its charge on several neighbouring pixels at once. `phot2pix::ChargeDeposit` (`ChargeDeposit.h`) is the generic base of these sources: for a step of duration *dt*, `generate()` draws the deposits `{pixel, electrons}` over the whole physical detector, and the detector keeps those that fall on its matrix. `phot2pix::CosmicRay::CosmicDeposit` implements it for cosmic rays and radioactivity ([CosmicDeposit](CosmicDeposit)). `phot2pix::DetectorSimulator::simulate()` **never adds deposits**. Its `expose()` adds those of the source that `initialize()` creates from the `"cosmic"` key with `_makeChargeDeposit()`, all at once, as for a single read. An instrument with a readout of several steps, such as `nisp::SCA`, returns no source from `_makeChargeDeposit()`: it owns its own source and adds the deposits at each step of its readout.
+
+**History effects** depend on time. Examples are the charge accumulated along a ramp, the persistence released by traps filled during previous exposures, and the readout sequence itself. These effects need a memory of the past, which is added on top of the pixel response. In the NISP example, the readout loop keeps the accumulated charge and the persistence scheduler keeps the past exposures. `ScenerySequencer` simulates the exposures of a sequence in time order on the same detector, so this history carries over from one exposure to the next ([Sequences of exposures](ScenerySequencer)).
 
 This separation is what makes the simulator understandable:
 
@@ -116,44 +118,66 @@ Two rules:
 
 | You want to… | Override | Example |
 |---|---|---|
-| Change **one** physical effect of a pixel | The stage it belongs to: `integrate()`, `resetLevel()` or `read()` | Cosmic-ray hits or charge trapping → `integrate()`; non-Gaussian read noise, full well and non-linearity → `read()` |
+| Change **one** physical effect of a pixel | The stage it belongs to: `integrate()`, `resetLevel()` or `read()` | Charge trapping → `integrate()`; non-Gaussian read noise, full well and non-linearity → `read()` |
 | Replace the whole single-read model | `pixelresponse()` (virtual) | A completely different detector technology |
 | Add an effect that depends on the position of the pixel | `DetectorSimulator::_engine()` | Column or amplifier glow |
 | Add an effect that couples pixels | No override: a member of the detector (`PixelConvolution`, in `DetectorEffect.h`), applied by the readout to the whole image. | Inter-pixel capacitance and crosstalk, in `nisp::SCA` |
+| Add a source of charge over several pixels | Derive from `ChargeDeposit` (`ChargeDeposit.h`): `configure()`, `generate()`, `clone()`, and if needed `isConfigured()` and `inputCards()`. Return it from `_makeChargeDeposit()`, so that `expose()` adds its deposits; an instrument with a readout of several steps owns it instead and adds its deposits at each step ([example below](#example-a-source-of-cosmic-ray-hits)) | Cosmic rays and radioactivity: `CosmicDeposit` ([details](CosmicDeposit)); `nisp::CosmicDeposit` sets the HgCdTe layer of the H2RG |
 | Add configuration keys | `initialize(cfg)`, calling the base first | NISP: `exposureMode`, `frame_time`, `oneOverF`… |
 | Record the inputs in the output header | `setInputCard()` in `initialize()` (`PixelConfig::card(key)` gives a key's value or map file name), then `writeInputCards()` on the output. The base already records the six pixel parameters (`PIXGAIN`, `PIXDARK`, …) | NISP: readout noise, persistence, reference pixels, full well and non-linearity |
 | Add a readout pattern | An instrument class that sequences the stages | NISP: MACC, UTR, CDS, DPU |
 | Simulate a sequence of exposures on your instrument | A `ScenerySequencer` subclass: `_checkExposure()` for the keys of one exposure, and a `run()` that calls your detector's exposure function ([details](ScenerySequencer#4-building-your-own-sequencer)) | NISP: `macc` and `exposureMode` per exposure, `run(SCA&)` |
 
-### Example: a pixel hit by cosmic rays
+### Example: a source of cosmic-ray hits
 
-Cosmic-ray hits deposit charge during integration, so they are a charge effect and belong in `integrate()`. The reset level and the read noise are inherited unchanged.
+A cosmic ray deposits its charge along a track, on several pixels at once, so it is not a pixel effect. `integrate()` sees one pixel, in the thread that owns it: a track shared by pixels of two threads could not be drawn there without synchronisation. Cosmic rays are therefore a `ChargeDeposit`, owned by the detector. A toy source, with hits of a fixed charge on single pixels, uniform over the detector:
 
 ```cpp
-#include <phot2pix/PixelSimulator.h>
+#include <phot2pix/ChargeDeposit.h>
 #include <random>
 
-class CosmicPixel : public phot2pix::pixsim
+class UniformHits : public phot2pix::ChargeDeposit
 {
-    double m_rate   = 1.0e-4;   // hits / s / pixel
+    double m_rate   = 0.0;      // hits / s on the whole detector
     double m_charge = 2000.0;   // e- per hit
 
 public:
-    using phot2pix::pixsim::pixsim;      // inherit the constructors
-    using phot2pix::pixsim::integrate;   // keep the cfg overload visible (C++ name hiding)
+    std::shared_ptr<phot2pix::ChargeDeposit> clone() const override { return std::make_shared<UniformHits>(*this); }
 
-    double integrate(const double& flux, const double& t) const override
+    void configure(const phot2pix::PixelConfig& cfg) override
     {
-        thread_local std::mt19937_64 rng{std::random_device{}()};
-        std::poisson_distribution<int> hits(m_rate * t);
-        return phot2pix::pixsim::integrate(flux, t) + hits(rng) * m_charge / getGain();   // ADU
+        m_rate   = cfg.getAsDouble("hitRate",   m_rate);
+        m_charge = cfg.getAsDouble("hitCharge", m_charge);
+    }
+
+    void generate(double dt, const phot2pix::Geometry& geometry, std::vector<phot2pix::Deposit>& out) const override
+    {
+        if (!(m_rate > 0.0))
+            return;
+
+        std::mt19937_64 rng = makeRng();   // reproducible with setSeed(), whatever the threads
+        std::poisson_distribution<int>        hits(m_rate * dt);
+        std::uniform_int_distribution<size_t> X(0, geometry.width - 1), Y(0, geometry.height - 1);
+
+        for (int n = hits(rng); n > 0; --n)
+        {
+            const size_t x = X(rng);
+            const size_t y = Y(rng);
+            push(out, geometry, x, y, m_charge);   // e-; dropped outside the detector or if <= 0
+        }
     }
 };
 ```
 
-`CosmicPixel::pixelresponse()` now gives a single read with cosmic rays, and any ramp simulator that uses the stages gets cosmic rays that accumulate correctly from read to read.
+A plain `DetectorSimulator` uses such a source when a derived class returns it from `_makeChargeDeposit()`: `initialize()` configures it from the `"cosmic"` key, and `expose()` adds its deposits to the image of a single read, through `_addDeposits()`. An instrument with a readout of several steps returns `nullptr` instead, configures its own source in its `initialize()`, and adds the deposits to the charge of each step of its readout loop, before the read. `nisp::SCA` does it in `_simulate()`: `generate(dt, geometry, hits)` runs in parallel with the pixel simulation of the step, then `_addCosmicHits()` adds the hits that fall on the window, divided by the gain of their pixel (e⁻ → ADU), reference pixels included. As a result:
 
-Things to keep in mind:
+- **Hits accumulate along a ramp** like the photon charge: a hit during one step is in every read after it.
+- **Hits leave persistence.** With persistence on, the charge of the hits is registered with the charge of the exposure.
+- **Draws are reproducible.** With a seed (`setSeed()`), `makeRng()` gives the *n*-th call of `generate()` the same random stream, whatever the threads.
+
+The real source, `phot2pix::CosmicRay::CosmicDeposit`, draws the species, energy and direction of each hit from spectra and spreads its charge along the track. It is described in [CosmicDeposit](CosmicDeposit); [§6](CosmicDeposit#6-using-it-from-a-detector-family) explains how a detector family adapts it.
+
+Things to keep in mind when you override a pixel stage:
 
 - **Override a stage, not `pixelresponse()`, when you can.** Multi-read simulators (such as the NISP readout modes) call the stages directly and never call `pixelresponse()`. A model that only overrides `pixelresponse()` works for single-read exposures (`DetectorSimulator::simulate()`) but not in ramps.
 - **`integrate()` only sees the charge of one interval.** Effects that depend on the *total* accumulated charge (non-linearity, full-well saturation) need the accumulated charge. The instrument's readout loop accumulates it and passes it to `read()`, so these effects belong there: `nisp::pixel::read(charge, nl)` limits the charge to the full well and applies the non-linear response, while the accumulated charge itself stays linear ([NISP example §3.1](NISP-example#31-one-pixel)) - An other possibility would have been to change pixel response model with non linear function and make sure pixel is tracking its accumulated charge along integration time. This would have been more complex and less generic, so it was not chosen.

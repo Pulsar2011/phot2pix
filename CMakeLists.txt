@@ -190,7 +190,7 @@ configure_file(${CMAKE_SOURCE_DIR}/src/phot2pix/phot2pix.h.in ${GENERATED_DIR}/p
 message("${Red}----------- SEARCH DeepSky libraries -----------${ColourReset}")
 # Minimum versions of the DeepSky libraries: the latest tag of each package.
 set(DSTmath_MIN_VERSION 0.2.0)
-set(DSTfits_MIN_VERSION 1.5.0)
+set(DSTfits_MIN_VERSION 1.5.1)
 set(DSTCore_MIN_VERSION 2.0.1)   # optional: only nispSimulator needs it
 set(DSTools_MIN_VERSION 2.2.0)   # headers only; downloaded when not installed (see below)
 

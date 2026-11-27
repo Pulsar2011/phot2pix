@@ -24,14 +24,14 @@ The library is instrument-agnostic by design. The `src/nisp/` subdirectory provi
 
 ## Dependencies
 
-| Library | Role | Notes |
+| Library | Version | Role | Notes |
 |---|---|---|
-| [`DSTmath`]:https://gitlab.in2p3.fr/deepskyproject/deepskymath | RNG and math primitives | Required; part of the DeepSky toolkit |
-| [`DSTfits`]:https://gitlab.in2p3.fr/deepskyproject/dstfits | FITS I/O (read/write) | Required; wraps `cfitsio` + `wcslib` + `Minuit2` — provided as submodules |
-| [`DSTcore`]:https://gitlab.in2p3.fr/deepskyproject/deepskysys | Command Line Tools Helpers | Required to build utilities |
-| [`DSTutils`](https://gitlab.in2p3.fr/deepskyproject/deepskyutils) | *Optional* | Required for `kernelConvolution`. If not found, CMake fetches only the code needed for the convolution, instead of cloning the whole repository, which itself depends on [`DSTdisplay`](https://gitlab.in2p3.fr/deepskyproject/deepskydisplay). |
-| `nlohmann/json` | JSON parsing for `PixelConfig` | Fetched automatically if not found |
-| GoogleTest | Unit test runner | Git submodule; only needed when `-DBUILD_TESTS=ON` |
+| [`DSTmath`]:https://gitlab.in2p3.fr/deepskyproject/deepskymath | v0.2.2 | RNG and math primitives | Required; part of the DeepSky toolkit |
+| [`DSTfits`]:https://gitlab.in2p3.fr/deepskyproject/dstfits |  v1.5.0 | FITS I/O (read/write) | Required; wraps `cfitsio` + `wcslib` + `Minuit2` — provided as submodules |
+| [`DSTcore`]:https://gitlab.in2p3.fr/deepskyproject/deepskysys | v2.0.0 | Command Line Tools Helpers | Required to build utilities |
+| [`DSTutils`](https://gitlab.in2p3.fr/deepskyproject/deepskyutilities) | v2.0.2 | *Optional* | Required for `kernelConvolution`. If not found, CMake fetches only the code needed for the convolution, instead of cloning the whole repository, which itself depends on [`DSTdisplay`](https://gitlab.in2p3.fr/deepskyproject/deepskydisplay). |
+| `nlohmann/json` | | JSON parsing for `PixelConfig` | Fetched automatically if not found |
+| GoogleTest | | Unit test runner | Git submodule; only needed when `-DBUILD_TESTS=ON` |
 
 C++ standard: **C++23**. CMake ≥ 3.24.
 

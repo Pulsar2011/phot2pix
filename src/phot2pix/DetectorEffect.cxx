@@ -23,43 +23,43 @@ namespace phot2pix
 #pragma region - Inter-pixel capacitance
     namespace
     {
-        // Side of the square IPC kernel of `count` weights. Throws unless it is an odd integer.
-        size_t ipcSquareSide(size_t count)
+        // Side of the square kernel of `count` weights. Throws unless it is an odd integer.
+        size_t kernelSquareSide(size_t count)
         {
             const size_t side = static_cast<size_t>(std::lround(std::sqrt(static_cast<double>(count))));
             if (side * side != count || side % 2 == 0)
-                throw std::invalid_argument("PixelConvolution: 'ipc': " + std::to_string(count) + " weights do not make a "
+                throw std::invalid_argument("PixelConvolution: 'kernel': " + std::to_string(count) + " weights do not make a "
                                             "square kernel with an odd number of rows (1, 9, 25, ...).");
             return side;
         }
 
-        // "width" or "height" of the IPC kernel object j. Throws unless it is an odd integer.
-        size_t ipcSize(const json& j, const char* name)
+        // "width" or "height" of the kernel object j. Throws unless it is an odd integer.
+        size_t kernelSize(const json& j, const char* name)
         {
             const double v = (j.contains(name) && j.at(name).is_number()) ? j.at(name).get<double>() : 0.0;
             if (!(v >= 1.0) || std::fmod(v, 2.0) != 1.0)
-                throw std::invalid_argument(std::string("PixelConvolution: 'ipc': \"") + name + "\" must be an odd integer >= 1.");
+                throw std::invalid_argument(std::string("PixelConvolution: 'kernel': \"") + name + "\" must be an odd integer >= 1.");
             return static_cast<size_t>(v);
         }
     }
 
     void PixelConvolution::initialize(const PixelConfig& cfg, const Geometry& geometry, size_t width, size_t height,
-                                           const CubeLoader& loadCube)
+                                           const CubeLoader& loadCube, const std::string& what)
     {
-        if (!cfg.has("ipc") && !cfg.has("ipc.file"))
+        if (!cfg.has(what) && !cfg.has(what+".file"))
             return;
 
-        const std::string what = "PixelConvolution: 'ipc'";
+        const std::string _what = "PixelConvolution: '" + what + "'";
 
-        // The JSON value of "ipc"; null when it is a path (or a number, rejected below).
+        // The JSON value of "kernel"; null when it is a path (or a number, rejected below).
         const json* node = nullptr;
-        if (cfg.has("ipc"))
+        if (cfg.has(what))
         {
-            try                                { node = &cfg.getJson("ipc"); }
+            try                                { node = &cfg.getJson(what); }
             catch (const std::invalid_argument&) {}
         }
 
-        // ── No IPC: [] ──
+        // ── No Kernel: [] ──
         if (node && node->is_array() && node->empty())
         {
             m_kernel    = kernel::one({1, 1});
@@ -75,54 +75,54 @@ namespace phot2pix
             const bool  isObject = node->is_object();
             const json& values   = isObject ? node->at("kernel") : *node;
             if (!values.is_array())
-                throw std::invalid_argument(what + ": \"kernel\" must be an array of numbers.");
+                throw std::invalid_argument(_what + ": \"kernel\" must be an array of numbers.");
 
             size_t w = 0, h = 0;
             if (isObject)
             {
                 for (auto it = node->begin(); it != node->end(); ++it)
                     if (it.key() != "kernel" && it.key() != "width" && it.key() != "height")
-                        throw std::invalid_argument(what + ": unknown key '" + it.key() + "'.");
+                        throw std::invalid_argument(_what + ": unknown key '" + it.key() + "'.");
 
-                w = ipcSize(*node, "width");
-                h = ipcSize(*node, "height");
+                w = kernelSize(*node, "width");
+                h = kernelSize(*node, "height");
                 if (w * h != values.size())
-                    throw std::invalid_argument(what + ": " + std::to_string(values.size()) + " weights for a " +
+                    throw std::invalid_argument(_what + ": " + std::to_string(values.size()) + " weights for a " +
                                                 std::to_string(w) + " × " + std::to_string(h) + " kernel.");
             }
             else
-                w = h = ipcSquareSide(values.size());
+                w = h = kernelSquareSide(values.size());
 
             std::valarray<double> weights(0.0, values.size());
             for (size_t k = 0; k < values.size(); ++k)
             {
                 if (!values[k].is_number())
-                    throw std::invalid_argument(what + ": weight " + std::to_string(k) + " is not a number.");
+                    throw std::invalid_argument(_what + ": weight " + std::to_string(k) + " is not a number.");
                 weights[k] = values[k].get<double>();
             }
 
-            try                                     { setKernel(weights, w, h, width, height); }
-            catch (const std::invalid_argument& err) { throw std::invalid_argument(what + ": " + err.what()); }
+            try                                      { setKernel(weights, w, h, width, height); }
+            catch (const std::invalid_argument& err) { throw std::invalid_argument(_what + ": " + err.what()); }
             return;
         }
 
         // ── Dynamic kernel: FITS cube of n + 1 layers (n neighbours and the central pixel) ──
         const std::shared_ptr<DSL::FITScube> image = loadCube();   // null: a number or a boolean
         if (!image)
-            throw std::invalid_argument(what + " must be an array of weights, {\"kernel\", \"width\", \"height\"}, "
+            throw std::invalid_argument(_what + " must be an array of weights, {\"kernel\", \"width\", \"height\"}, "
                                         "or a FITS file (a path or {\"file\", \"hdu\"}).");
         if (image->GetDimension() != 3)
-            throw std::invalid_argument(what + ": the FITS kernel must be a cube (columns × rows × weights), not a " +
+            throw std::invalid_argument(_what + ": the FITS kernel must be a cube (columns × rows × weights), not a " +
                                         std::to_string(image->GetDimension()) + "-D image.");
 
         const size_t nPix = width * height;
         const size_t mapW = image->Size(1), mapH = image->Size(2), nK = image->Size(3);
-        ipcSquareSide(nK);   // throws if the layers do not make a square kernel
+        kernelSquareSide(nK);   // throws if the layers do not make a square kernel
 
         auto cube = std::make_shared< DSL::FITSimg<float> >(std::vector<size_t>{width, height, nK});   // float: memory
         std::valarray<float>* out = cube->GetData<float>();
         if (!out)
-            throw std::runtime_error(what + ": cannot allocate the kernel cube.");
+            throw std::runtime_error(_what + ": cannot allocate the kernel cube.");
 
         // Section of this matrix, layer by layer, and sum of the layers of every pixel. The
         // middle layer is the fraction kept by the central pixel: it is summed like the others.
@@ -134,13 +134,13 @@ namespace phot2pix
             for (size_t k = 0; k < nK; ++k)
             {
                 std::copy_n(&data[k * nMap], nMap, std::begin(layer));                // T → double
-                const std::valarray<double> weight = geometry.extract(layer, mapW, mapH, width, height, what);
+                const std::valarray<double> weight = geometry.extract(layer, mapW, mapH, width, height, _what);
                 std::copy(std::begin(weight), std::end(weight), &(*out)[k * nPix]);   // double → float
                 sum += weight;                                                        // pixel by pixel, in double
             }
         });
         if (!known)
-            throw std::invalid_argument(what + ": the FITS kernel is not an integer or floating point cube.");
+            throw std::invalid_argument(_what + ": the FITS kernel is not an integer or floating point cube.");
 
         // The layers of a pixel should not sum to more than 1 (1e-6: float rounding). The errors
         // of a measured kernel can make them do so: a warning, not an error.
@@ -158,10 +158,10 @@ namespace phot2pix
         }
 
         if (nBad > 0)
-            throw std::invalid_argument(what + ": the sum of the layers must be finite and > 0: " + std::to_string(nBad) +
+            throw std::invalid_argument(_what + ": the sum of the layers must be finite and > 0: " + std::to_string(nBad) +
                                         " of " + std::to_string(nPix) + " pixels do not comply.");
         if (nAbove > 0)
-            std::cerr << what << ": warning: the layers sum to more than 1 in " << nAbove << " of " << nPix
+            std::cerr << _what << ": warning: the layers sum to more than 1 in " << nAbove << " of " << nPix
                       << " pixels (largest sum: " << largest << "); the kernels are normalized to 1." << std::endl;
 
         // Every layer divided by the sums: the kernel of each pixel is normalized to 1.
@@ -260,7 +260,7 @@ namespace phot2pix
 
         using idx = std::ptrdiff_t;
         const idx nK   = static_cast<idx>(m_cube->Size(3));
-        const idx side = static_cast<idx>(ipcSquareSide(m_cube->Size(3)));
+        const idx side = static_cast<idx>(kernelSquareSide(m_cube->Size(3)));
         const idx half = side / 2;
         const idx nc   = static_cast<idx>(ncols), nr = static_cast<idx>(nrows);
 

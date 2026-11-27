@@ -1,0 +1,56 @@
+{
+    "width"        : 2048,
+    "height"       : 2048,
+
+    "benchmark"    : 0,
+
+    "flux"         : 10,
+
+    "exposureMode" : "CDS",
+    "macc"         : [4, 16, 4],
+
+    "ipc"          : [0.0002,0.0058,0.0002,0.0045, 0.9779 , 0.0062,0.0002,0.0048,0.0002],
+    "crosstalk"    : [1, 2.5e-5, 1e-5,0.5e-5, 2.5e-6, 1e-6, 0.5e-6, 2.5e-7, 1e-7, 0.5e-7, 2.5e-8, 1e-8, 0.5e-8],
+
+    "frame_time"   : 1.45408,
+    "offset"       : 1024.0,
+    "scale"        : 3.0,
+
+    "gain"         : 1.92,
+    "dark"         : 0.001,
+    "readNoise"    : 13.0,
+    "QE"           : 0.94,
+    "KTCnoise"     : 48.0,
+    "baseline"     : 10000.0,
+
+    "fullWell"     : 130000.0,
+    "nlModel"      : "polynomial",
+    "nl0"          : -6.25e-7,
+    "nl1"          : -3.1e-13,
+
+    "oneOverF"           : { "amplitude": 22.0, "slope": 0.0, "nPoles": 16 },
+    "bias_voltage_noise" : { "amplitude": 15.0, "slope": 0.5, "nPoles": 16 },
+    "pedestal_drift"     : { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [] } },
+
+    "cosmic"       : {
+        "depth_um": 10.0, "pitch_um": 18.0, "eVPerElectron": 1.3, "seed": 1, "sigmaDiffusion_px": 0.0,
+        "spectrum": [
+            {"species": "p",  "Z": 1, "A": 1,
+             "file": "ressource/cosmic_reference_spectra.csv",
+             "filterColumn": "component", "filterValue": "GCR_min_p",  "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "back", "deltaRays": true},
+            {"species": "He", "Z": 2, "A": 4,
+             "file": "ressource/cosmic_reference_spectra.csv",
+             "filterColumn": "component", "filterValue": "GCR_min_He", "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "back", "deltaRays": true},
+            {"species": "alpha", "Z": 2, "A": 4, "file": "ressource/natural_radioactivity_spectra.csv",
+                     "filterColumn": "component", "filterValue": "U238_alpha_ULA", "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "front", "deltaRays": true},
+            {"species": "alpha", "Z": 2, "A": 4, "file": "ressource/natural_radioactivity_spectra.csv",
+                     "filterColumn": "component", "filterValue": "Th232_alpha_STD", "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "both", "deltaRays": true},
+            {"species": "e-", "Z": -1, "mc2": 0.51099895, "file": "ressource/natural_radioactivity_spectra.csv",
+                     "filterColumn": "component", "filterValue": "Th232_beta_STD", "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "front"},
+            {"species": "e-", "Z": -1, "mc2": 0.51099895, "file": "ressource/natural_radioactivity_spectra.csv",
+                     "filterColumn": "component", "filterValue": "K40_beta_STD", "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "front"},
+            {"species": "e-", "Z": -1, "mc2": 0.51099895, "file": "ressource/natural_radioactivity_spectra.csv",
+                     "filterColumn": "component", "filterValue": "U238_beta_STD", "colEnergy": "energy", "colFlux": "flux","angular": {"model": "surface"}, "faces": "back"}
+        ]
+    }
+}
