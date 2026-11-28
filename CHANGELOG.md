@@ -2,7 +2,13 @@
 
 Notable changes of phot2pix, most recent first. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No version has been tagged yet: the changes that are already in the repository are listed by date.
 
-## [Unreleased]
+## 2026-11-28
+
+### Added
+
+- **Random Telegraph Noise (RTN)** for the nispSCA model.  
+
+## 2026-11-27
 
 ### Added
 

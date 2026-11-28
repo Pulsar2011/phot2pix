@@ -498,18 +498,26 @@ namespace nisp
     // value straight into the output layer. A std::slice / std::gslice version would need
     // temporaries for the double → uint16 conversion and run on a single thread.
     // The readout noise map is in electrons: it is converted with each pixel's gain,
-    // like the read noise in pixel::read().
+    // like the read noise in pixel::read(). The RTN map is in ADU, a voltage offset: added as is.
     // With IPC or crosstalk, a pixel needs the charge of others: all the pixels are accumulated
     // first, and read in a second pass.
     void SCA::_accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
-                          uint16_t* layer, const std::valarray<double>* oneOverF) const
+                          uint16_t* layer, const std::valarray<double>* oneOverF,
+                          const std::valarray<double>* rtn) const
     {
 
         // Measured value of pixel i for the given signal (ADU).
-        const auto readPixel = [this, oneOverF](size_t i, double signal)
+        const auto readPixel = [this, oneOverF, rtn](size_t i, double signal)
         {
-            const double value = m_pixels[i].read(signal, m_nl);
-            return toUint16(oneOverF ? value + (*oneOverF)[i] / m_pixels[i].getGain() : value);   // e- → ADU
+            double value = m_pixels[i].read(signal, m_nl);
+            if (oneOverF)
+                value += (*oneOverF)[i] / m_pixels[i].getGain();   // e- → ADU
+            if (rtn)
+            {
+                value += (*rtn)[i];                                // ADU
+                value = (value < 0.0) ? 0.0 : value;               // clamp to [0, 65535]
+            }
+            return toUint16(value);
         };
 
         const bool coupled = layer && _pixelsAreCoupled();
@@ -740,6 +748,11 @@ namespace nisp
         // match the detector (colPerChannel, nChannels).
         if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
             m_oneOverFNoise.checkGeometry(getWidth(), getHeight());
+
+        // Random telegraph noise of the source followers ("rtn"): the RTN pixels, their time
+        // constants and the sign of their offset are drawn here, once.
+        if (cfg.has("rtn"))
+            m_rtn.initialize(cfg, getWidth(), getHeight());
 
         // Reference pixels: the physical pixels within refBorder (4) of the detector edge
         // (nisp::Geometry). A 2048 × 2048 matrix has 4 reference pixels on each side; a
@@ -974,6 +987,20 @@ namespace nisp
             }
         }
 
+        // ── Random telegraph noise ──
+        removeInputCards("RTN");
+        if (m_rtn.isEnabled())
+        {
+            setInputCard({"RTNFRAC", m_rtn.getFraction(),         "RTN: fraction of the pixels"});
+            setInputCard({"RTNNPIX", m_rtn.getPixels().size(),    "[pix] RTN: pixels drawn"});
+            setInputCard({"RTNTMIN", m_rtn.getTauMin(),           "[s] RTN: shortest time constant"});
+            setInputCard({"RTNTMAX", m_rtn.getTauMax(),           "[s] RTN: longest time constant"});
+            setInputCard({"RTNAMP",  m_rtn.getAmplitude(),        "[ADU] RTN: largest amplitude, uniform from 1 ADU"});
+            setInputCard({"RTNPOS",  m_rtn.getPositiveFraction(), "RTN: fraction of positive offsets"});
+            if (const auto seed = m_rtn.getSeed())
+                setInputCard({"RTNSEED", static_cast<size_t>(*seed), "RTN: seed of the draw"});
+        }
+
         // ── Persistence: [{"f", "t"}, …] or {"traps": [...], "dT": s} ──
         if (cfg.has("persistence"))
         {
@@ -1051,6 +1078,9 @@ namespace nisp
         _simulate(fullFlux, exposureTime, frame, c0, r0, ncols, nrows);
         // Single read: read noise + readout noise, the read being the last frame of the exposure.
         _read(*(frame->GetData<double>()), c0, r0, ncols, nrows, std::max(0.0, exposureTime - frameTime));
+        // Random telegraph noise of the read (ADU), levels drawn for this read alone.
+        if (m_rtn.isEnabled())
+            m_rtn.beginStream().addTo(*(frame->GetData<double>()), c0, r0, ncols, nrows);
 
         // Register full-frame charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)
@@ -1188,6 +1218,16 @@ namespace nisp
         if (m_enable_oneOverF && m_oneOverFNoise.isEnabled())
             oneOverFStream = m_oneOverFNoise.beginStream(getWidth(), getHeight());
 
+        // Random telegraph noise: the levels of the RTN pixels over the whole ramp, moved forward at
+        // every frame (read or dropped), and their offsets (ADU) written in rtnMap before each read.
+        std::optional<nisp::RTN::Stream> rtnStream;
+        std::valarray<double>            rtnMap;
+        if (m_rtn.isEnabled())
+        {
+            rtnStream = m_rtn.beginStream();
+            rtnMap.resize(nPix, 0.0);
+        }
+
         for (size_t g = 0; g < nG; ++g)
         {
             for(size_t f = 0; f < nF; ++f)
@@ -1211,9 +1251,17 @@ namespace nisp
                 if (oneOverFFuture.valid())
                     oneOverF = oneOverFFuture.get();
 
-                // cumul += this frame's charge, then read it: layer = pixel read (read noise) + 1/f.
+                // RTN levels at this read: one frame after the previous frame, read or dropped.
+                if (rtnStream)
+                {
+                    if (layer > 0)
+                        rtnStream->advance(frameTime);
+                    rtnStream->writeTo(rtnMap);
+                }
+
+                // cumul += this frame's charge, then read it: layer = pixel read (read noise) + 1/f + RTN.
                 _accumulate(*(frame->GetData<double>()), cumul, &(*outData)[layer * nPix],
-                            oneOverF.size() ? &oneOverF : nullptr);
+                            oneOverF.size() ? &oneOverF : nullptr, m_rtn.isEnabled() ? &rtnMap : nullptr);
                 frame.reset();
                 ++layer;
             }
@@ -1237,8 +1285,12 @@ namespace nisp
                 if(!skipped)
                     throw std::runtime_error("SCA::expose: failed to simulate skipped frame ["+std::to_string(g)+","+std::to_string(nF-1)+",0]");
 
-                _accumulate(*(skipped->GetData<double>()), cumul, nullptr, nullptr);   // dropped frames: charge only, no layer
+                _accumulate(*(skipped->GetData<double>()), cumul, nullptr, nullptr, nullptr);   // dropped frames: charge only, no layer
                 skipped.reset();
+
+                // The RTN levels go on changing during the dropped frames.
+                if (rtnStream)
+                    rtnStream->advance(static_cast<double>(nD) * frameTime);
 
                 if (oneOverFSkip.valid())
                     oneOverFSkip.get();
@@ -1311,8 +1363,21 @@ namespace nisp
 
         // Each read adds its own, independent read noise (pixel::read) and readout noise.
         // Read 1 is frame 0, read N is frame N−1: it starts cdsTime = (N−1)·t_f after the reset.
+        // The RTN levels (ADU, added to each read) are those of one process, cdsTime apart.
+        std::optional<nisp::RTN::Stream> rtnStream;
+        if (m_rtn.isEnabled())
+            rtnStream = m_rtn.beginStream();
+
         _read(read1, 0.0);
+        if (rtnStream)
+            rtnStream->addTo(read1);
+
         _read(readN, cdsTime);
+        if (rtnStream)
+        {
+            rtnStream->advance(cdsTime);
+            rtnStream->addTo(readN);
+        }
 
         // CDS = read N − read 1: reset level and kTC cancel, the read noise of both reads remains.
         *(f1->GetData<double>()) -= *(f0->GetData<double>());
@@ -1358,6 +1423,9 @@ namespace nisp
         _simulate(flux, effectiveExposureTime, frame);
         // Single read: read noise + readout noise, the read being the last frame of the exposure.
         _read(*(frame->GetData<double>()), std::max(0.0, effectiveExposureTime - frameTime));
+        // Random telegraph noise of the read (ADU), levels drawn for this read alone.
+        if (m_rtn.isEnabled())
+            m_rtn.beginStream().addTo(*(frame->GetData<double>()));
 
         // Register accumulated charge (electrons) for future persistence computation.
         if (persistenceModelling && m_enable_persistence)

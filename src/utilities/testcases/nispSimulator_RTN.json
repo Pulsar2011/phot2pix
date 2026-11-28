@@ -1,0 +1,26 @@
+{
+    "width"        : 256,
+    "height"       : 256,
+    "detectorOrigin": [0, 0],
+
+    "benchmark"    : 0,
+
+    "flux"         : 0.0,
+
+    "exposureMode" : "MACC",
+    "macc"         : [15, 16, 11],
+
+    "frame_time"   : 1.45408,
+    "offset"       : 1024.0,
+    "scale"        : 1.0,
+
+    "gain"         : 1.0,
+    "dark"         : 0.01,
+    "readNoise"    : 23.0,
+    "QE"           : 1.0,
+    "KTCnoise"     : 0.0,
+    "baseline"     : 10000.0,
+
+    "fullWell"     : 130000.0,
+    "rtn"          : { "fraction": 0.004, "tauMin": 0.5, "tauMax": 150.0, "amplitude": 600.0, "positiveFraction": 0.6 }
+}
