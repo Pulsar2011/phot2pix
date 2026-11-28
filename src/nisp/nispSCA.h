@@ -14,6 +14,7 @@
 
 #include "nispPixel.h"
 #include "nispOneOverFNoise.h"
+#include "nispRTN.h"
 #include <vector>
 #include <map>
 #include <memory>
@@ -342,6 +343,7 @@ namespace nisp
 
         std::shared_ptr<persistence::scheduler> persistenceModelling;   ///< Past exposures; null without persistence
         nisp::OneOverFNoise m_oneOverFNoise;                            ///< Readout noise of the output channels
+        nisp::RTN           m_rtn;                                      ///< Random telegraph noise of the pixels ("rtn"); none by default
 
         /// @brief Inter-pixel capacitance ("ipc", see PixelConvolution::initialize()).
         /// @details Applied before the read noise: from detector characterisation it is not possible to
@@ -526,16 +528,38 @@ namespace nisp
 
         /// @brief Ramp step: cumul += charge (charge only), and a read when layer is not null.
         /// @details The read is written as layer[i] = uint16(pixel_i.read(cumul[i], m_nl) +
-        ///          oneOverF[i] / gain_i): the read noise and readout noise go to that layer only,
-        ///          never into cumul. With IPC or crosstalk (_couplePixels()), a coupled copy of cumul is
-        ///          read instead of cumul, which is never coupled itself. Threaded over getThreadCount().
+        ///          oneOverF[i] / gain_i + rtn[i]): the read noise, readout noise and random telegraph
+        ///          noise go to that layer only, never into cumul. With IPC or crosstalk
+        ///          (_couplePixels()), a coupled copy of cumul is read instead of cumul, which is never
+        ///          coupled itself. Threaded over getThreadCount().
+        /// @param charge   Charge of the step (ADU).
+        /// @param cumul    Accumulated charge (ADU), updated.
+        /// @param layer    Layer the read is written to; null for dropped frames.
+        /// @param oneOverF Readout-noise map in electrons, from OneOverFNoise::Stream; null when the
+        ///                 readout noise is disabled.
+        /// @param rtn      Random telegraph noise map in ADU, from RTN::Stream::writeTo(), not divided by
+        ///                 the gain; null without RTN.
+        void _accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
+                         uint16_t* layer, const std::valarray<double>* oneOverF,
+                         const std::valarray<double>* rtn) const;
+
+
+        /// @brief Ramp step: cumul += charge (charge only), and a read when layer is not null.
+        /// @details The read is written as layer[i] = uint16(pixel_i.read(cumul[i], m_nl) +
+        ///          oneOverF[i] / gain_i + rtn[i]): the read noise, readout noise and random telegraph
+        ///          noise go to that layer only, never into cumul. With IPC or crosstalk
+        ///          (_couplePixels()), a coupled copy of cumul is read instead of cumul, which is never
+        ///          coupled itself. Threaded over getThreadCount().
         /// @param charge   Charge of the step (ADU).
         /// @param cumul    Accumulated charge (ADU), updated.
         /// @param layer    Layer the read is written to; null for dropped frames.
         /// @param oneOverF Readout-noise map in electrons, from OneOverFNoise::Stream; null when the
         ///                 readout noise is disabled.
         void _accumulate(const std::valarray<double>& charge, std::valarray<double>& cumul,
-                         uint16_t* layer, const std::valarray<double>* oneOverF) const;
+                         uint16_t* layer, const std::valarray<double>* oneOverF) const
+                        {
+                            _accumulate(charge, cumul, layer, oneOverF, nullptr);
+                        }
 
         /// @brief True if the read of a pixel depends on other pixels (IPC or crosstalk).
         bool _pixelsAreCoupled() const { return m_ipc.isEnabled() || m_crosstalk.isEnabled(); }
@@ -693,7 +717,8 @@ namespace nisp
         // ── Configuration ─────────────────────────────────────────────────────
 
         /// @brief Configure the detector: geometry and output channels, pixels, readout, persistence, readout
-        ///        noise, reference pixels, full well and non-linearity, inter-pixel capacitance, crosstalk.
+        ///        noise, random telegraph noise, reference pixels, full well and non-linearity, inter-pixel
+        ///        capacitance, crosstalk.
         /// @details The keys are described in the wiki (NISP example, configuration reference). With
         ///          "persistence", cfg must outlive the SCA: the scheduler keeps a reference to it.
         /// @param cfg Configuration; absent keys leave the current value unchanged.
@@ -718,6 +743,11 @@ namespace nisp
             m_nl = f;
             setInputCard({"NLMODEL", std::string(f ? "custom" : "linear"), "Non-linearity model"});
         }
+
+        // ── Random telegraph noise ────────────────────────────────────────────
+
+        /// @brief Random telegraph noise of the pixels ("rtn"): the RTN pixels drawn by initialize().
+        const nisp::RTN& getRTN() const { return m_rtn; }
 
         // ── Inter-pixel capacitance ───────────────────────────────────────────
 

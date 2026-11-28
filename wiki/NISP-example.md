@@ -41,6 +41,7 @@ While NISP instrument use fixed exposure parameter this model allows to simulate
 | `nispScenerySequencer.h/.cxx` | `nisp::ScenerySequencer`: a sequence of NISP exposures, each with its own MACC parameters or exposure time and readout mode ([details](ScenerySequencer#3-the-nisp-override)) |
 | `nispGeometry.h` | `nisp::Geometry`: the H2RG layout (2048 × 2048, reference border, output channels), derived from `phot2pix::Geometry` |
 | `nispOneOverFNoise.h/.cxx` | `nisp::OneOverFNoise`: readout noise of the output channels (1/f noise per channel, bias voltage noise common to all channels, pedestal drift) and its continuous `Stream` over a ramp |
+| `nispRTN.h/.cxx` | `nisp::RTN`: random telegraph noise of the pixels (the RTN pixels, their time constants and the sign of their offset, drawn at the initialisation) and the `Stream` of their levels over an exposure |
 | `../utilities/nispSimulator.cxx` | Command-line tool driven by a JSON file |
 | `../utilities/*.json` | A default configuration with averaged NISP values, and one test configuration per readout mode |
 
@@ -93,7 +94,7 @@ flowchart TD
         I2["② pixel model, in DetectorSimulator::initialize<br/>gain, dark, readNoise, QE, KTCnoise, baseline<br/>numbers, or FITS maps of matrix or detector size → PIX* cards"]
         I3["③ readout and DPU settings<br/>exposureMode, frame_time, offset, scale, dpu_gain, dpu_noise"]
         I4["④ persistence scheduler<br/>persistence traps"]
-        I5["⑤ readout noise, OneOverFNoise<br/>oneOverF, bias_voltage_noise, pedestal_drift<br/>channel layout checked against the detector"]
+        I5["⑤ readout noise, OneOverFNoise<br/>oneOverF, bias_voltage_noise, pedestal_drift<br/>channel layout checked against the detector<br/>random telegraph noise, RTN: rtn pixels drawn"]
         I6["⑥ reference pixels<br/>QE = 0, refDark"]
         I7["⑦ full well and non-linearity<br/>fullWell, nlModel, nl0, nl1, nl2: numbers or FITS maps<br/>model checked to increase up to the full well of every pixel"]
         I8["⑧ coupling of the pixels, PixelConvolution<br/>ipc: kernel, or FITS cube of kernels<br/>crosstalk: couplings between the channels of the geometry"]
@@ -226,6 +227,7 @@ Pixel *i* of the W × H matrix sits at column *x* and row *y*, with i = y·W + x
 
 - the **inter-pixel capacitance** (IPC) and the **crosstalk** between output channels, which couple the pixels at each read and leave the charge unchanged. Both are a convolution of the image by a kernel (`phot2pix::PixelConvolution`): for the IPC, the kernel $K$ of the `ipc` key, the same for every pixel or one per pixel; for the crosstalk, a one-row kernel holding the couplings $\kappa_d$ at ± *d* channel widths, applied to the signal above the baseline and added to the image ([details](#inter-pixel-capacitance-and-crosstalk));
 - the **readout noise** $\mathcal{R}$, in electrons, added at each read: the 1/f noise of each output channel, modelled as a sum of $n_p$ AR(1) processes whose spectrum approximates PSD ∝ 1/ν^a, with amplitude *A* and slope *a* ([details](#1f-noise-of-channel-c)), the bias voltage noise shared by all channels and the pedestal drift of each channel;
+- the **random telegraph noise** $\mathcal{T}$, in ADU, added at each read to a few pixels whose output jumps between two levels ([details](#random-telegraph-noise));
 - the **persistence** *P*, which depends on the previous exposures and is added to the charge.
 
 A quantiser then converts each value to `uint16`:
@@ -283,7 +285,7 @@ The read is then that of the coupled signal: **everywhere below, $M_i(Q_i)$ stan
 #### MACC and UTR: one layer of the output cube
 
 ```math
-Y_i[\ell] = \mathcal{Q}\Big( M_i\big(Q_i[m_\ell]\big) + \frac{\mathcal{R}_i[n_\ell]}{g_i} \Big)
+Y_i[\ell] = \mathcal{Q}\Big( M_i\big(Q_i[m_\ell]\big) + \frac{\mathcal{R}_i[n_\ell]}{g_i} + \mathcal{T}_i[n_\ell] \Big)
 ```
 
 where $M_i$ is the read of §3.1 (full well, non-linearity, read noise) and $m_\ell$ is the step that ends at frame $n_\ell$. MACC and UTR layers are rounded and clamped but **not** scaled or offset.
@@ -364,6 +366,26 @@ f(t) = \sum_k a_k\,t^k + \sum_j A_j\,e^{-t/\tau_j} + \sum_m B_m \sin\!\Big(\frac
 ```
 
 $t_0$ places the exposure in time (for example after a power-on or a mode change). A constant offset belongs to the `baseline` map instead: it is drawn at the reset and cancels in every difference, whereas the pedestal drift changes from one read to the next. **Pedestal drift is by default disable and is activated only if its parametrisations is present in the configuration file.**
+
+#### Random telegraph noise
+
+A trap in the source follower of a pixel captures and releases an electron, and the output of the pixel jumps between two levels. This is a voltage offset of the output, in ADU, and not a charge: it is added to each read after the full well and the non-linearity, is not divided by the gain, is not coupled by the IPC and leaves no persistence. Reference pixels can have it too, since they have the same source follower.
+
+A fraction of the pixels of the matrix, drawn uniformly at the initialisation, has random telegraph noise (RTN). Each RTN pixel $i$ has two state: a rest level (offset 0) and a shifted level (offset $s_i A_i$, with $s_i = -1$ or $+1$), and mean dwell times $\tau_{0,i}$ and $\tau_{1,i}$ associated to each state. Dwel times are drawn independently and uniformly in range [`tauMin`, `tauMax`]. The offset level of the shifted state $A_i$ is drawn uniformly in [1 ADU, `amplitude`]. The parameter `positiveFraction` (0.4 by default) define how much of RTN pixel have shiffted positive states. The level of pixel $i$ at frame $n$ is written $u_i[n]$: 1 when the pixel is in its shifted level, 0 when it is at rest. The offset added to the read of frame $n$ is then
+
+```math
+\mathcal{T}_i[n] = s_i\,A_i\,u_i[n]
+```
+
+The switching between the two states follows a two-state Markov process: pixel $i$ leaves its rest level at the rate $1/\tau_{0,i}$ and its shifted level at the rate $1/\tau_{1,i}$. The sum of these two rates, $\lambda_i = 1/\tau_{0,i} + 1/\tau_{1,i}$, sets how fast the pixel forgets its level: after a time much longer than $1/\lambda_i$, its level no longer depends on the level it started from. The probability of finding the pixel in its shifted level at any time is $p_i = \tau_{1,i}/(\tau_{0,i} + \tau_{1,i})$, which is also the fraction of the time it spends there: on average, a cycle lasts $\tau_{0,i} + \tau_{1,i}$, of which $\tau_{1,i}$ in the shifted level. Over a time $\Delta t$, the probability that the pixel ends in its shifted level, knowing that it started in its shifted level (left) or at rest (right), is
+
+```math
+P\big(u_i = 1 \mid u_i = 1\big) = p_i + (1 - p_i)\,e^{-\lambda_i \Delta t},
+\qquad
+P\big(u_i = 1 \mid u_i = 0\big) = p_i\,\big(1 - e^{-\lambda_i \Delta t}\big)
+```
+
+At the start of each exposure, $u_i$ is drawn from its stationary distribution, $P(u_i = 1) = p_i$: the level is not carried from one exposure to the next, which stands for an unknown time between exposures during which the RTN has changed level. In a ramp the state is moved forward by $t_f$ at every frame, read or dropped, so that a flip appears as a step of the ramp that comes back later. In CDS the two reads see one process, $(N - 1)\,t_f$ apart, and a pixel whose level has not changed leaves no RTN in the difference. A FLUX read, or a windowed read, draws the level from the stationary distribution. **RTN is disabled by default and is activated only if `rtn` is present in the configuration file.**
 
 #### Persistence
 
@@ -701,6 +723,25 @@ An offset shared by all the pixels of a channel, changing from read to read (pre
 
 The drift f(t) is the same for all channels and is evaluated at the read time of each row, t = `t0` + (n − 1 + (Y + ½)/H_d)·t_f. A drift within one frame therefore appears as a gradient along the columns. A constant f is pointless: it belongs to `baseline`.
 
+#### `rtn`: random telegraph noise of the pixels
+
+```json
+"rtn": { "fraction": 1e-3, "tauMin": 0.5, "tauMax": 100.0, "amplitude": 30.0, "positiveFraction": 0.4, "seed": 1 }
+```
+
+A few pixels whose output jumps between a rest level and a shifted level ([§3.2](#random-telegraph-noise)). The RTN pixels, their time constants and the sign of their offset are drawn once, by `initialize()`; their levels then change during every exposure. Unlike the three components above, the RTN is defined on the pixels of the matrix and its amplitude is in ADU.
+
+| Key | Unit | Default | Meaning and use |
+|---|---|---|---|
+| `fraction` | — | — (required) | Fraction of the matrix pixels with RTN, in [0, 1]: round(`fraction` × W × H) distinct pixels drawn uniformly, reference pixels included. 0 switches the RTN off |
+| `tauMin` | s | — (required) | Shortest mean dwell time, > 0 |
+| `tauMax` | s | — (required) | Longest mean dwell time, ≥ `tauMin`. The dwell times in the rest and shifted levels of each RTN pixel are drawn independently and uniformly in [`tauMin`, `tauMax`] |
+| `amplitude` | ADU | — (required) | Largest offset of the shifted level, ≥ 1. The amplitude of each RTN pixel is drawn uniformly in [1 ADU, `amplitude`]. It is not divided by the gain: a voltage offset of the output |
+| `positiveFraction` | — | 0.4 | Fraction of the RTN pixels whose offset is +A, in [0, 1]; the others get −A |
+| `seed` | — | none | Integer ≥ 0: the same RTN pixels, time constants and signs at every run. The levels during the exposures are not reproducible, like the other noises |
+
+Every `rtn` object replaces the whole previous RTN configuration and draws the pixels again; unknown keys are rejected.
+
 ### 4.8 Persistence
 
 ```json
@@ -786,7 +827,8 @@ The NISP averages of `src/utilities/nispSimulator_default.json` (Euclid Collabor
 
     "oneOverF":           { "amplitude": 15.0, "slope": 1.0, "nPoles": 16 },
     "bias_voltage_noise": { "amplitude": 10.0, "slope": 1.0, "nPoles": 16 },
-    "pedestal_drift":     { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [0.0, 0.05] } }
+    "pedestal_drift":     { "sigma": 8.0, "t0": 0.0, "drift": { "poly": [0.0, 0.05] } },
+    "rtn":                { "fraction": 1e-3, "tauMin": 0.5, "tauMax": 100.0, "amplitude": 30.0 }
 }
 ```
 
@@ -794,6 +836,7 @@ The NISP averages of `src/utilities/nispSimulator_default.json` (Euclid Collabor
 - MACC(4,16,4) ramp fitted by the DPU. The output is DN = slope × 3 + 1024, so (DN − 1024) is the signal integrated over 87.2 s: 10 ph/s × 0.94 × 87.2 s / 1.92 ≈ 427 ADU.
 - Full well of 130 ke⁻ and quadratic non-linearity, −5 % at 80 ke⁻ (negligible at this flux).
 - Per read: 13 e⁻ read noise, then pink 1/f noise of 15 e⁻ per channel, 10 e⁻ of common bands, and channel offsets of 8 e⁻ RMS drifting by 0.05 e⁻/s.
+- About 4 200 pixels (0.1 %) with RTN: jumps of 1 to 30 ADU, down for 60 % of them, with dwell times between 0.5 s and 100 s.
 
 ---
 
@@ -988,6 +1031,7 @@ Every comment starts with the unit in square brackets (FITS convention), e.g. `G
 | `OOFAMP`, `OOFSLOPE`, `OOFPOLES` | `oneOverF` |
 | `BIASAMP`, `BIASSLOP`, `BIASPOLE` | `bias_voltage_noise` |
 | `PEDSIGMA`, `PEDT0`, `PEDPOLY`, `PEDEXPn`, `PEDSINn` | `pedestal_drift`: σ, t₀, then the drift terms (`'0, 0.05'`, `'A=20 tau=30'`, `'B=2 P=300 phi=0'`) |
+| `RTNFRAC`, `RTNNPIX`, `RTNTMIN`, `RTNTMAX`, `RTNAMP`, `RTNPOS`, `RTNSEED` | `rtn`: fraction and number of RTN pixels drawn, `tauMin`, `tauMax` (s), largest amplitude (ADU), `positiveFraction`, and `seed` when given |
 | `PERDT`, `PERTRn` | Persistence: delay between two exposures (s) and traps, release rate (s⁻¹) and decay time (s) (`'f=1e-06 tau=80'`) |
 | `FLUX`, `FLUXSEC` | Written by `nispSimulator`: input flux (ph/s/pixel, or file name) and the section of the detector it covers |
 

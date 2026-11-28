@@ -37,9 +37,17 @@
                     {"species": "p",  "Z": 1, "A": 1, "file": "ressource/cosmic_reference_spectra.csv",
                      "filterColumn": "component", "filterValue": "GCR_min_p",  "colEnergy": "energy", "colFlux": "flux", "deltaRays": false},
                     {"species": "He", "Z": 2, "A": 4, "file": "ressource/cosmic_reference_spectra.csv",
-                     "filterColumn": "component", "filterValue": "GCR_min_He", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true},
-                    {"species": "60Fe", "Z": 26, "A": 60, "file": "ressource/cosmic_reference_spectra.csv",
-                     "filterColumn": "component", "filterValue": "Fe_Ga75", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true}
+                     "filterColumn": "component", "filterValue": "GCR_min_He", "colEnergy": "energy", "colFlux": "flux", "deltaRays": false},
+                    {"species": "Fe", "Z": 26, "A": 60, "file": "ressource/cosmic_reference_spectra.csv",
+                     "filterColumn": "component", "filterValue": "Fe", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true},
+                    {"species": "B", "Z": 5, "A": 10, "file": "ressource/cosmic_reference_spectra.csv",
+                     "filterColumn": "component", "filterValue": "B", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true},
+                    {"species": "C", "Z": 6, "A": 12, "file": "ressource/cosmic_reference_spectra.csv",
+                     "filterColumn": "component", "filterValue": "C", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true},
+                    {"species": "N", "Z": 7, "A": 14, "file": "ressource/cosmic_reference_spectra.csv",
+                     "filterColumn": "component", "filterValue": "N", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true},
+                    {"species": "O", "Z": 8, "A": 16, "file": "ressource/cosmic_reference_spectra.csv",
+                     "filterColumn": "component", "filterValue": "O", "colEnergy": "energy", "colFlux": "flux", "deltaRays": true}
                 ]
     }
 }
